@@ -1,0 +1,88 @@
+# ============================================================
+# 搜索空间定义（配置即文档）
+# 每个参数必须写 description：它是"这个超参数是什么含义"的说明，
+# 会注入 agent 的上下文，成为它自主收窄/放宽搜索空间的领域知识依据；
+# 也会展示在 `cli.py space show` 与最终报告里。
+#
+# 参数类型：
+#   type: choice  —— 离散取值，配合 choices: [...]（可含字符串/整数）
+#   type: float   —— 连续区间，配合 low/high，可选 log: true（对数均匀）
+#   type: int     —— 整数区间，配合 low/high
+#
+# 注意：log: true 的参数 low 必须 > 0；数值请写成 1.0e-4 这种带小数点
+# 的科学计数法（YAML 1.1 会把 1e-4 解析成字符串）。
+# ============================================================
+
+params:
+  - name: optimizer
+    type: choice
+    choices: [adam, adamw, sgd]
+    description: >-
+      优化算法。Adam/AdamW 对小学习率(1e-4~1e-3)稳定、收敛快；
+      SGD(动量0.9)通常需要更高的学习率(0.01~0.3)，低 lr 下收敛很慢。
+      AdamW = Adam + 解耦权重衰减。
+
+  - name: lr
+    type: float
+    low: 1.0e-4
+    high: 3.0e-1
+    log: true
+    description: >-
+      学习率：参数更新的步长。过大→loss 发散/出现尖峰；过小→收敛缓慢。
+      经验上 Adam 系适用 1e-4~1e-3，SGD 可高 10~100 倍。
+      本空间故意放宽，若观察到高 lr 区间频繁发散可收窄上界。
+
+  - name: scheduler
+    type: choice
+    choices: [none, cosine, step]
+    description: >-
+      学习率调度策略。none=恒定 lr；cosine=余弦退火到接近 0；
+      step=训练半程时 lr 乘 0.5。短训练(≤5 epoch)中调度收益有限，
+      若某策略持续不占优可冻结为 none。
+
+  - name: batch_size
+    type: choice
+    choices: [32, 64, 128, 256]
+    description: >-
+      批大小。小 batch 噪声大、有一定正则效果但每 epoch 步数多(更慢)；
+      大 batch 更快更平滑，但通常需要相应提高 lr 才能充分训练。
+
+  - name: weight_decay
+    type: float
+    low: 1.0e-6
+    high: 1.0e-2
+    log: true
+    description: >-
+      权重衰减(L2 正则强度)。~1e-6 近似无正则；过大会欠拟合。
+      AdamW 下 1e-4~1e-2 常见；对 Adam 作用较弱。
+
+  - name: dropout
+    type: float
+    low: 0.0
+    high: 0.5
+    description: >-
+      全连接层 Dropout 概率。防过拟合，但本任务训练极短、过拟合风险低，
+      若高 dropout 持续不占优可收窄到 [0, 0.2] 或冻结为 0。
+
+  - name: augment
+    type: choice
+    choices: [none, affine]
+    description: >-
+      数据增强。none=不用；affine=随机旋转±10°+平移10%（MNIST 常用）。
+      增强提升泛化但略微降低训练速度。
+
+  - name: width
+    type: choice
+    choices: [8, 16, 32]
+    description: >-
+      CNN 基础通道数（模型容量）。8≈1千参数、16≈4千、32≈1.6万。
+      更大容量拟合更快但每 epoch 更慢；结合 epoch_time_s 权衡。
+
+  - name: epochs
+    type: int
+    low: 2
+    high: 5
+    description: >-
+      训练轮数（资源轴）。本演示为 CPU 快速验证故意限制在 2~5；
+      若 top 试验在最后一个 epoch 仍快速上升，说明欠训练（可考虑放宽，
+      但注意单次试验耗时约束）。

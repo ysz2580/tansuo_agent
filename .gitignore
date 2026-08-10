@@ -1,0 +1,11 @@
+# 运行时产物
+data/
+__pycache__/
+*.pyc
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# MNIST 数据缓存（examples/train_mnist.py 会下载到 ./mnist_data）
+mnist_data/

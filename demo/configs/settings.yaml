@@ -1,0 +1,66 @@
+# ============================================================
+# tansuo_agent 总配置（配置即文档）
+# 本文件声明：实验怎么评估（metrics）、训练怎么驱动（adapter）、
+# 预算多少（budget）、agent 怎么连（agent）。
+# 支持 ${ENV:变量名} 与 ${ENV:变量名:默认值} 形式的环境变量展开。
+# ============================================================
+
+experiment:
+  name: mnist_demo          # 实验名，用于报告标题与日志
+  data_dir: demo/data       # 运行时产物目录（db / journal / 报告 / 空间快照）
+
+# ---------- 结果指标定义：有几个指标、各自大好还是小好 ----------
+metrics:
+  # 唯一主优化目标，驱动 Optuna 搜索（必须且只能有一个）
+  primary:
+    name: val_acc           # 训练脚本协议行 metrics 里的键名
+    direction: maximize     # maximize=越大越好 | minimize=越小越好
+  # 观测指标：不影响搜索方向，但会记录、展示给 agent 做多维权衡
+  watch:
+    - {name: val_loss, direction: minimize}
+    - {name: train_loss, direction: minimize}
+    - {name: epoch_time_s, direction: minimize}
+
+# ---------- 训练驱动方式 ----------
+adapter:
+  mode: subprocess          # subprocess=子进程跑脚本(推荐) | python=同进程调函数
+  command: ["python", "demo/train_mnist.py"]   # mode=subprocess 时
+  # entry: "mypkg.train:run_trial"                 # mode=python 时（module.path:函数名）
+  config_via: env           # env=TANSUO_TRIAL_CONFIG 环境变量传 JSON | file=TANSUO_CONFIG_FILE 传临时文件路径
+  timeout_s: 300            # 单次试验超时红线
+
+# ---------- 预算 ----------
+budget:
+  total_trials: 30          # 一次会话最多跑多少次试验
+  wake_every: 5             # 每完成多少次试验唤醒 agent 一轮
+  seed: 42                  # TPE 采样种子（可复现）
+  data_fraction: 0.5        # 训练集抽样比例（加速开关；1.0=全量。纯 CPU 演示建议 ≤0.5）
+
+# ---------- 早停剪枝器 ----------
+pruner:
+  type: median              # 目前仅支持 median（MedianPruner）
+  n_startup_trials: 4       # 前 N 次试验不剪枝，先积累比较样本
+  n_warmup_steps: 1         # 每个试验至少跑满 N 步才参与剪枝比较
+
+# ---------- LLM agent（监督者） ----------
+agent:
+  enabled: true             # false 等价于 --no-agent
+  model: qwen3-max
+  base_url: ${ENV:ANTHROPIC_BASE_URL:}      # 空则用 SDK 默认/环境变量
+  auth_token: ${ENV:ANTHROPIC_AUTH_TOKEN:}
+  max_wake_rounds: 6        # 全会话最多唤醒轮数
+  max_turns_per_wake: 10    # 每轮最多 messages 往返
+  max_tool_calls_per_wake: 8
+  max_space_edits_total: 6  # 全会话最多空间编辑次数
+  max_consecutive_failures: 3   # LLM 连续失败 N 次→本会话自动降级 --no-agent
+  # ---------- 权限 hook：工具执行前的权限策略 ----------
+  # 每个工具调用都会经过钩子链；全程写 journal 审计。
+  # 取值：allow=放行 | confirm=控制台人工确认 | deny=禁用
+  permissions:
+    default: allow
+    # edit_search_space: confirm      # 例：空间编辑需人工确认
+    # add_custom_trial: confirm       # 例：假设试验需人工确认
+
+# ---------- 结果存储 ----------
+storage:
+  url: sqlite:///demo/data/tansuo.db   # 也支持 journal://demo/data/optuna_journal.jsonl
