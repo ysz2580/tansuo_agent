@@ -12,5 +12,6 @@ mnist_data/
 
 # 前端
 web/node_modules/
-web/dist/
 web/*.tsbuildinfo
+# 注：web/dist（前端构建产物）随仓库提交，保证其它机器克隆后无需 Node 即可用 Web 界面；
+# 修改前端后需重新 `cd web && npm run build` 并把 dist 一并提交。

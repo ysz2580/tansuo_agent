@@ -84,9 +84,11 @@ Ctrl+C 会写 finish 事件并提示续跑。
 大模型 API 切换（探测→写回 settings.yaml）与报告查看，全部在浏览器里完成：
 
 ```powershell
-# 方式一（生产，单端口）：前端已构建时由后端直接托管
-cd web && npm install && npm run build
+# 方式一（生产，单端口）：web/dist 构建产物已随仓库提交，克隆后直接起服务即可
 python cli.py web                # 打开 http://127.0.0.1:8000
+
+# 修改过前端后需重建并提交 dist：
+cd web && npm install && npm run build
 
 # 方式二（开发热重载）：前后端分开跑
 python cli.py web                # 后端 :8000
