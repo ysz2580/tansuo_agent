@@ -19,11 +19,11 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..analysis import learning_curves, summarize
 from ..config import ConfigError, load_settings
-from ..journal import Journal
+from ..journal import TRIAL_END, Journal
 from ..space import SearchSpace, SpaceError
 from ..study import create_or_load_study
 from .run_manager import RunManager
@@ -95,8 +95,22 @@ def summary():
     s["experiment"] = settings.experiment_name
     s["budget_total"] = settings.budget.total_trials
     s["space_version"] = space.version
+    s["workers"] = settings.budget.workers
     s["watch"] = [{"name": m.name, "direction": m.direction}
                   for m in settings.metrics.watch]
+    # ETA：最近 ≤10 次已完结试验平均耗时 × 剩余预算 ÷ 并发数（无样本返回 null）
+    from optuna.trial import TrialState
+    finished = len(study.get_trials(
+        deepcopy=False,
+        states=(TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL)))
+    budget_left = max(0, settings.budget.total_trials - finished)
+    ends = [e for e in journal.load_events()
+            if e.get("kind") == TRIAL_END
+            and isinstance(e.get("duration_s"), (int, float))]
+    recent = [float(e["duration_s"]) for e in ends[-10:]]
+    s["eta_s"] = (round(sum(recent) / len(recent) * budget_left
+                  / max(1, settings.budget.workers))
+                  if recent and budget_left > 0 else None)
     return s
 
 
@@ -199,6 +213,10 @@ class RunStartBody(BaseModel):
     wake_every: int | None = None
     no_agent: bool = False
     fresh: bool = False
+    workers: int | None = Field(default=None, ge=1, le=32,
+                                description="并行试验数（缺省取 settings budget.workers）")
+    max_duration_h: float | None = Field(default=None, gt=0,
+                                         description="时间预算（小时），到点优雅收尾")
 
 
 @app.get("/api/run/status")
@@ -235,7 +253,8 @@ def run_start(body: RunStartBody):
     try:
         return RUN.start(settings.data_dir, trials=trials_arg,
                          wake_every=body.wake_every, no_agent=body.no_agent,
-                         fresh=body.fresh)
+                         fresh=body.fresh, workers=body.workers,
+                         max_duration_h=body.max_duration_h)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 

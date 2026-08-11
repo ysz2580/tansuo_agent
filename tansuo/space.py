@@ -58,10 +58,33 @@ class ParamSpec:
     env_high: float | None = None
     # ---- 冻结状态 ----
     frozen: Any = None
+    # ---- 条件依赖：{父参数名: [允许取值...]}，全部满足才生效（父参数必须是先定义的 choice）----
+    depends_on: dict | None = None
 
     @property
     def is_frozen(self) -> bool:
         return self.frozen is not None
+
+    @property
+    def is_conditional(self) -> bool:
+        return bool(self.depends_on)
+
+    def condition_met(self, cfg: dict) -> bool:
+        """已构建的配置是否满足 depends_on（无依赖恒为 True）。父参数缺失视为不满足。"""
+        if not self.depends_on:
+            return True
+        for pname, vals in self.depends_on.items():
+            if pname not in cfg or cfg[pname] not in vals:
+                return False
+        return True
+
+    def dep_text(self) -> str:
+        """依赖关系的可读文本（注入 agent 上下文 / space show / 报告）。"""
+        if not self.depends_on:
+            return ""
+        parts = [f"{pn} ∈ {{{', '.join(map(str, vs))}}}"
+                 for pn, vs in self.depends_on.items()]
+        return "仅当 " + " 且 ".join(parts) + " 时生效"
 
     def domain_contains(self, value: Any) -> bool:
         if self.kind == "choice":
@@ -85,7 +108,8 @@ class ParamSpec:
 
     def brief(self) -> str:
         frozen_txt = f"  【已冻结={self.frozen}】" if self.is_frozen else ""
-        return f"- {self.name} [{self.kind}] {self.domain_text()}{frozen_txt}" + (
+        dep_txt = f"  【{self.dep_text()}】" if self.is_conditional else ""
+        return f"- {self.name} [{self.kind}] {self.domain_text()}{frozen_txt}{dep_txt}" + (
             f"\n    含义: {self.description}" if self.description else "")
 
 
@@ -127,7 +151,8 @@ class SearchSpace:
         if not isinstance(params_raw, list) or not params_raw:
             raise SpaceError("搜索空间必须包含非空的 params 列表")
         valid_keys = {"name", "type", "choices", "low", "high", "log",
-                      "description", "env_choices", "env_low", "env_high", "frozen"}
+                      "description", "env_choices", "env_low", "env_high", "frozen",
+                      "depends_on"}
         params: list[ParamSpec] = []
         seen: set[str] = set()
         for i, pr in enumerate(params_raw):
@@ -153,6 +178,36 @@ class SearchSpace:
                     f"参数 {name} 缺少 description：配置即文档，每个超参数都必须写明含义"
                     f"（它也是 agent 自主调节搜索空间的领域知识依据）")
             log = bool(pr.get("log", False))
+            # ---- 条件依赖解析：父参数必须已定义（排在前面）、必须是 choice、取值 ⊆ 父候选集 ----
+            dep_raw = pr.get("depends_on")
+            depends_on: dict | None = None
+            if dep_raw is not None:
+                if not isinstance(dep_raw, dict) or not dep_raw:
+                    raise SpaceError(
+                        f"参数 {name} 的 depends_on 必须是非空映射"
+                        f"（父参数名 → 取值或取值列表），实际：{dep_raw!r}")
+                depends_on = {}
+                by_name = {p.name: p for p in params}   # 只含本参数之前的定义
+                for pname, pvals in dep_raw.items():
+                    pname = str(pname)
+                    parent = by_name.get(pname)
+                    if parent is None:
+                        raise SpaceError(
+                            f"参数 {name} 依赖的父参数 '{pname}' 不存在，或定义在它后面"
+                            f"（被依赖的参数必须排在前面，现有参数：{sorted(by_name)}）")
+                    if parent.kind != "choice":
+                        raise SpaceError(
+                            f"参数 {name} 依赖的父参数 '{pname}' 必须是 choice 类型"
+                            f"（当前仅支持分类父参数），实际是 {parent.kind}")
+                    vals = pvals if isinstance(pvals, list) else [pvals]
+                    if not vals:
+                        raise SpaceError(f"参数 {name} 的依赖 depends_on.{pname} 取值列表为空")
+                    bad = [v for v in vals if v not in (parent.env_choices or [])]
+                    if bad:
+                        raise SpaceError(
+                            f"参数 {name} 的依赖取值 {bad} 不在父参数 {pname} 的候选集 "
+                            f"{parent.env_choices} 内")
+                    depends_on[pname] = vals
             if kind == "choice":
                 choices = pr.get("choices")
                 if not isinstance(choices, list) or not choices:
@@ -167,7 +222,8 @@ class SearchSpace:
                     raise SpaceError(f"参数 {name} 的 choices 超出 envelope 范围")
                 frozen = pr.get("frozen", None)
                 params.append(ParamSpec(name=name, kind=kind, choices=list(choices),
-                                        description=desc, env_choices=env_choices, frozen=frozen))
+                                        description=desc, env_choices=env_choices,
+                                        frozen=frozen, depends_on=depends_on))
             else:
                 try:
                     low, high = float(pr["low"]), float(pr["high"])
@@ -189,7 +245,7 @@ class SearchSpace:
                 frozen = pr.get("frozen", None)
                 params.append(ParamSpec(name=name, kind=kind, low=low, high=high, log=log,
                                         description=desc, env_low=env_low, env_high=env_high,
-                                        frozen=frozen))
+                                        frozen=frozen, depends_on=depends_on))
         space = cls(params)
         v = data.get("version")
         if isinstance(v, int) and v >= 1:
@@ -208,6 +264,10 @@ class SearchSpace:
                           "env_low": p.env_low, "env_high": p.env_high})
             if p.is_frozen:
                 d["frozen"] = p.frozen
+            if p.is_conditional:
+                # 单值写回标量、多值写回列表（from_dict 两种都接受）
+                d["depends_on"] = {pn: (vs[0] if len(vs) == 1 else list(vs))
+                                   for pn, vs in p.depends_on.items()}
             out["params"].append(d)
         return out
 
@@ -235,9 +295,15 @@ class SearchSpace:
         return sum(1 for p in self.params if not p.is_frozen)
 
     def suggest(self, trial) -> dict:
-        """从当前空间为一试验取样。冻结参数不 suggest、直接注入常量。"""
+        """从当前空间为一试验取样。冻结参数不 suggest、直接注入常量。
+
+        条件参数（depends_on）仅在已构建配置满足条件时才取样；不满足时该试验
+        params 缺少此键——TPE 对缺键历史试验自动跳过（Optuna 官方动态空间机制）。
+        """
         cfg: dict = {}
         for p in self.params:
+            if not p.condition_met(cfg):
+                continue
             if p.is_frozen:
                 cfg[p.name] = p.frozen
                 continue
@@ -252,10 +318,11 @@ class SearchSpace:
         return cfg
 
     def inject(self, cfg: dict, trial=None) -> dict:
-        """为自定义试验补齐冻结参数（agent 的 add_custom_trial 用）。"""
+        """为自定义试验补齐冻结参数（agent 的 add_custom_trial 用）。
+        条件冻结参数仅在依赖条件满足时注入。"""
         merged = dict(cfg)
         for p in self.params:
-            if p.is_frozen and p.name not in merged:
+            if p.is_frozen and p.name not in merged and p.condition_met(merged):
                 merged[p.name] = p.frozen
         if trial is not None:
             trial.set_user_attr("space_version", self.version)
@@ -264,10 +331,16 @@ class SearchSpace:
     def validate_config(self, cfg: dict) -> list[str]:
         """校验一组完整超参数取值是否在当前空间内（返回错误列表，空=通过）。"""
         errors: list[str] = []
+        probe = self.inject(dict(cfg))   # 补齐冻结值后，再判断条件参数的生效状态
         for p in self.params:
+            active = p.condition_met(probe)
             if p.name not in cfg:
-                if not p.is_frozen:
+                if not p.is_frozen and active:
                     errors.append(f"缺少参数 {p.name}")
+                continue
+            if not active:
+                errors.append(
+                    f"参数 {p.name} {p.dep_text()}，当前父参数取值不满足，不应提供该参数")
                 continue
             v = cfg[p.name]
             if p.is_frozen and v != p.frozen:

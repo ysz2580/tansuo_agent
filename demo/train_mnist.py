@@ -102,7 +102,7 @@ def make_optimizer(model, cfg):
         return torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=wd)
     if name == "sgd":
         return torch.optim.SGD(model.parameters(), lr=float(cfg["lr"]),
-                               momentum=0.9, weight_decay=wd)
+                               momentum=float(cfg.get("momentum", 0.9)), weight_decay=wd)
     raise RuntimeError(f"未知 optimizer：{name}（支持 adam/adamw/sgd）")
 
 

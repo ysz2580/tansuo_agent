@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ TRIAL_START = "trial_start"
 TRIAL_END = "trial_end"
 TRIAL_PRUNED = "trial_pruned"
 TRIAL_FAIL = "trial_fail"
+TRIAL_RETRY = "trial_retry"
 SPACE_PATCH = "space_patch"
 AGENT_WAKEUP = "agent_wakeup"
 AGENT_TOOL_CALL = "agent_tool_call"
@@ -22,18 +24,22 @@ FINISH = "finish"
 
 
 class Journal:
-    """追加式 JSONL 日志。每行一个事件，立即 flush（崩溃不丢数据）。"""
+    """追加式 JSONL 日志。每行一个事件，立即 flush（崩溃不丢数据）。
+    append 持锁写入，多线程并行试验下保证行完整性。"""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
 
     def append(self, kind: str, **fields) -> dict:
         rec = {"schema_version": SCHEMA_VERSION, "kind": kind,
                "ts": time.strftime("%Y-%m-%d %H:%M:%S"), **fields}
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-            f.flush()
+        line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
         return rec
 
     def load_events(self) -> list[dict]:

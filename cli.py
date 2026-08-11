@@ -75,6 +75,12 @@ def cmd_run(args) -> int:
 
     total = args.trials or settings.budget.total_trials
     wake = args.wake_every or settings.budget.wake_every
+    if args.workers is not None and args.workers < 1:
+        print("参数错误：--workers 必须 ≥ 1", file=sys.stderr)
+        return 2
+    if args.hours is not None and args.hours <= 0:
+        print("参数错误：--hours 必须是正数（小时）", file=sys.stderr)
+        return 2
 
     agent_on = settings.agent.enabled and not args.no_agent
     supervisor = None
@@ -92,9 +98,15 @@ def cmd_run(args) -> int:
     else:
         print("[agent] 已禁用（--no-agent / settings agent.enabled=false），纯 Optuna 巡航。")
 
+    workers = args.workers or settings.budget.workers
     print(f"实验：{settings.experiment_name} | 主指标：{settings.metrics.primary.name}"
-          f"（{settings.metrics.primary.better}）| 预算：{total} 次试验 | 每 {wake} 次唤醒")
-    orch.run(total_trials=total, wake_every=wake, supervisor=supervisor)
+          f"（{settings.metrics.primary.better}）| 预算：{total} 次试验 | 每 {wake} 次唤醒"
+          + (f" | 并行 {workers} worker" if workers > 1 else "")
+          + (f" | 时间上限 {args.hours:g}h" if args.hours else
+             (f" | 时间上限 {settings.budget.max_duration_h:g}h"
+              if settings.budget.max_duration_h else "")))
+    orch.run(total_trials=total, wake_every=wake, supervisor=supervisor,
+             workers=args.workers, max_duration_h=args.hours)
     try:
         from tansuo.report import generate_report
         report_path, best_path = generate_report(settings, orch.study, orch.space, orch.journal)
@@ -175,11 +187,13 @@ def cmd_init(args) -> int:
 
 
 def cmd_web(args) -> int:
-    import uvicorn
-    from tansuo.web.app import app
-    # 路径以绝对路径经环境变量注入，后端不受启动目录影响
+    # 路径以绝对路径经环境变量注入，后端不受启动目录影响。
+    # 必须在导入 app 之前设置：app 模块加载时就读取这两个环境变量，
+    # 顺序颠倒会让 --settings/--space 被静默忽略（永远回退 demo 配置）。
     os.environ["TANSUO_SETTINGS"] = str(Path(args.settings).resolve())
     os.environ["TANSUO_SPACE"] = str(Path(args.space).resolve())
+    import uvicorn
+    from tansuo.web.app import app
     print(f"Web 后端：http://{args.host}:{args.port}")
     print(f"前端开发模式：cd web && npm run dev（自动代理 /api → :{args.port}）")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
@@ -238,6 +252,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="断点续跑（默认行为即续跑；此标志为显式声明）")
     pr.add_argument("--seed", type=int, default=None, help="覆盖 TPE 采样种子")
     pr.add_argument("--model", default=None, help="覆盖 agent 模型名")
+    pr.add_argument("--workers", type=int, default=None,
+                    help="并行试验数（默认取 settings budget.workers，1=串行）")
+    pr.add_argument("--hours", type=float, default=None,
+                    help="会话时间预算（小时）：到点在途试验跑完后优雅收尾")
     pr.add_argument("--fresh", action="store_true", help="清空历史（db/journal/快照）重新开始")
     pr.set_defaults(fn=cmd_run)
 

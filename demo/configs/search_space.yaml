@@ -9,6 +9,10 @@
 #   type: float   —— 连续区间，配合 low/high，可选 log: true（对数均匀）
 #   type: int     —— 整数区间，配合 low/high
 #
+# 条件依赖（可选）：
+#   depends_on: {父参数名: 取值} 或 {父参数名: [取值1, 取值2]}（多键=同时满足）
+#   父参数必须是定义在前面的 choice 参数；条件不满足时该参数不参与取样。
+#
 # 注意：log: true 的参数 low 必须 > 0；数值请写成 1.0e-4 这种带小数点
 # 的科学计数法（YAML 1.1 会把 1e-4 解析成字符串）。
 # ============================================================
@@ -21,6 +25,15 @@ params:
       优化算法。Adam/AdamW 对小学习率(1e-4~1e-3)稳定、收敛快；
       SGD(动量0.9)通常需要更高的学习率(0.01~0.3)，低 lr 下收敛很慢。
       AdamW = Adam + 解耦权重衰减。
+
+  - name: momentum
+    type: float
+    low: 0.5
+    high: 0.99
+    depends_on: {optimizer: sgd}   # 条件参数：仅当 optimizer=sgd 时取样
+    description: >-
+      SGD 动量系数（条件参数，仅 optimizer=sgd 时生效）。0.9 是经典默认；
+      更高(0.95~0.99)收敛更快但更易震荡，过低(≤0.5)接近无动量的纯梯度下降。
 
   - name: lr
     type: float

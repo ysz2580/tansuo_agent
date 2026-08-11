@@ -33,6 +33,8 @@ export default function SettingsPage() {
 function RunPanel() {
   const [trials, setTrials] = useState("2")
   const [wakeEvery, setWakeEvery] = useState("5")
+  const [workers, setWorkers] = useState("")
+  const [hours, setHours] = useState("")
   const [noAgent, setNoAgent] = useState(false)
   const [fresh, setFresh] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -48,9 +50,13 @@ function RunPanel() {
     try {
       const t = parseInt(trials)
       const w = parseInt(wakeEvery)
+      const k = parseInt(workers)
+      const h = parseFloat(hours)
       await api.runStart({
         trials: Number.isFinite(t) && t > 0 ? t : undefined,
         wake_every: Number.isFinite(w) && w > 0 ? w : undefined,
+        workers: Number.isFinite(k) && k > 0 ? k : undefined,
+        max_duration_h: Number.isFinite(h) && h > 0 ? h : undefined,
         no_agent: noAgent,
         fresh,
       })
@@ -98,6 +104,7 @@ function RunPanel() {
         </CardTitle>
         <CardDescription>
           启动一次搜索（子进程方式，等价于 python cli.py run）；「清空重来」会删除历史 db/journal/快照。
+          并发数留空取 settings 默认；时长上限到点后在途试验跑完即优雅收尾。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -111,6 +118,16 @@ function RunPanel() {
             <Label htmlFor="wake">每 N 次唤醒 agent</Label>
             <Input id="wake" className="w-28" value={wakeEvery}
                    onChange={(e) => setWakeEvery(e.target.value)} />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="workers">并发数</Label>
+            <Input id="workers" className="w-24" placeholder="默认" value={workers}
+                   onChange={(e) => setWorkers(e.target.value)} />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="hours">时长上限（小时）</Label>
+            <Input id="hours" className="w-24" placeholder="不限" value={hours}
+                   onChange={(e) => setHours(e.target.value)} />
           </div>
           <div className="flex items-center gap-2 pb-2">
             <Switch id="noagent" checked={noAgent} onCheckedChange={setNoAgent} />

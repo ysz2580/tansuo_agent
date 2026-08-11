@@ -23,6 +23,13 @@ function fmt(v: number | null | undefined, digits = 4): string {
   return v === null || v === undefined ? "—" : v.toFixed(digits)
 }
 
+/** 秒数 → 人类可读时长（与 CLI 进度行的 ETA≈ 格式一致）。 */
+function fmtEta(seconds: number): string {
+  if (seconds < 90) return `${Math.round(seconds)}s`
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m`
+  return `${(seconds / 3600).toFixed(1)}h`
+}
+
 export default function DashboardPage() {
   const { data: summary, error: sumErr } = usePolling<Summary>(api.summary, 5000)
   const { data: curves } = usePolling(api.curves, 10000)
@@ -44,7 +51,9 @@ export default function DashboardPage() {
         <StatCard title="试验统计" value={`${c.completed} 完成`}
                   sub={`${c.pruned} 剪枝 ｜ ${c.failed} 失败 ｜ ${c.running} 进行中`} />
         <StatCard title="预算" value={`${finished} / ${summary.budget_total}`}
-                  sub={`剩余 ${Math.max(0, summary.budget_total - finished)} 次`} />
+                  sub={`剩余 ${Math.max(0, summary.budget_total - finished)} 次`
+                    + (summary.eta_s !== null ? ` · ETA≈${fmtEta(summary.eta_s)}` : "")
+                    + (summary.workers > 1 ? ` · ${summary.workers} 并发` : "")} />
         <StatCard title="搜索空间" value={`v${summary.space_version}`}
                   sub={summary.convergence.length > 24 ? undefined : summary.convergence} />
       </div>

@@ -31,6 +31,8 @@ export interface Summary {
   experiment: string
   budget_total: number
   space_version: number
+  workers: number
+  eta_s: number | null
   watch: { name: string; direction: string }[]
 }
 
@@ -86,6 +88,7 @@ export interface SpaceParam {
   env_low?: number
   env_high?: number
   frozen?: string | number | null
+  depends_on?: Record<string, unknown>
 }
 
 export interface SpacePatchEvent {
@@ -171,7 +174,7 @@ export const api = {
   reportGenerate: () => http<{ report: string; best: string }>("/report/generate", { method: "POST" }),
   runStatus: () => http<RunStatus>("/run/status"),
   runLog: (tail = 300) => http<RunLogResp>(`/run/log?tail=${tail}`),
-  runStart: (body: { trials?: number; wake_every?: number; no_agent?: boolean; fresh?: boolean }) =>
+  runStart: (body: { trials?: number; wake_every?: number; no_agent?: boolean; fresh?: boolean; workers?: number; max_duration_h?: number }) =>
     http<RunStatus>("/run/start", { method: "POST", body: JSON.stringify(body) }),
   runStop: () => http<RunStatus & { marked_failed?: number[] }>("/run/stop", { method: "POST", body: "{}" }),
   agentConfig: () => http<AgentConfig>("/config/agent"),

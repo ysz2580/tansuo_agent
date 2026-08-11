@@ -69,7 +69,7 @@ def make_space(tmp: Path) -> SearchSpace:
 def test_load_and_suggest(tmp: Path) -> None:
     print("== 空间加载与 suggest ==")
     sp = make_space(tmp)
-    ok("9 个参数", len(sp.params) == 9)
+    ok("10 个参数（含条件参数 momentum）", len(sp.params) == 10)
     ok("envelope 记录", sp._by_name["lr"].env_low == 1e-4 and sp._by_name["lr"].env_high == 0.3)
 
     import optuna
@@ -78,12 +78,15 @@ def test_load_and_suggest(tmp: Path) -> None:
 
     def objective(trial):
         cfg = sp.suggest(trial)
-        assert set(cfg) == {p.name for p in sp.params}
+        names = {p.name for p in sp.params}
+        # 条件参数：momentum 仅在 optimizer=sgd 时出现
+        expected = names if cfg["optimizer"] == "sgd" else names - {"momentum"}
+        assert set(cfg) == expected, f"cfg 键集异常：{sorted(cfg)}"
         assert cfg["optimizer"] in ("adam", "adamw", "sgd")
         assert 2 <= cfg["epochs"] <= 5
         return 0.0
     study.optimize(objective, n_trials=5)
-    ok("suggest 5 次取样合法", True)
+    ok("suggest 5 次取样合法（含条件参数）", True)
 
 
 def test_patch(tmp: Path) -> None:
@@ -126,16 +129,17 @@ def test_patch(tmp: Path) -> None:
     r = sp.apply_patch([{"op": "freeze", "param": "augment", "value": "flip"}], "非法取值")
     ok("freeze 非法取值被拒", not r.ok)
 
-    # 冻死护栏：9 个参数，冻住 7 个后只剩 2 个自由（< MIN_FREE_PARAMS=3）→ 应被拒
+    # 冻死护栏：10 个参数（含条件 momentum），已冻 1，再批量冻 3 剩 6 自由；
+    # 试图一次再冻 4 个 → 只剩 2（< MIN_FREE_PARAMS=3）→ 应被拒
     freeze_more = [{"op": "freeze", "param": n, "value": v} for n, v in
                    [("scheduler", "none"), ("batch_size", 64), ("augment", "none")]]
     r = sp.apply_patch(freeze_more, "批量冻结三个")
-    ok("批量冻结通过（还剩 5 自由）", r.ok and sp.free_param_count() == 5)
+    ok("批量冻结通过（还剩 6 自由）", r.ok and sp.free_param_count() == 6)
     freeze_rest = [{"op": "freeze", "param": n, "value": v} for n, v in
-                   [("width", 16), ("dropout", 0.2), ("lr", 1e-3)]]
-    r = sp.apply_patch(freeze_rest, "再冻三个")
+                   [("width", 16), ("dropout", 0.2), ("lr", 1e-3), ("weight_decay", 1e-4)]]
+    r = sp.apply_patch(freeze_rest, "再冻四个")
     ok("冻死被拒（自由参数 < 3）", not r.ok and "冻死" in str(r.errors))
-    ok("拒绝是原子的（空间未被部分修改）", sp.free_param_count() == 5)
+    ok("拒绝是原子的（空间未被部分修改）", sp.free_param_count() == 6)
 
     r = sp.apply_patch([{"op": "release", "param": "optimizer"}], "释放观察")
     ok("release 通过", r.ok and not sp._by_name["optimizer"].is_frozen

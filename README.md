@@ -29,7 +29,7 @@ E:\tansuo_agent\
 │   ├── configs\            # settings.yaml + search_space.yaml（带详尽注释）
 │   ├── train_mnist.py      # 演示训练脚本（遵守子进程协议）
 │   └── my_adapter_template.py  # 你自己的训练任务接入模板
-└── tests\                  # 空间护栏 34 / 协议 12 / 权限与降级 21 断言
+└── tests\                  # 空间护栏 34 / 条件空间 30 / 协议 12 / 权限降级 21 / 运行时 23 断言
 ```
 
 ## 快速上手（跑演示）
@@ -54,7 +54,7 @@ agent 决策摘要）与 `best.yaml`。
 
 | 命令 | 作用 |
 |---|---|
-| `run` | 跑搜索。`--trials N --wake-every K --no-agent --resume --fresh --seed --model` |
+| `run` | 跑搜索。`--trials N --wake-every K --workers W --hours H --no-agent --resume --fresh --seed --model` |
 | `space show` | 查看当前搜索空间（含每个参数的语义说明）与补丁历史 |
 | `report` | 重新生成分析报告与 best.yaml |
 | `api` | 大模型 API 自配置：盘点凭据→候选模型探测→写回 settings |
@@ -65,6 +65,17 @@ agent 决策摘要）与 `best.yaml`。
 
 `run` 细节：默认断点续跑（storage 与空间快照都在 `data_dir`）；`--fresh` 清空重来；
 Ctrl+C 会写 finish 事件并提示续跑。
+
+- **并行试验**：`--workers N`（默认取 `budget.workers`）。批内多线程执行
+  （Optuna 官方支持的多线程 ask/tell），每个试验独立子进程；agent 唤醒仍发生在
+  批边界。python 函数模式下并行要求你的函数**线程安全**。
+- **时间预算**：`--hours H`（默认取 `budget.max_duration_h`）。到点后不再派发新试验，
+  在途试验跑完即以 `time_budget_exhausted` 优雅收尾——适合"我有一晚上 GPU"的用法。
+- **失败重试**：`adapter.retry_on_fail`（0-3，默认 0）。非零退出码**且 stderr 为空**
+  判定为瞬时故障自动重试（journal 记 `trial_retry` 事件）；超时/协议错误/stderr
+  有内容是确定性失败，不重试。仅子进程模式生效。
+- **ETA**：进度行与 Web 仪表盘按最近试验平均耗时 × 剩余预算 ÷ 并发数估算剩余时间
+  （断点续跑时从 journal 预热样本）。
 
 ## Web 可视化界面（shadcn/ui 前端）
 
@@ -83,7 +94,8 @@ cd web && npm run dev            # 前端 :5173，/api 自动代理到 :8000
 ```
 
 - **运行控制**：界面上「开始搜索」等价于 `python cli.py run`（子进程驱动，完整复用
-  agent 降级与断点续跑）；「停止」杀整棵进程树，进行中的试验会如实标记为失败。
+  agent 降级与断点续跑），可设本次试验数、唤醒间隔、**并发数**与**时长上限（小时）**；
+  「停止」杀整棵进程树，进行中的试验会如实标记为失败。仪表盘预算卡片展示 ETA 估算。
 - **API 切换**：设置页改 model / base_url / auth_token，保存前先做两级探测
   （ping + tool-use），失败不落盘。token 留空 = 保持现有 `${ENV:...}` 环境变量引用；
   填明文 = 写入 settings.yaml（界面会警告密钥入库风险）。
@@ -103,7 +115,13 @@ adapter:
   mode: subprocess
   command: ["python", "demo/train_mnist.py"]
   timeout_s: 300
-budget: {total_trials: 30, wake_every: 5, data_fraction: 0.5}
+  retry_on_fail: 1        # 瞬时故障（非零退出码且 stderr 为空）自动重试次数
+budget:
+  total_trials: 30
+  wake_every: 5
+  data_fraction: 0.5
+  workers: 1              # 并行试验数（1=串行，上限 32）
+  # max_duration_h: 8     # 可选时间预算（小时）：到点在途试验跑完后优雅收尾
 agent:
   model: qwen3-max
   permissions: {default: allow}    # 权限 hook：allow/confirm/deny，可按工具配置
@@ -111,7 +129,23 @@ agent:
 
 **search_space.yaml** 每个参数必须带中文 `description`（含义 + 取值建议）——它既是
 给人看的文档，也是注入 agent system prompt 的领域知识（例如它看到高 lr 区间频繁
-发散，就有依据地收窄 lr 上界）。
+发散，就有依据地收窄 lr 上界）。支持**条件参数**（真实调参几乎都是条件空间）：
+
+```yaml
+- name: optimizer
+  type: choice
+  choices: [adam, sgd]
+  description: 优化器
+- name: momentum
+  type: float
+  low: 0.5
+  high: 0.99
+  depends_on: {optimizer: sgd}   # 仅 optimizer=sgd 时生效；值可为列表，多键=AND
+  description: SGD 动量系数
+```
+
+条件不满足的试验不会取样该参数（TPE 正确处理"缺参数"的历史试验）；`space show`
+与 Web 空间页会标注依赖关系，agent 上下文中同样可见。
 
 ## agent 框架：skill / loop / hooks
 
@@ -148,7 +182,9 @@ agent:
 - **端点不支持 tool-use？** `check` 会在第 2 级探测暴露；用 `--no-agent` 巡航，
   或换支持 function calling 的端点/模型。
 - **试验太慢？** `budget.data_fraction`（训练集抽样，演示默认 0.5）、调小 epochs
-  上界、提高 `adapter.timeout_s` 前先评估单次耗时。
+  上界、提高 `adapter.timeout_s` 前先评估单次耗时；多核/多卡机器用
+  `budget.workers`（或 `--workers`）并行跑试验，ETA 会按并发数折算。
+  机器不稳定常偶发退出码 1？设 `adapter.retry_on_fail: 1` 自动重试瞬时故障。
 - **为什么不能改分类参数的候选集？** Optuna storage 拒绝动态
   CategoricalDistribution（实测）。聚焦分类参数用 `freeze` 固定到某个取值。
 - **怎么看 agent 干了什么？** `demo/data/journal.jsonl`（JSONL 事件流：试验/补丁/

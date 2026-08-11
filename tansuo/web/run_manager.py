@@ -56,7 +56,8 @@ class RunManager:
 
     def start(self, data_dir: str | Path, trials: int | None = None,
               wake_every: int | None = None, no_agent: bool = False,
-              fresh: bool = False) -> dict:
+              fresh: bool = False, workers: int | None = None,
+              max_duration_h: float | None = None) -> dict:
         if self.running:
             raise RuntimeError(f"已有搜索在运行（pid={self.pid}），请先停止再启动新任务")
         data_dir = Path(data_dir)
@@ -74,6 +75,10 @@ class RunManager:
             cmd.append("--no-agent")
         if fresh:
             cmd.append("--fresh")
+        if workers and workers > 0:
+            cmd += ["--workers", str(workers)]
+        if max_duration_h and max_duration_h > 0:
+            cmd += ["--hours", str(max_duration_h)]
         kwargs: dict = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP

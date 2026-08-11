@@ -13,7 +13,8 @@ import optuna
 
 from .adapter import PROTOCOL_PREFIX, make_adapter
 from .config import Settings
-from .journal import TRIAL_END, TRIAL_FAIL, TRIAL_PRUNED, TRIAL_START, Journal
+from .journal import (TRIAL_END, TRIAL_FAIL, TRIAL_PRUNED, TRIAL_RETRY,
+                      TRIAL_START, Journal)
 from .space import SearchSpace
 
 
@@ -76,7 +77,8 @@ class TrialRunner:
         extra_env: dict[str, str] = {}
         if settings.budget.data_fraction < 1.0:
             extra_env["TANSUO_DATA_FRACTION"] = str(settings.budget.data_fraction)
-        self.adapter = make_adapter(settings.adapter, extra_env=extra_env)
+        # adapter 按试验创建（并行时每个线程持有独立实例；构造廉价，进程 run() 时才 spawn）
+        self._extra_env = extra_env
         self.primary = settings.metrics.primary.name
         self.direction = settings.metrics.primary.direction
 
@@ -100,6 +102,7 @@ class TrialRunner:
                             custom=cfg_override is not None, note=note)
         curve: list[dict] = []
         final_value: dict = {"v": None}
+        adapter = make_adapter(self.settings.adapter, extra_env=self._extra_env)
 
         def _handle_epoch(payload: dict) -> None:
             metrics = payload.get("metrics") or {}
@@ -145,29 +148,46 @@ class TrialRunner:
                 _handle_final(payload)
             # 其它 type 忽略（允许脚本扩展）
 
-        if self.adapter.mode == "subprocess":
+        if adapter.mode == "subprocess":
             def on_line(line: str) -> None:
                 payload = parse_metric_line(line)
                 if payload is not None:
                     _dispatch(payload)
-            try:
-                result = self.adapter.run(cfg, on_line)
-            except _PruneSignal:
-                self.adapter.kill()
-                self.journal.append(TRIAL_PRUNED, trial=trial.number, epochs=len(curve))
-                raise optuna.TrialPruned()
-            except TrialFailedError:
-                self.adapter.kill()
-                raise
+            attempts = self.settings.adapter.retry_on_fail + 1
+            result = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    result = adapter.run(cfg, on_line)
+                except _PruneSignal:
+                    adapter.kill()
+                    self.journal.append(TRIAL_PRUNED, trial=trial.number, epochs=len(curve))
+                    raise optuna.TrialPruned()
+                except TrialFailedError:
+                    adapter.kill()
+                    raise
+                # 可重试的瞬时故障：非零退出码 且 stderr 为空 且未超时
+                # （超时/协议错误/stderr 有内容都是确定性失败，重试无益）
+                transient = (result.exit_code != 0 and not result.timed_out
+                             and not (result.stderr_tail or "").strip())
+                if transient and attempt < attempts:
+                    self.journal.append(TRIAL_RETRY, trial=trial.number, attempt=attempt,
+                                        reason=f"退出码 {result.exit_code} 且 stderr 为空，判定瞬时故障")
+                    curve.clear()
+                    final_value["v"] = None
+                    continue
+                break
             if result.timed_out:
                 raise TrialFailedError(
                     f"训练超时（>{self.settings.adapter.timeout_s}s）",
                     hint="可减少 epochs/width 或调低 budget.data_fraction；"
                          "也可在 settings.yaml 提高 adapter.timeout_s")
             if result.exit_code != 0:
+                retried = attempt - 1   # 实际发生的重试次数（确定性失败可能为 0）
                 raise TrialFailedError(
-                    f"训练脚本退出码 {result.exit_code}",
-                    hint="查看下方 stderr/stdout 尾部定位脚本错误（若都为空，多为环境瞬时问题，重试即可）",
+                    f"训练脚本退出码 {result.exit_code}"
+                    + (f"（已自动重试 {retried} 次仍失败）" if retried else ""),
+                    hint="查看下方 stderr/stdout 尾部定位脚本错误（若都为空，多为环境瞬时问题，"
+                         "可在 settings.yaml 设置 adapter.retry_on_fail 自动重试）",
                     detail=(f"stderr: {result.stderr_tail or '(空)'} | "
                             f"stdout 尾部: {result.stdout_tail[-3:] or '(空)'}"))
             if final_value["v"] is None:
@@ -182,7 +202,7 @@ class TrialRunner:
                 _dispatch({"type": "epoch", "epoch": epoch, "metrics": metrics})
                 return True
             try:
-                value = self.adapter.run(cfg, report)
+                value = adapter.run(cfg, report)
             except _PruneSignal:
                 self.journal.append(TRIAL_PRUNED, trial=trial.number, epochs=len(curve))
                 raise optuna.TrialPruned()

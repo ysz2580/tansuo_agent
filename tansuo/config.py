@@ -71,6 +71,7 @@ class AdapterCfg:
     entry: str = ""                   # mode=python: "module.path:fn"
     config_via: str = "env"           # env | file
     timeout_s: int = 300
+    retry_on_fail: int = 0            # 瞬时失败自动重试次数（仅"非零退出码且 stderr 为空"）
 
 
 @dataclass
@@ -79,6 +80,8 @@ class BudgetCfg:
     wake_every: int = 5
     seed: int = 42
     data_fraction: float = 1.0   # 训练集抽样比例（加速开关，注入 TANSUO_DATA_FRACTION）
+    workers: int = 1             # 并行试验数（多线程 ask/tell + 每试验独立子进程）
+    max_duration_h: float | None = None   # 会话时间预算（小时）；到点优雅收尾
 
 
 @dataclass
@@ -173,6 +176,7 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         entry=str(a.get("entry") or "").strip(),
         config_via=str(a.get("config_via", "env")).strip().lower(),
         timeout_s=int(a.get("timeout_s", 300)),
+        retry_on_fail=int(a.get("retry_on_fail", 0)),
     )
     _require(adapter.mode in ("subprocess", "python"),
              f"adapter.mode 非法：'{adapter.mode}'，必须是 subprocess 或 python")
@@ -186,20 +190,29 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
     _require(adapter.config_via in ("env", "file"),
              f"adapter.config_via 非法：'{adapter.config_via}'，必须是 env 或 file")
     _require(adapter.timeout_s >= 5, "adapter.timeout_s 不能小于 5 秒")
+    _require(0 <= adapter.retry_on_fail <= 3,
+             f"adapter.retry_on_fail 应在 [0, 3] 内（0=不重试），实际 {adapter.retry_on_fail}")
 
     # ---- budget ----
     b = raw.get("budget") or {}
+    max_duration_h = b.get("max_duration_h")
     budget = BudgetCfg(
         total_trials=int(b.get("total_trials", 30)),
         wake_every=int(b.get("wake_every", 5)),
         seed=int(b.get("seed", 42)),
         data_fraction=float(b.get("data_fraction", 1.0)),
+        workers=int(b.get("workers", 1)),
+        max_duration_h=float(max_duration_h) if max_duration_h is not None else None,
     )
     _require(budget.total_trials >= 1, "budget.total_trials 必须 ≥ 1")
     _require(1 <= budget.wake_every <= budget.total_trials,
              f"budget.wake_every 应在 [1, total_trials={budget.total_trials}] 内，实际 {budget.wake_every}")
     _require(0.0 < budget.data_fraction <= 1.0,
              f"budget.data_fraction 应在 (0, 1] 内，实际 {budget.data_fraction}")
+    _require(1 <= budget.workers <= 32,
+             f"budget.workers 应在 [1, 32] 内（1=串行），实际 {budget.workers}")
+    _require(budget.max_duration_h is None or budget.max_duration_h > 0,
+             f"budget.max_duration_h 必须是正数（小时），实际 {budget.max_duration_h}")
 
     # ---- pruner ----
     p = raw.get("pruner") or {}

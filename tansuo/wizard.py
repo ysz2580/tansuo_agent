@@ -40,6 +40,8 @@ adapter:
   # entry: "mypkg.train:run_trial"
   config_via: env            # env=环境变量传 JSON | file=临时文件路径(TANSUO_CONFIG_FILE)
   timeout_s: 300             # 单次试验超时红线（秒）
+  # retry_on_fail: 1         # 瞬时故障自动重试次数（0-3）：仅"非零退出码且 stderr 为空"
+                             # 判为瞬时故障；超时/协议错误/stderr 有内容是确定性失败，不重试
 
 # ---------- 预算 ----------
 budget:
@@ -47,6 +49,9 @@ budget:
   wake_every: 5              # 每完成多少次试验唤醒 agent 一轮
   seed: 42                   # TPE 采样种子（可复现）
   data_fraction: 1.0         # 训练集抽样比例（加速开关；纯 CPU 调试可设 0.5）
+  workers: 1                 # 并行试验数（1=串行，上限 32）；CLI --workers 可临时覆盖
+  # max_duration_h: 8        # 可选时间预算（小时）：到点不再派发新试验，在途试验跑完
+                             # 即以 time_budget_exhausted 收尾；CLI --hours 可临时覆盖
 
 # ---------- 早停剪枝器 ----------
 pruner:
@@ -77,6 +82,8 @@ SPACE_TEMPLATE = """\
 # 每个参数必须带 description（配置即文档；也是 agent 调节空间的
 # 领域知识依据）。参数名在会话中不可更改（TPE 按名建模）。
 # type 取值：choice（离散选项）/ float / int；float 可用 log 尺度。
+# 条件参数：depends_on 声明父参数依赖（父参数必须是定义在前面的 choice），
+# 如 momentum 仅 optimizer=sgd 时生效；条件不满足的试验不取样该参数。
 # ============================================================
 
 params:
@@ -86,6 +93,15 @@ params:
     description: >-
       优化算法。Adam/AdamW 对小学习率稳定；SGD 通常需要更高 lr
       （配合动量 0.9）。按你的训练脚本支持的优化器修改 choices。
+
+  - name: momentum           # ← 示例：条件参数（仅 optimizer=sgd 时生效）
+    type: float
+    low: 0.5
+    high: 0.99
+    depends_on: {optimizer: sgd}   # 值可为列表 {optimizer: [sgd, adam]}；多键=AND
+    description: >-
+      SGD 动量系数。条件参数示例：optimizer 取 adam/adamw 时本参数
+      不参与搜索。不用条件参数可删除本段。
 
   - name: lr                 # ← 示例：log 尺度连续超参数
     type: float

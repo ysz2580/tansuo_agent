@@ -10,6 +10,7 @@ function fmtNum(v: number | undefined): string {
 
 function ParamCard({ p }: { p: SpaceParam }) {
   const frozen = p.frozen !== undefined && p.frozen !== null
+  const deps = p.depends_on ? Object.entries(p.depends_on) : []
   return (
     <Card>
       <CardHeader className="pb-2">
@@ -18,6 +19,12 @@ function ParamCard({ p }: { p: SpaceParam }) {
           <Badge variant="secondary" className="text-xs font-normal">{p.type}</Badge>
           {p.log && <Badge variant="outline" className="text-xs font-normal">log 尺度</Badge>}
           {frozen && <Badge className="bg-blue-600/15 text-blue-700 dark:text-blue-300 text-xs font-normal">已冻结 = {String(p.frozen)}</Badge>}
+          {deps.length > 0 && (
+            <Badge variant="outline" className="border-dashed text-xs font-normal">
+              条件：{deps.map(([k, v]) =>
+                `${k}=${(Array.isArray(v) ? v : [v]).map(String).join("/")}`).join(" 且 ")}
+            </Badge>
+          )}
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-1.5">

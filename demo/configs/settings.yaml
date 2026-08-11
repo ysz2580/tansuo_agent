@@ -28,6 +28,9 @@ adapter:
   # entry: "mypkg.train:run_trial"                 # mode=python 时（module.path:函数名）
   config_via: env           # env=TANSUO_TRIAL_CONFIG 环境变量传 JSON | file=TANSUO_CONFIG_FILE 传临时文件路径
   timeout_s: 300            # 单次试验超时红线
+  retry_on_fail: 1          # 瞬时故障自动重试次数（0-3）：仅"非零退出码且 stderr 为空"
+                            # 判为瞬时故障（CPU 演示场景偶有偶发退出码 1，故默认 1）；
+                            # 超时/协议错误/stderr 有内容是确定性失败，不重试
 
 # ---------- 预算 ----------
 budget:
@@ -35,6 +38,10 @@ budget:
   wake_every: 5             # 每完成多少次试验唤醒 agent 一轮
   seed: 42                  # TPE 采样种子（可复现）
   data_fraction: 0.5        # 训练集抽样比例（加速开关；1.0=全量。纯 CPU 演示建议 ≤0.5）
+  workers: 1                # 并行试验数（1=串行，上限 32）；CLI --workers 可临时覆盖。
+                            # python 函数模式并行要求用户函数线程安全
+  # max_duration_h: 8       # 可选时间预算（小时）：到点不再派发新试验，在途试验跑完
+                            # 即以 time_budget_exhausted 收尾。CLI --hours 可临时覆盖
 
 # ---------- 早停剪枝器 ----------
 pruner:
