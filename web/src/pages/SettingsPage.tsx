@@ -7,6 +7,7 @@ import {
   type ReportResp,
   type RunLogResp,
 } from "@/lib/api"
+import { useCohort } from "@/lib/cohort"
 import { usePolling } from "@/lib/usePolling"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -36,7 +37,8 @@ function RunPanel() {
   const [workers, setWorkers] = useState("")
   const [hours, setHours] = useState("")
   const [noAgent, setNoAgent] = useState(false)
-  const [fresh, setFresh] = useState(false)
+  const [newCohort, setNewCohort] = useState(false)
+  const [note, setNote] = useState("")
   const [busy, setBusy] = useState(false)
 
   const { data: log, error } = usePolling<RunLogResp>(
@@ -58,7 +60,8 @@ function RunPanel() {
         workers: Number.isFinite(k) && k > 0 ? k : undefined,
         max_duration_h: Number.isFinite(h) && h > 0 ? h : undefined,
         no_agent: noAgent,
-        fresh,
+        new_cohort: newCohort,
+        note: note.trim() || undefined,
       })
       toast.success("搜索已启动")
     } catch (e) {
@@ -103,7 +106,8 @@ function RunPanel() {
           )}
         </CardTitle>
         <CardDescription>
-          启动一次搜索（子进程方式，等价于 python cli.py run）；「清空重来」会删除历史 db/journal/快照。
+          启动一次搜索（子进程方式，等价于 python cli.py run）。记录按分区管理、永不删除：
+          训练代码或优化目标变化时会自动新开分区；也可手动「新开分区」并写备注。
           并发数留空取 settings 默认；时长上限到点后在途试验跑完即优雅收尾。
         </CardDescription>
       </CardHeader>
@@ -134,8 +138,13 @@ function RunPanel() {
             <Label htmlFor="noagent">不用 agent（纯 Optuna）</Label>
           </div>
           <div className="flex items-center gap-2 pb-2">
-            <Switch id="fresh" checked={fresh} onCheckedChange={setFresh} />
-            <Label htmlFor="fresh">清空重来</Label>
+            <Switch id="newcohort" checked={newCohort} onCheckedChange={setNewCohort} />
+            <Label htmlFor="newcohort">新开分区（不删除历史记录）</Label>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="note">分区备注</Label>
+            <Input id="note" className="w-44" placeholder="如：换了新模型" value={note}
+                   onChange={(e) => setNote(e.target.value)} />
           </div>
           <div className="ml-auto flex gap-2">
             <Button onClick={start} disabled={running || busy}>开始搜索</Button>
@@ -282,13 +291,14 @@ function ApiConfigPanel() {
 // ------------------------------------------------------------------
 
 function ReportPanel() {
-  const { data: report } = usePolling<ReportResp>(api.report, 15000)
+  const cohort = useCohort()
+  const { data: report } = usePolling<ReportResp>(() => api.report(cohort), 15000)
   const [generating, setGenerating] = useState(false)
 
   const generate = async () => {
     setGenerating(true)
     try {
-      await api.reportGenerate()
+      await api.reportGenerate(cohort)
       toast.success("报告已重新生成")
     } catch (e) {
       toast.error(`生成失败：${e instanceof Error ? e.message : e}`)

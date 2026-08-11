@@ -35,8 +35,13 @@ def _fmt_contrast(contrast: dict) -> list[str]:
 
 
 def generate_report(settings, study, space, journal: Journal,
-                    out_dir: str | Path | None = None) -> tuple[Path, Path]:
-    """生成 report.md 与 best.yaml，返回两者路径。"""
+                    out_dir: str | Path | None = None,
+                    cohort_info: dict | None = None) -> tuple[Path, Path]:
+    """生成 report.md 与 best.yaml，返回两者路径。
+
+    cohort_info（可选）：{"id", "fingerprint", "note"}，写入报告头部作为
+    可比性证据；缺省 None 时输出与旧版一致。
+    """
     out_dir = Path(out_dir) if out_dir else Path(settings.data_dir) / "reports"
     out_dir.mkdir(parents=True, exist_ok=True)
     primary = settings.metrics.primary
@@ -50,6 +55,11 @@ def generate_report(settings, study, space, journal: Journal,
     md.append(f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
     md.append(f"- 主指标：**{primary.name}**（{primary.better}）")
     md.append(f"- 观测指标：{', '.join(m.name for m in settings.metrics.watch) or '（无）'}")
+    if cohort_info:
+        fp = cohort_info.get("fingerprint") or ""
+        md.append(f"- 记录分区：{cohort_info.get('id')}"
+                  + (f"（代码指纹 {fp[:8]}）" if fp else "")
+                  + (f" ｜ 备注：{cohort_info['note']}" if cohort_info.get("note") else ""))
     c = s["counts"]
     md.append(f"- 试验统计：完成 {c['completed']} ｜ 剪枝 {c['pruned']} ｜ "
               f"失败 {c['failed']} ｜ 进行中 {c['running']}")

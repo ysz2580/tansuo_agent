@@ -7,7 +7,10 @@
 
 experiment:
   name: mnist_demo          # 实验名，用于报告标题与日志
-  data_dir: demo/data       # 运行时产物目录（db / journal / 报告 / 空间快照）
+  data_dir: demo/data       # 运行时产物目录（记录按分区存放，永不删除）
+  # fingerprint_paths:      # 可选：参与"代码指纹"的附加文件/目录（目录收 **/*.py）。
+  #   - src/model           # 训练入口脚本之外还有独立模型代码时用它——代码变了会自动
+  #                         # 新开记录分区，避免不可比的新旧结果混在一起（见 README「记录分区管理」）
 
 # ---------- 结果指标定义：有几个指标、各自大好还是小好 ----------
 metrics:

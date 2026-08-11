@@ -172,8 +172,14 @@ class Orchestrator:
     # ---------------- 主循环 ----------------
     def run(self, total_trials: int | None = None, wake_every: int | None = None,
             supervisor=None, workers: int | None = None,
-            max_duration_h: float | None = None) -> None:
-        """跑到预算耗尽 / 时间预算耗尽 / agent finish / Ctrl+C。supervisor 可为 None。"""
+            max_duration_h: float | None = None,
+            cohort: str | None = None, cohort_fp: str | None = None,
+            fp_match: bool | None = None) -> None:
+        """跑到预算耗尽 / 时间预算耗尽 / agent finish / Ctrl+C。supervisor 可为 None。
+
+        cohort/cohort_fp/fp_match：分区管理审计字段（见 tansuo/cohort.py），
+        仅写入 SESSION_START 事件，缺省 None 时行为与旧版完全一致。
+        """
         if total_trials is not None:
             self.total = total_trials
         if workers is not None:
@@ -194,7 +200,8 @@ class Orchestrator:
         self.journal.append(SESSION_START, total=self.total, wake_every=wake_every,
                             resume=already > 0, space_version=self.space.version,
                             study_trials=already, workers=self.workers,
-                            max_duration_h=hours)
+                            max_duration_h=hours, cohort=cohort,
+                            cohort_fp=cohort_fp, fp_match=fp_match)
         self.space.snapshot(self.settings.data_dir)
 
         if self.budget_left() <= 0:

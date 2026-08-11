@@ -17,7 +17,9 @@ SETTINGS_TEMPLATE = """\
 
 experiment:
   name: my_experiment        # 实验名（报告标题/日志用）
-  data_dir: data             # 运行时产物目录（db / journal / 报告 / 空间快照）
+  data_dir: data             # 运行时产物目录（记录按分区存放，永不删除）
+  # fingerprint_paths:       # 可选：参与"代码指纹"的附加文件/目录（目录收 **/*.py）
+  #   - src/model            # 训练入口之外还有独立模型代码时声明；代码变化会自动新开记录分区
 
 # ---------- 结果指标定义：有几个指标、各自大好还是小好 ----------
 metrics:

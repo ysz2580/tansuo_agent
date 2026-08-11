@@ -120,6 +120,7 @@ class Settings:
     pruner: PrunerCfg = field(default_factory=PrunerCfg)
     agent: AgentCfg = field(default_factory=AgentCfg)
     storage: StorageCfg = field(default_factory=StorageCfg)
+    fingerprint_paths: list[str] = field(default_factory=list)  # 分区代码指纹附加文件/目录
     source_path: str = ""
     raw: dict = field(default_factory=dict)
 
@@ -257,6 +258,14 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
              f"storage.url 必须以 sqlite:/// 或 journal:// 开头，实际：'{storage.url}'")
 
     exp = raw.get("experiment") or {}
+    fp_paths_raw = exp.get("fingerprint_paths") or []
+    _require(isinstance(fp_paths_raw, list),
+             "experiment.fingerprint_paths 必须是列表（参与分区代码指纹的文件/目录）")
+    fingerprint_paths = []
+    for i, v in enumerate(fp_paths_raw):
+        _require(isinstance(v, str) and v.strip(),
+                 f"experiment.fingerprint_paths[{i}] 必须是非空字符串路径，实际：{v!r}")
+        fingerprint_paths.append(v.strip())
     return Settings(
         experiment_name=str(exp.get("name", "experiment")).strip() or "experiment",
         data_dir=str(exp.get("data_dir", "data")).strip() or "data",
@@ -266,6 +275,7 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         pruner=pruner,
         agent=agent,
         storage=storage,
+        fingerprint_paths=fingerprint_paths,
         source_path=str(path),
         raw=raw,
     )

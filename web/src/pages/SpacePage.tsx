@@ -1,4 +1,5 @@
 import { api, type SpaceParam } from "@/lib/api"
+import { useCohort } from "@/lib/cohort"
 import { usePolling } from "@/lib/usePolling"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -60,7 +61,8 @@ function ParamCard({ p }: { p: SpaceParam }) {
 }
 
 export default function SpacePage() {
-  const { data, error } = usePolling(api.space, 8000)
+  const cohort = useCohort()
+  const { data, error } = usePolling(() => api.space(cohort), 8000)
 
   if (error) return <div className="text-red-600 py-8 text-center">加载失败：{error}</div>
   if (!data) return <div className="text-muted-foreground py-12 text-center">加载中…</div>

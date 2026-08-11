@@ -26,6 +26,7 @@ class RunManager:
         self.started_at: str | None = None
         self.exit_code: int | None = None
         self.stopped: bool = False
+        self.last_cohort: str | None = None   # 本次运行所在的记录分区（stop 清理用）
         self._log_f = None
 
     @property
@@ -52,12 +53,13 @@ class RunManager:
             "started_at": self.started_at,
             "exit_code": self.exit_code,
             "stopped": self.stopped,
+            "last_cohort": self.last_cohort,
         }
 
     def start(self, data_dir: str | Path, trials: int | None = None,
               wake_every: int | None = None, no_agent: bool = False,
-              fresh: bool = False, workers: int | None = None,
-              max_duration_h: float | None = None) -> dict:
+              workers: int | None = None, max_duration_h: float | None = None,
+              cohort: str | None = None, note: str | None = None) -> dict:
         if self.running:
             raise RuntimeError(f"已有搜索在运行（pid={self.pid}），请先停止再启动新任务")
         data_dir = Path(data_dir)
@@ -73,8 +75,12 @@ class RunManager:
             cmd += ["--wake-every", str(wake_every)]
         if no_agent:
             cmd.append("--no-agent")
-        if fresh:
-            cmd.append("--fresh")
+        if cohort:
+            # 分区已由 Web 端 resolve_for_run 决定，CLI 侧显式续跑同一分区，
+            # 避免两个进程各自解析产生分歧
+            cmd += ["--cohort", cohort]
+        if note:
+            cmd += ["--note", note]
         if workers and workers > 0:
             cmd += ["--workers", str(workers)]
         if max_duration_h and max_duration_h > 0:
@@ -91,6 +97,7 @@ class RunManager:
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.exit_code = None
         self.stopped = False
+        self.last_cohort = cohort
         return self.status()
 
     def stop(self) -> dict:

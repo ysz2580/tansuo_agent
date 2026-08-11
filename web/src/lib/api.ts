@@ -18,6 +18,11 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   return resp.json() as Promise<T>
 }
 
+/** 分区作用域查询串：cohort 为空表示后端默认（最新分区）。 */
+function qs(cohort?: string | null): string {
+  return cohort ? `?cohort=${encodeURIComponent(cohort)}` : ""
+}
+
 // ---------- 类型（与后端返回结构对应） ----------
 
 export interface Summary {
@@ -34,6 +39,8 @@ export interface Summary {
   workers: number
   eta_s: number | null
   watch: { name: string; direction: string }[]
+  cohort: string | null
+  code_fingerprint_changed: boolean
 }
 
 export interface Trial {
@@ -126,10 +133,35 @@ export interface RunStatus {
   started_at: string | null
   exit_code: number | null
   stopped: boolean
+  last_cohort: string | null
 }
 
 export interface RunLogResp extends RunStatus {
   text: string
+}
+
+// 记录分区（cohort）：一条不可删除的历史记录单元
+export type RunComparable = "match" | "code-changed" | "objective-changed" | "legacy"
+
+export interface RunInfo {
+  id: string
+  created_at: string | null
+  note: string
+  objective_hash: string | null
+  code_hash: string | null
+  primary_metric: { name: string; direction: string } | null
+  completed: number
+  best: number | null
+  locked: boolean
+  virtual: boolean
+  incomplete: boolean
+  comparable: RunComparable
+}
+
+export interface RunsResp {
+  runs: RunInfo[]
+  current: { objective_hash: string; code_hash: string; reliable: boolean }
+  default: string | null
 }
 
 export interface AgentConfig {
@@ -164,17 +196,22 @@ export interface SaveResult {
 // ---------- 端点 ----------
 
 export const api = {
-  summary: () => http<Summary>("/summary"),
-  trials: () => http<TrialsResp>("/trials"),
-  trialCurve: (n: number) => http<CurveResp>(`/trials/${n}/curve`),
-  curves: () => http<CurvesResp>("/curves"),
-  space: () => http<SpaceResp>("/space"),
-  agentEvents: () => http<{ events: AgentEvent[] }>("/agent/events"),
-  report: () => http<ReportResp>("/report"),
-  reportGenerate: () => http<{ report: string; best: string }>("/report/generate", { method: "POST" }),
+  // 分区作用域端点：cohort 缺省 → 后端取最新分区（无分区则扁平布局）
+  summary: (cohort?: string | null) => http<Summary>(`/summary${qs(cohort)}`),
+  trials: (cohort?: string | null) => http<TrialsResp>(`/trials${qs(cohort)}`),
+  trialCurve: (n: number, cohort?: string | null) =>
+    http<CurveResp>(`/trials/${n}/curve${qs(cohort)}`),
+  curves: (cohort?: string | null) => http<CurvesResp>(`/curves${qs(cohort)}`),
+  space: (cohort?: string | null) => http<SpaceResp>(`/space${qs(cohort)}`),
+  agentEvents: (cohort?: string | null) => http<{ events: AgentEvent[] }>(`/agent/events${qs(cohort)}`),
+  report: (cohort?: string | null) => http<ReportResp>(`/report${qs(cohort)}`),
+  reportGenerate: (cohort?: string | null) =>
+    http<{ report: string; best: string }>(`/report/generate${qs(cohort)}`, { method: "POST" }),
+  // 分区列表 + 当前双指纹 + 可比性
+  runs: () => http<RunsResp>("/runs"),
   runStatus: () => http<RunStatus>("/run/status"),
   runLog: (tail = 300) => http<RunLogResp>(`/run/log?tail=${tail}`),
-  runStart: (body: { trials?: number; wake_every?: number; no_agent?: boolean; fresh?: boolean; workers?: number; max_duration_h?: number }) =>
+  runStart: (body: { trials?: number; wake_every?: number; no_agent?: boolean; fresh?: boolean; new_cohort?: boolean; note?: string; workers?: number; max_duration_h?: number }) =>
     http<RunStatus>("/run/start", { method: "POST", body: JSON.stringify(body) }),
   runStop: () => http<RunStatus & { marked_failed?: number[] }>("/run/stop", { method: "POST", body: "{}" }),
   agentConfig: () => http<AgentConfig>("/config/agent"),

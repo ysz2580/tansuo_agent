@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react"
 import { api, type CurveResp, type Trial } from "@/lib/api"
+import { useCohort } from "@/lib/cohort"
 import { usePolling } from "@/lib/usePolling"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -31,7 +32,8 @@ function fmt(v: number | null | undefined): string {
 }
 
 export default function TrialsPage() {
-  const { data, error } = usePolling(api.trials, 5000)
+  const cohort = useCohort()
+  const { data, error } = usePolling(() => api.trials(cohort), 5000)
   const [selected, setSelected] = useState<Trial | null>(null)
 
   if (error) return <div className="text-red-600 py-8 text-center">加载失败：{error}</div>
@@ -89,12 +91,13 @@ export default function TrialsPage() {
         </Table>
       </div>
 
-      <TrialDetailDialog trial={selected} onClose={() => setSelected(null)} />
+      <TrialDetailDialog trial={selected} cohort={cohort} onClose={() => setSelected(null)} />
     </div>
   )
 }
 
-function TrialDetailDialog({ trial, onClose }: { trial: Trial | null; onClose: () => void }) {
+function TrialDetailDialog({ trial, cohort, onClose }:
+                           { trial: Trial | null; cohort: string | null; onClose: () => void }) {
   const [curve, setCurve] = useState<CurveResp | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -111,14 +114,14 @@ function TrialDetailDialog({ trial, onClose }: { trial: Trial | null; onClose: (
     setLoading(true)
     setCurve(null)
     setErr(null)
-    api.trialCurve(trial.number)
+    api.trialCurve(trial.number, cohort)
       .then((c) => active && setCurve(c))
       .catch((e: Error) => active && setErr(e.message))
       .finally(() => active && setLoading(false))
     return () => {
       active = false
     }
-  }, [trial])
+  }, [trial, cohort])
 
   return (
     <Dialog open={trial !== null}

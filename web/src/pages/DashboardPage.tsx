@@ -1,4 +1,5 @@
 import { api, type Summary } from "@/lib/api"
+import { useCohort } from "@/lib/cohort"
 import { usePolling } from "@/lib/usePolling"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -31,8 +32,9 @@ function fmtEta(seconds: number): string {
 }
 
 export default function DashboardPage() {
-  const { data: summary, error: sumErr } = usePolling<Summary>(api.summary, 5000)
-  const { data: curves } = usePolling(api.curves, 10000)
+  const cohort = useCohort()
+  const { data: summary, error: sumErr } = usePolling<Summary>(() => api.summary(cohort), 5000)
+  const { data: curves } = usePolling(() => api.curves(cohort), 10000)
 
   if (sumErr) {
     return <Alert variant="destructive"><AlertDescription>加载失败：{sumErr}</AlertDescription></Alert>
@@ -45,6 +47,13 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-4">
+      {summary.code_fingerprint_changed && (
+        <Alert className="border-amber-300 bg-amber-50 dark:bg-amber-950/30">
+          <AlertDescription>
+            训练代码或优化目标已变化：下次运行将自动新开记录分区，当前分区的历史结果原样保留、不受影响。
+          </AlertDescription>
+        </Alert>
+      )}
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
         <StatCard title={`最优 ${summary.primary}`} value={fmt(summary.best?.value)}
                   sub={summary.best ? `trial#${summary.best.trial}（${maximize ? "越大越好" : "越小越好"}）` : "暂无完成试验"} />
@@ -71,7 +80,7 @@ export default function DashboardPage() {
             <CardTitle className="text-base">主指标走势（按试验序号）</CardTitle>
           </CardHeader>
           <CardContent>
-            <ProgressWithTrials primary={summary.primary} maximize={maximize} />
+            <ProgressWithTrials primary={summary.primary} maximize={maximize} cohort={cohort} />
           </CardContent>
         </Card>
         <Card>
@@ -109,8 +118,9 @@ export default function DashboardPage() {
 }
 
 /** 从 /api/trials 取完成试验画主指标走势（独立轮询，避免拖慢顶部卡片）。 */
-function ProgressWithTrials({ primary, maximize }: { primary: string; maximize: boolean }) {
-  const { data } = usePolling(api.trials, 8000)
+function ProgressWithTrials({ primary, maximize, cohort }:
+                             { primary: string; maximize: boolean; cohort: string | null }) {
+  const { data } = usePolling(() => api.trials(cohort), 8000)
   if (!data) return <div className="text-muted-foreground py-8 text-center text-sm">加载中…</div>
   let best = maximize ? -Infinity : Infinity
   const points = data.trials

@@ -17,5 +17,6 @@
 | 2026-08-11 | 009 | [TypeScript 6.0 弃用 baseUrl（TS5101），Vite 脚手架默认 tsconfig 构建失败，paths 需脱离 baseUrl 单独使用](2026-08-11-009-typescript6-baseurl-ts5101.md) | `typescript` `vite` `tsconfig` `版本兼容` `前端构建` | ✅ 已解决 |
 | 2026-08-11 | 010 | [cli.py web --settings/--space 被静默忽略：app 模块在环境变量注入前就加载，永远回退 demo 配置](2026-08-11-010-cli-web-settings-env-order.md) | `cli` `web后端` `模块加载顺序` `环境变量` `配置` | ✅ 已解决 |
 | 2026-08-11 | 011 | [Optuna journal:// 存储在 Windows 上创建符号链接锁失败（WinError 1314 无特权），测试与降级存储不可用](2026-08-11-011-optuna-journal-storage-windows-symlink.md) | `optuna` `journal存储` `windows` `符号链接` `测试` | ✅ 已解决 |
+| 2026-08-11 | 012 | [Optuna create_study(load_if_exists=True) 静默丢弃请求的 direction，改主指标方向续跑会让排序/剪枝/报告整体反向](2026-08-11-012-optuna-silent-direction-poisoning.md) | `optuna` `direction` `断点续跑` `记录分区` `数据污染` | ✅ 已解决 |
 
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中

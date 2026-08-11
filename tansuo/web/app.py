@@ -22,6 +22,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..analysis import learning_curves, summarize
+from ..cohort import (CohortError, abs_data_dir, apply_cohort, code_fingerprint,
+                      cohort_stats, list_cohorts, load_cohort, resolve_for_run)
 from ..config import ConfigError, load_settings
 from ..journal import TRIAL_END, Journal
 from ..space import SearchSpace, SpaceError
@@ -59,19 +61,35 @@ def _load_space_with_snapshots(space_yaml: Path, data_dir: Path) -> SearchSpace:
     return SearchSpace.from_yaml(space_yaml)
 
 
-def _load():
-    """settings/space/study/journal 四件套（只读）。"""
+def _load_for(cohort_id: str | None = None):
+    """settings/space/study/journal/cohort 五件套（只读）。
+
+    cohort_id 指定 → 该分区；缺省 → 最新分区；无任何分区 → 扁平布局（新装行为不变）。
+    GET 路径不做物理迁移——未迁移的旧布局以虚拟 legacy 分区呈现。
+    """
     settings = load_settings(SETTINGS_PATH)
+    cohort = None
+    root = abs_data_dir(settings, PROJECT_ROOT)
+    if cohort_id:
+        cohort = load_cohort(root, cohort_id, settings=settings)
+        apply_cohort(settings, cohort)
+    else:
+        cohorts = list_cohorts(root, settings=settings)
+        if cohorts:
+            cohort = cohorts[-1]
+            apply_cohort(settings, cohort)
     data_dir = Path(settings.data_dir)
     space = _load_space_with_snapshots(Path(SPACE_PATH), data_dir)
     study = create_or_load_study(settings)
     journal = Journal(data_dir / "journal.jsonl")
-    return settings, space, study, journal
+    return settings, space, study, journal, cohort
 
 
-def _safe_load():
+def _safe_load(cohort_id: str | None = None):
     try:
-        return _load()
+        return _load_for(cohort_id)
+    except CohortError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except (ConfigError, SpaceError) as e:
         raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
     except sqlite3.OperationalError as e:
@@ -89,8 +107,8 @@ def health():
 
 
 @app.get("/api/summary")
-def summary():
-    settings, space, study, journal = _safe_load()
+def summary(cohort: str | None = Query(default=None)):
+    settings, space, study, journal, coh = _safe_load(cohort)
     s = summarize(study, settings, top_k=8)
     s["experiment"] = settings.experiment_name
     s["budget_total"] = settings.budget.total_trials
@@ -98,6 +116,20 @@ def summary():
     s["workers"] = settings.budget.workers
     s["watch"] = [{"name": m.name, "direction": m.direction}
                   for m in settings.metrics.watch]
+    s["cohort"] = coh.id if coh else None
+    # 代码指纹变化提示（仅对最新实体分区有意义：下次运行将自动新开分区）
+    s["code_fingerprint_changed"] = False
+    if coh is not None and not coh.virtual and coh.meta.get("code_hash"):
+        try:
+            root = abs_data_dir(load_settings(SETTINGS_PATH), PROJECT_ROOT)
+            latest = [c for c in list_cohorts(root) if not c.virtual]
+            if latest and latest[-1].id == coh.id:
+                fp = code_fingerprint(settings, PROJECT_ROOT)
+                s["code_fingerprint_changed"] = (
+                    fp.code_hash != coh.meta.get("code_hash")
+                    or fp.objective_hash != coh.meta.get("objective_hash"))
+        except (ConfigError, CohortError):
+            pass
     # ETA：最近 ≤10 次已完结试验平均耗时 × 剩余预算 ÷ 并发数（无样本返回 null）
     from optuna.trial import TrialState
     finished = len(study.get_trials(
@@ -115,8 +147,8 @@ def summary():
 
 
 @app.get("/api/trials")
-def trials():
-    settings, space, study, journal = _safe_load()
+def trials(cohort: str | None = Query(default=None)):
+    settings, space, study, journal, coh = _safe_load(cohort)
     fail_reasons = {e.get("trial"): e.get("reason")
                     for e in journal.load_events() if e.get("kind") == "trial_fail"}
     rows = []
@@ -139,8 +171,8 @@ def trials():
 
 
 @app.get("/api/trials/{number}/curve")
-def trial_curve(number: int):
-    settings, space, study, journal = _safe_load()
+def trial_curve(number: int, cohort: str | None = Query(default=None)):
+    settings, space, study, journal, coh = _safe_load(cohort)
     curves = learning_curves(study, trial_ids=[number])
     if not curves:
         raise HTTPException(status_code=404,
@@ -151,17 +183,17 @@ def trial_curve(number: int):
 
 
 @app.get("/api/curves")
-def curves_default():
+def curves_default(cohort: str | None = Query(default=None)):
     """默认曲线：top-3 + 最近 2 次完成试验（与 agent 工具 get_learning_curves 一致）。"""
-    settings, space, study, journal = _safe_load()
+    settings, space, study, journal, coh = _safe_load(cohort)
     return {"primary": settings.metrics.primary.name,
             "watch": [m.name for m in settings.metrics.watch],
             "curves": learning_curves(study)}
 
 
 @app.get("/api/space")
-def space():
-    settings, sp, study, journal = _safe_load()
+def space(cohort: str | None = Query(default=None)):
+    settings, sp, study, journal, coh = _safe_load(cohort)
     return {"version": sp.version,
             "params": sp.to_dict()["params"],
             "free_params": sp.free_param_count(),
@@ -169,14 +201,14 @@ def space():
 
 
 @app.get("/api/agent/events")
-def agent_events():
-    settings, space, study, journal = _safe_load()
+def agent_events(cohort: str | None = Query(default=None)):
+    settings, space, study, journal, coh = _safe_load(cohort)
     return {"events": journal.agent_events()}
 
 
 @app.get("/api/report")
-def report():
-    settings, space, study, journal = _safe_load()
+def report(cohort: str | None = Query(default=None)):
+    settings, space, study, journal, coh = _safe_load(cohort)
     reports_dir = Path(settings.data_dir) / "reports"
     md = reports_dir / "report.md"
     best = reports_dir / "best.yaml"
@@ -189,11 +221,17 @@ def report():
 
 
 @app.post("/api/report/generate")
-def report_generate():
-    settings, space, study, journal = _safe_load()
+def report_generate(cohort: str | None = Query(default=None)):
+    settings, space, study, journal, coh = _safe_load(cohort)
     from ..report import generate_report
+    cohort_info = None
+    if coh is not None and not coh.virtual:
+        cohort_info = {"id": coh.id,
+                       "fingerprint": coh.meta.get("code_hash", ""),
+                       "note": coh.meta.get("note", "")}
     try:
-        report_path, best_path = generate_report(settings, study, space, journal)
+        report_path, best_path = generate_report(settings, study, space, journal,
+                                                 cohort_info=cohort_info)
     except Exception as e:   # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"报告生成失败：{e}")
     return {"report": str(report_path), "best": str(best_path)}
@@ -204,6 +242,48 @@ def time_iso(ts: float) -> str:
     return _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(ts))
 
 
+@app.get("/api/runs")
+def runs_list():
+    """记录分区列表 + 当前双指纹 + 各分区与当前指纹的可比性。"""
+    try:
+        settings = load_settings(SETTINGS_PATH)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    root = abs_data_dir(settings, PROJECT_ROOT)
+    fp = code_fingerprint(settings, PROJECT_ROOT)
+    items = []
+    for c in list_cohorts(root, settings=settings):
+        meta = c.meta or {}
+        st = cohort_stats(c)
+        if not (meta.get("objective_hash") or meta.get("code_hash")):
+            comparable = "legacy"          # 历史记录（无指纹）
+        elif meta.get("objective_hash") != fp.objective_hash:
+            comparable = "objective-changed"   # 目标语义已变，不可直接比较
+        elif meta.get("code_hash") != fp.code_hash:
+            comparable = "code-changed"    # 目标一致、训练代码已变
+        else:
+            comparable = "match"
+        items.append({
+            "id": c.id,
+            "created_at": meta.get("created_at"),
+            "note": meta.get("note") or "",
+            "objective_hash": meta.get("objective_hash"),
+            "code_hash": meta.get("code_hash"),
+            "primary_metric": meta.get("primary_metric"),
+            "completed": st["completed"],
+            "best": st["best"],
+            "locked": st["locked"],
+            "virtual": c.virtual,
+            "incomplete": c.incomplete,
+            "comparable": comparable,
+        })
+    return {"runs": items,
+            "current": {"objective_hash": fp.objective_hash,
+                        "code_hash": fp.code_hash,
+                        "reliable": fp.reliable},
+            "default": items[-1]["id"] if items else None}
+
+
 # ------------------------------------------------------------------
 # 运行驱动（子进程）
 # ------------------------------------------------------------------
@@ -212,7 +292,9 @@ class RunStartBody(BaseModel):
     trials: int | None = None
     wake_every: int | None = None
     no_agent: bool = False
-    fresh: bool = False
+    fresh: bool = Field(default=False, description="旧字段别名：等价 new_cohort，不再删除记录")
+    new_cohort: bool = Field(default=False, description="强制新开记录分区（不删除历史）")
+    note: str | None = Field(default=None, description="分区备注（写入 meta.yaml）")
     workers: int | None = Field(default=None, ge=1, le=32,
                                 description="并行试验数（缺省取 settings budget.workers）")
     max_duration_h: float | None = Field(default=None, gt=0,
@@ -231,30 +313,87 @@ def run_log(tail: int = Query(default=200, ge=1, le=5000)):
     return st
 
 
+def _dispose_study(study) -> None:
+    """释放 sqlite 连接池（Windows 下避免 ~30s 句柄残留）。
+    study._storage 是 _CachedStorage 包装层，引擎在 _backend 上。"""
+    backend = getattr(getattr(study, "_storage", None), "_backend", None)
+    engine = getattr(backend, "engine", None) if backend else None
+    if engine is None:
+        engine = getattr(getattr(study, "_storage", None), "engine", None)
+    if engine is not None:
+        try:
+            engine.dispose()
+        except Exception:   # noqa: BLE001
+            pass
+
+
+def _orphan_cleanup_for(cohort) -> list[int]:
+    """清理指定分区的孤儿 RUNNING 试验；cohort=None → 扁平布局根目录。"""
+    try:
+        s = load_settings(SETTINGS_PATH)
+        if cohort is not None:
+            apply_cohort(s, cohort)
+        journal = Journal(Path(s.data_dir) / "journal.jsonl")
+        return _mark_orphaned_running_as_failed(s, journal)
+    except (ConfigError, CohortError, sqlite3.Error):
+        return []
+
+
 @app.post("/api/run/start")
 def run_start(body: RunStartBody):
-    # 上次运行若被强杀/服务器重启，可能遗留孤儿 RUNNING 试验——先清理再加载 study，
-    # 否则 study 缓存拿不到刚标记的 FAIL，新增试验数换算会偏差。
+    # 顺序：先解析目标分区 → 清理目标分区（及上次运行分区）的孤儿试验 →
+    # 在**目标分区内**统计已完结数做「本次新增 N → 总预算」换算 → 显式 --cohort 启动 CLI。
     try:
-        _settings0 = load_settings(SETTINGS_PATH)
-        _journal0 = Journal(Path(_settings0.data_dir) / "journal.jsonl")
-        _mark_orphaned_running_as_failed(_settings0, _journal0)
-    except (ConfigError, sqlite3.Error):
-        pass
-    settings, space, study, journal = _safe_load()
+        settings0 = load_settings(SETTINGS_PATH)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    root = abs_data_dir(settings0, PROJECT_ROOT)
+    try:
+        target, info = resolve_for_run(settings0,
+                                       force_new=body.new_cohort or body.fresh,
+                                       note=body.note, base_dir=PROJECT_ROOT)
+    except CohortError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if RUN.last_cohort and RUN.last_cohort != target.id:
+        try:
+            prev = load_cohort(root, RUN.last_cohort, settings=settings0)
+            if not prev.virtual:
+                _orphan_cleanup_for(prev)
+        except CohortError:
+            pass
+    elif RUN.last_cohort is None:
+        _orphan_cleanup_for(None)   # 升级前的扁平布局可能有历史孤儿
+    _orphan_cleanup_for(target)
+
     trials_arg = body.trials
     if trials_arg is not None:
-        # cli --trials 语义是「总预算」，界面语义是「本次新增 N 次试验」——换算成总量
+        # cli --trials 语义是「总预算」，界面语义是「本次新增 N 次试验」——换算成总量。
+        # 必须在目标分区内统计：新开分区时完结数为 0，不能把旧分区计数带进来。
         from optuna.trial import TrialState
-        finished = len(study.get_trials(
-            deepcopy=False,
-            states=(TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL)))
+        if info["action"] == "created":
+            finished = 0
+        else:
+            study_t = None
+            try:
+                s_t = load_settings(SETTINGS_PATH)
+                apply_cohort(s_t, target)
+                study_t = create_or_load_study(s_t)
+                finished = len(study_t.get_trials(
+                    deepcopy=False,
+                    states=(TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL)))
+            except sqlite3.OperationalError as e:
+                raise HTTPException(status_code=503,
+                                    detail=f"数据库正被占用，稍后再试（{e}）")
+            finally:
+                if study_t is not None:
+                    _dispose_study(study_t)
         trials_arg = finished + trials_arg
     try:
-        return RUN.start(settings.data_dir, trials=trials_arg,
+        return RUN.start(target.path, trials=trials_arg,
                          wake_every=body.wake_every, no_agent=body.no_agent,
-                         fresh=body.fresh, workers=body.workers,
-                         max_duration_h=body.max_duration_h)
+                         workers=body.workers, max_duration_h=body.max_duration_h,
+                         cohort=target.id, note=body.note)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -267,13 +406,20 @@ def run_stop():
         raise HTTPException(status_code=409, detail=str(e))
     # 杀进程树不会触发 orchestrator 的 FINISH 逻辑，进行中的试验会永远停在 RUNNING。
     # 把它如实标记为 FAIL（reason 写进 journal），避免仪表盘"进行中"计数永久失真。
-    try:
-        settings, _, _, journal = _safe_load()
-        marked = _mark_orphaned_running_as_failed(settings, journal)
-        if marked:
-            st["marked_failed"] = marked
-    except HTTPException:
-        pass   # 清理失败不影响 stop 本身的结果
+    # 清理对象是本次运行所在的分区（RUN.last_cohort），而不是"最新分区"。
+    marked: list[int] = []
+    if RUN.last_cohort:
+        try:
+            s0 = load_settings(SETTINGS_PATH)
+            c = load_cohort(abs_data_dir(s0, PROJECT_ROOT), RUN.last_cohort,
+                            settings=s0)
+            marked = _orphan_cleanup_for(c)
+        except (ConfigError, CohortError):
+            pass
+    else:
+        marked = _orphan_cleanup_for(None)
+    if marked:
+        st["marked_failed"] = marked
     return st
 
 
