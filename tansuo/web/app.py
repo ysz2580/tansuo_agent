@@ -1,0 +1,404 @@
+"""tansuo Web 后端：FastAPI app。
+
+三类接口：
+1. 只读查询（summary/trials/curves/space/agent 事件/报告）——直接加载 SQLite study 与 journal；
+2. 运行驱动（run start/stop/status/log）——子进程拉起 `python cli.py run`，见 run_manager.py；
+3. API 配置切换（config/agent get/probe/save）——复用 probe_endpoint 探测、最小化写回 settings.yaml。
+
+路径来自环境变量 TANSUO_SETTINGS / TANSUO_SPACE（由 `cli.py web` 注入，取绝对路径），
+缺省回退到 demo 配置——这样 `uvicorn tansuo.web.app:app` 从项目根直接起也能用。
+"""
+from __future__ import annotations
+
+import dataclasses
+import os
+import re
+import sqlite3
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from ..analysis import learning_curves, summarize
+from ..config import ConfigError, load_settings
+from ..journal import Journal
+from ..space import SearchSpace, SpaceError
+from ..study import create_or_load_study
+from .run_manager import RunManager
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SETTINGS_PATH = os.environ.get(
+    "TANSUO_SETTINGS", str(PROJECT_ROOT / "demo" / "configs" / "settings.yaml"))
+SPACE_PATH = os.environ.get(
+    "TANSUO_SPACE", str(PROJECT_ROOT / "demo" / "configs" / "search_space.yaml"))
+
+app = FastAPI(title="tansuo_agent Web", description="智能调参 agent 可视化后端")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+
+RUN = RunManager(PROJECT_ROOT, SETTINGS_PATH, SPACE_PATH)
+
+
+# ------------------------------------------------------------------
+# 加载工具（与 cli.py::_make_runtime 同构；只读用途，逐请求加载避免 SQLite 锁竞争）
+# ------------------------------------------------------------------
+
+def _load_space_with_snapshots(space_yaml: Path, data_dir: Path) -> SearchSpace:
+    """优先恢复最新空间快照（agent 的编辑状态不丢），否则用初始空间。"""
+    snaps: list[tuple[int, Path]] = []
+    if data_dir.exists():
+        for p in data_dir.glob("space_v*.yaml"):
+            m = re.fullmatch(r"space_v(\d+)\.yaml", p.name)
+            if m:
+                snaps.append((int(m.group(1)), p))
+    if snaps:
+        snaps.sort()
+        return SearchSpace.from_yaml(snaps[-1][1])
+    return SearchSpace.from_yaml(space_yaml)
+
+
+def _load():
+    """settings/space/study/journal 四件套（只读）。"""
+    settings = load_settings(SETTINGS_PATH)
+    data_dir = Path(settings.data_dir)
+    space = _load_space_with_snapshots(Path(SPACE_PATH), data_dir)
+    study = create_or_load_study(settings)
+    journal = Journal(data_dir / "journal.jsonl")
+    return settings, space, study, journal
+
+
+def _safe_load():
+    try:
+        return _load()
+    except (ConfigError, SpaceError) as e:
+        raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    except sqlite3.OperationalError as e:
+        raise HTTPException(status_code=503,
+                            detail=f"数据库正被运行中的任务写入，稍后再试（{e}）")
+
+
+# ------------------------------------------------------------------
+# 只读查询
+# ------------------------------------------------------------------
+
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/api/summary")
+def summary():
+    settings, space, study, journal = _safe_load()
+    s = summarize(study, settings, top_k=8)
+    s["experiment"] = settings.experiment_name
+    s["budget_total"] = settings.budget.total_trials
+    s["space_version"] = space.version
+    s["watch"] = [{"name": m.name, "direction": m.direction}
+                  for m in settings.metrics.watch]
+    return s
+
+
+@app.get("/api/trials")
+def trials():
+    settings, space, study, journal = _safe_load()
+    fail_reasons = {e.get("trial"): e.get("reason")
+                    for e in journal.load_events() if e.get("kind") == "trial_fail"}
+    rows = []
+    for t in study.get_trials(deepcopy=False):
+        duration = None
+        if t.datetime_start and t.datetime_complete:
+            duration = round((t.datetime_complete - t.datetime_start).total_seconds(), 1)
+        rows.append({
+            "number": t.number,
+            "state": t.state.name,
+            "value": t.value,
+            "params": dict(t.params),
+            "attrs": {k: v for k, v in t.user_attrs.items() if k != "curve"},
+            "duration_s": duration,
+            "fail_reason": fail_reasons.get(t.number),
+        })
+    return {"trials": rows,
+            "primary": settings.metrics.primary.name,
+            "direction": settings.metrics.primary.direction}
+
+
+@app.get("/api/trials/{number}/curve")
+def trial_curve(number: int):
+    settings, space, study, journal = _safe_load()
+    curves = learning_curves(study, trial_ids=[number])
+    if not curves:
+        raise HTTPException(status_code=404,
+                            detail=f"trial#{number} 不存在或未完成（无学习曲线）")
+    return {"primary": settings.metrics.primary.name,
+            "watch": [m.name for m in settings.metrics.watch],
+            "curve": curves[0]}
+
+
+@app.get("/api/curves")
+def curves_default():
+    """默认曲线：top-3 + 最近 2 次完成试验（与 agent 工具 get_learning_curves 一致）。"""
+    settings, space, study, journal = _safe_load()
+    return {"primary": settings.metrics.primary.name,
+            "watch": [m.name for m in settings.metrics.watch],
+            "curves": learning_curves(study)}
+
+
+@app.get("/api/space")
+def space():
+    settings, sp, study, journal = _safe_load()
+    return {"version": sp.version,
+            "params": sp.to_dict()["params"],
+            "free_params": sp.free_param_count(),
+            "patches": journal.patches()}
+
+
+@app.get("/api/agent/events")
+def agent_events():
+    settings, space, study, journal = _safe_load()
+    return {"events": journal.agent_events()}
+
+
+@app.get("/api/report")
+def report():
+    settings, space, study, journal = _safe_load()
+    reports_dir = Path(settings.data_dir) / "reports"
+    md = reports_dir / "report.md"
+    best = reports_dir / "best.yaml"
+    if not md.exists():
+        return {"exists": False, "content": None, "best": None}
+    return {"exists": True,
+            "updated": time_iso(md.stat().st_mtime),
+            "content": md.read_text(encoding="utf-8"),
+            "best": best.read_text(encoding="utf-8") if best.exists() else None}
+
+
+@app.post("/api/report/generate")
+def report_generate():
+    settings, space, study, journal = _safe_load()
+    from ..report import generate_report
+    try:
+        report_path, best_path = generate_report(settings, study, space, journal)
+    except Exception as e:   # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"报告生成失败：{e}")
+    return {"report": str(report_path), "best": str(best_path)}
+
+
+def time_iso(ts: float) -> str:
+    import time as _t
+    return _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(ts))
+
+
+# ------------------------------------------------------------------
+# 运行驱动（子进程）
+# ------------------------------------------------------------------
+
+class RunStartBody(BaseModel):
+    trials: int | None = None
+    wake_every: int | None = None
+    no_agent: bool = False
+    fresh: bool = False
+
+
+@app.get("/api/run/status")
+def run_status():
+    return RUN.status()
+
+
+@app.get("/api/run/log")
+def run_log(tail: int = Query(default=200, ge=1, le=5000)):
+    st = RUN.status()
+    st["text"] = RUN.log_tail(tail)
+    return st
+
+
+@app.post("/api/run/start")
+def run_start(body: RunStartBody):
+    # 上次运行若被强杀/服务器重启，可能遗留孤儿 RUNNING 试验——先清理再加载 study，
+    # 否则 study 缓存拿不到刚标记的 FAIL，新增试验数换算会偏差。
+    try:
+        _settings0 = load_settings(SETTINGS_PATH)
+        _journal0 = Journal(Path(_settings0.data_dir) / "journal.jsonl")
+        _mark_orphaned_running_as_failed(_settings0, _journal0)
+    except (ConfigError, sqlite3.Error):
+        pass
+    settings, space, study, journal = _safe_load()
+    trials_arg = body.trials
+    if trials_arg is not None:
+        # cli --trials 语义是「总预算」，界面语义是「本次新增 N 次试验」——换算成总量
+        from optuna.trial import TrialState
+        finished = len(study.get_trials(
+            deepcopy=False,
+            states=(TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL)))
+        trials_arg = finished + trials_arg
+    try:
+        return RUN.start(settings.data_dir, trials=trials_arg,
+                         wake_every=body.wake_every, no_agent=body.no_agent,
+                         fresh=body.fresh)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/run/stop")
+def run_stop():
+    try:
+        st = RUN.stop()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    # 杀进程树不会触发 orchestrator 的 FINISH 逻辑，进行中的试验会永远停在 RUNNING。
+    # 把它如实标记为 FAIL（reason 写进 journal），避免仪表盘"进行中"计数永久失真。
+    try:
+        settings, _, _, journal = _safe_load()
+        marked = _mark_orphaned_running_as_failed(settings, journal)
+        if marked:
+            st["marked_failed"] = marked
+    except HTTPException:
+        pass   # 清理失败不影响 stop 本身的结果
+    return st
+
+
+def _mark_orphaned_running_as_failed(settings, journal) -> list[int]:
+    """把被强制停止遗留的 RUNNING 试验改为 FAIL。返回处理的试验编号。"""
+    url = settings.storage.url
+    if not url.startswith("sqlite:///"):
+        return []   # journal:// 降级存储不支持直接改状态，跳过
+    db_rel = url[len("sqlite:///"):]
+    db_path = Path(db_rel)
+    if not db_path.is_absolute():
+        db_path = PROJECT_ROOT / db_rel
+    if not db_path.exists():
+        return []
+    con = sqlite3.connect(str(db_path))
+    try:
+        rows = con.execute(
+            "SELECT trial_id, number FROM trials WHERE state = 'RUNNING'").fetchall()
+        if not rows:
+            return []
+        ids = [r[0] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        con.execute(
+            f"UPDATE trials SET state = 'FAIL' WHERE trial_id IN ({placeholders})", ids)
+        con.commit()
+    finally:
+        con.close()
+    numbers = [r[1] for r in rows]
+    for n in numbers:
+        journal.append("trial_fail", trial=n, reason="运行被手动停止",
+                       hint="该试验在搜索被停止时正在进行，已标记为失败",
+                       detail="(无 stderr/stdout：进程树被强制终止)", source="search")
+    return numbers
+
+
+# ------------------------------------------------------------------
+# API 配置切换（model / base_url / auth_token）
+# ------------------------------------------------------------------
+
+class AgentConfigBody(BaseModel):
+    model: str | None = None
+    base_url: str | None = None
+    auth_token: str | None = None
+
+
+def _agent_env_refs() -> dict:
+    """检查 settings.yaml 原文中 base_url/auth_token 是否为 ${ENV:...} 引用。"""
+    try:
+        text = Path(SETTINGS_PATH).read_text(encoding="utf-8")
+    except OSError:
+        return {"base_url": False, "auth_token": False}
+    return {
+        "base_url": bool(re.search(r"^\s*base_url:\s*\$\{ENV:", text, re.M)),
+        "auth_token": bool(re.search(r"^\s*auth_token:\s*\$\{ENV:", text, re.M)),
+    }
+
+
+def _effective_cfg(body: AgentConfigBody):
+    """请求字段 + 当前 settings + 环境变量兜底 → 用于探测的临时 AgentCfg。"""
+    settings = load_settings(SETTINGS_PATH)
+    cfg = settings.agent
+    token = ((body.auth_token or "").strip() or cfg.auth_token
+             or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+             or os.environ.get("ANTHROPIC_API_KEY", ""))
+    return dataclasses.replace(
+        cfg,
+        model=(body.model or "").strip() or cfg.model,
+        base_url=(body.base_url or "").strip() or cfg.base_url,
+        auth_token=token,
+    )
+
+
+@app.get("/api/config/agent")
+def agent_config_get():
+    try:
+        settings = load_settings(SETTINGS_PATH)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
+    cfg = settings.agent
+    from ..agent.api_setup import _mask
+    refs = _agent_env_refs()
+    if cfg.auth_token:
+        source = ("settings.yaml（${ENV:...} 引用环境变量）" if refs["auth_token"]
+                  else "settings.yaml（agent.auth_token 明文）")
+    elif os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        source = "环境变量 ANTHROPIC_AUTH_TOKEN"
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        source = "环境变量 ANTHROPIC_API_KEY"
+    else:
+        source = "未设置"
+    token = (cfg.auth_token or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+             or os.environ.get("ANTHROPIC_API_KEY", ""))
+    return {"model": cfg.model,
+            "base_url": cfg.base_url,
+            "enabled": cfg.enabled,
+            "auth_token_masked": _mask(token),
+            "auth_token_source": source,
+            "env_refs": refs}
+
+
+@app.post("/api/config/agent/probe")
+def agent_config_probe(body: AgentConfigBody):
+    from ..agent.client import make_client, probe_endpoint
+    try:
+        cfg = _effective_cfg(body)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
+    result = probe_endpoint(make_client(cfg), cfg.model)
+    return {"model": cfg.model, "base_url": cfg.base_url, **result}
+
+
+@app.post("/api/config/agent/save")
+def agent_config_save(body: AgentConfigBody):
+    """先探测（用生效配置），通过后把「显式给出的字段」最小化写回 settings.yaml。
+
+    留空的字段一律不动——尤其 auth_token 留空时保持 ${ENV:...} 引用，
+    绝不把环境变量里的 token 物化进配置文件。
+    """
+    from ..agent.api_setup import write_back_agent
+    from ..agent.client import make_client, probe_endpoint
+    try:
+        cfg = _effective_cfg(body)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
+    result = probe_endpoint(make_client(cfg), cfg.model)
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"探测失败于 [{result['stage']}]：{result['detail']}（已拒绝写盘）")
+    fields = {"model": (body.model or "").strip() or None,
+              "base_url": (body.base_url or "").strip() or None,
+              "auth_token": (body.auth_token or "").strip() or None}
+    wb = write_back_agent(SETTINGS_PATH, **fields)
+    if not wb["changed"] and wb["errors"]:
+        raise HTTPException(status_code=500, detail="；".join(wb["errors"]))
+    return {"probe": result, "write_back": wb,
+            "warnings": ["auth_token 已以明文写入 settings.yaml，注意不要误提交到公开仓库"]
+            if fields["auth_token"] else []}
+
+
+# ------------------------------------------------------------------
+# 静态前端（生产构建产物存在时托管，单端口部署）
+# ------------------------------------------------------------------
+
+_DIST = PROJECT_ROOT / "web" / "dist"
+if _DIST.exists():
+    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="ui")

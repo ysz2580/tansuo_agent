@@ -9,3 +9,8 @@ __pycache__/
 
 # MNIST 数据缓存（examples/train_mnist.py 会下载到 ./mnist_data）
 mnist_data/
+
+# 前端
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo

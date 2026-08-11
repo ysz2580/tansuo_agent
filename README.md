@@ -23,6 +23,8 @@ E:\tansuo_agent\
 │   ├── orchestrator.py     # 主循环：预算中枢、唤醒策略、断点续跑
 │   ├── runner.py/adapter.py# 试验执行 + 子进程/函数适配器（协议见下）
 │   └── analysis/report.py  # 汇总分析 + Markdown 报告 + best.yaml
+├── tansuo\web\             # Web 后端：FastAPI（只读查询 + 运行驱动 + API 配置切换）
+├── web\                    # Web 前端：Vite + React + TS + Tailwind + shadcn/ui
 ├── demo\                   # 演示场景（MNIST 小 CNN，CPU 可跑）
 │   ├── configs\            # settings.yaml + search_space.yaml（带详尽注释）
 │   ├── train_mnist.py      # 演示训练脚本（遵守子进程协议）
@@ -59,9 +61,34 @@ agent 决策摘要）与 `best.yaml`。
 | `check` | 两级探测端点（ping + tool-use），验证模型名是否可用 |
 | `setup --train 你的脚本` | 配置 agent：读训练脚本自动起草两份配置并跑探测试验自证 |
 | `init` | 生成离线配置模板（LLM 不可用时的兜底，`--force` 覆盖） |
+| `web` | 启动 Web 后端（可视化界面 API），默认 http://127.0.0.1:8000 |
 
 `run` 细节：默认断点续跑（storage 与空间快照都在 `data_dir`）；`--fresh` 清空重来；
 Ctrl+C 会写 finish 事件并提示续跑。
+
+## Web 可视化界面（shadcn/ui 前端）
+
+仪表盘（试验统计/最优配置/收敛信号/学习曲线）、试验表（逐 epoch 曲线）、
+搜索空间演化（补丁时间线）、agent 决策时间线、运行控制（启动/停止/实时日志）、
+大模型 API 切换（探测→写回 settings.yaml）与报告查看，全部在浏览器里完成：
+
+```powershell
+# 方式一（生产，单端口）：前端已构建时由后端直接托管
+cd web && npm install && npm run build
+python cli.py web                # 打开 http://127.0.0.1:8000
+
+# 方式二（开发热重载）：前后端分开跑
+python cli.py web                # 后端 :8000
+cd web && npm run dev            # 前端 :5173，/api 自动代理到 :8000
+```
+
+- **运行控制**：界面上「开始搜索」等价于 `python cli.py run`（子进程驱动，完整复用
+  agent 降级与断点续跑）；「停止」杀整棵进程树，进行中的试验会如实标记为失败。
+- **API 切换**：设置页改 model / base_url / auth_token，保存前先做两级探测
+  （ping + tool-use），失败不落盘。token 留空 = 保持现有 `${ENV:...}` 环境变量引用；
+  填明文 = 写入 settings.yaml（界面会警告密钥入库风险）。
+- **等价 CLI**：`python cli.py api`（自动探测候选模型并写回）与
+  `python cli.py check`（仅探测）在终端完成同样的事。
 
 ## 配置即文档
 

@@ -62,6 +62,54 @@ def _write_back(settings_path: str, model: str, base_url: str) -> bool:
     return True
 
 
+def _yaml_scalar(value: str) -> str:
+    """安全写入 YAML 的标量形式：含特殊字符时加双引号。"""
+    if re.fullmatch(r"[A-Za-z0-9_\-./:%]+", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_back_agent(settings_path: str, model: str | None = None,
+                     base_url: str | None = None,
+                     auth_token: str | None = None) -> dict:
+    """Web 界面的显式保存：把给出的字段最小化写回 settings.yaml（保留注释）。
+
+    与 _write_back（服务 cli.py api 流程、跳过 ${ENV:...} 引用）不同：
+    这里用户在界面上显式给出的值优先，会覆盖现有值（包括 ${ENV:...} 引用）；
+    未给出（None/空）的字段一律不动——尤其 auth_token 留空时保持环境变量引用，
+    绝不把环境变量里的 token 物化进配置文件。
+    """
+    from pathlib import Path
+    path = Path(settings_path)
+    fields = {"model": model, "base_url": base_url, "auth_token": auth_token}
+    fields = {k: str(v).strip() for k, v in fields.items() if v and str(v).strip()}
+    if not fields:
+        return {"ok": False, "changed": [], "errors": ["没有需要写入的字段"]}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "changed": [], "errors": [f"无法读取 {path}：{e}"]}
+    changed: list[str] = []
+    errors: list[str] = []
+    for name, value in fields.items():
+        pattern = re.compile(rf"^(?P<sp>\s*){name}:(\s*\S.*)?$", re.M)
+        if not pattern.search(text):
+            errors.append(f"settings.yaml 中未找到 {name} 字段所在行，请手动编辑")
+            continue
+        rendered = _yaml_scalar(value)
+        text, n = pattern.subn(
+            lambda m, _n=name, _r=rendered: f"{m.group('sp')}{_n}: {_r}",
+            text, count=1)
+        if n > 0:
+            changed.append(name)
+    if changed:
+        try:
+            path.write_text(text, encoding="utf-8")
+        except OSError as e:
+            return {"ok": False, "changed": [], "errors": [f"写入 {path} 失败：{e}"]}
+    return {"ok": bool(changed), "changed": changed, "errors": errors}
+
+
 def run_api_setup(settings_path: str, model: str | None = None,
                   log=print) -> int:
     """API 自配置主流程。返回退出码（0=配置完成并验证通过）。"""

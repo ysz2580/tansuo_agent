@@ -174,6 +174,18 @@ def cmd_init(args) -> int:
     return 0
 
 
+def cmd_web(args) -> int:
+    import uvicorn
+    from tansuo.web.app import app
+    # 路径以绝对路径经环境变量注入，后端不受启动目录影响
+    os.environ["TANSUO_SETTINGS"] = str(Path(args.settings).resolve())
+    os.environ["TANSUO_SPACE"] = str(Path(args.space).resolve())
+    print(f"Web 后端：http://{args.host}:{args.port}")
+    print(f"前端开发模式：cd web && npm run dev（自动代理 /api → :{args.port}）")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
+
+
 def cmd_setup(args) -> int:
     train = Path(args.train)
     if not train.exists():
@@ -254,6 +266,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="大模型 API 自配置：探测环境→验证模型→写回 settings")
     pa.add_argument("--model", default=None, help="优先探测的模型名")
     pa.set_defaults(fn=cmd_api)
+
+    pw = sub.add_parser("web", parents=[common], help="启动 Web 后端（可视化界面 API）")
+    pw.add_argument("--host", default="127.0.0.1", help="监听地址")
+    pw.add_argument("--port", type=int, default=8000, help="监听端口")
+    pw.set_defaults(fn=cmd_web)
     return p
 
 
