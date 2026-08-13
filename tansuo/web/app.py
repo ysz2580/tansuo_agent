@@ -578,6 +578,91 @@ def agent_config_save(body: AgentConfigBody):
 
 
 # ------------------------------------------------------------------
+# 提示词管理（prompts.yaml：覆盖 / 版本 / 历史回滚；前后端同步）
+# ------------------------------------------------------------------
+
+class PromptPreviewBody(BaseModel):
+    which: str
+    text: str = ""
+
+
+class PromptSaveBody(BaseModel):
+    which: str
+    text: str = ""
+    rationale: str
+
+
+def _preview_context(which: str) -> dict:
+    """为预览构建尽力而为的上下文；运行时才有的量用样例值，取不到的留空
+    （渲染后原样保留 {{var}}，missing_vars 会列出，便于编辑时排查）。"""
+    from ..agent.prompts import build_context_tuning_system
+    try:
+        settings = load_settings(SETTINGS_PATH)
+    except ConfigError:
+        return {}
+    root = abs_data_dir(settings, PROJECT_ROOT)
+    space = _load_space_with_snapshots(Path(SPACE_PATH), root)
+    if which == "tuning_system":
+        return build_context_tuning_system(settings, space)   # 全静态，可完整渲染
+    if which == "tuning_wake_brief":
+        total = settings.budget.total_trials   # 运行时量用样例值（第 1 轮、未开始）
+        return {"round_no": 1, "max_wake_rounds": settings.agent.max_wake_rounds,
+                "finished_count": 0, "total": total, "budget_left": total,
+                "space_version": space.version}
+    return {}   # setup_system：Web 侧无训练脚本上下文，占位符原样保留
+
+
+@app.get("/api/config/prompts")
+def prompts_get():
+    """三条提示词的当前覆盖、出厂默认、生效模板、可用变量与历史。"""
+    from ..agent.prompt_store import load_doc
+    from ..agent.prompts import DEFAULT_PROMPTS, PROMPT_NAMES, PROMPT_VARS
+    try:
+        settings = load_settings(SETTINGS_PATH)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
+    doc = load_doc(settings)
+    overrides = doc["prompts"]
+    prompts = []
+    for name in PROMPT_NAMES:
+        override = str(overrides.get(name, ""))
+        default = DEFAULT_PROMPTS[name]
+        prompts.append({"name": name, "override": override, "default": default,
+                        "effective": override or default, "vars": PROMPT_VARS[name]})
+    return {"version": doc["version"], "prompts": prompts, "history": doc["history"]}
+
+
+@app.post("/api/config/prompts/preview")
+def prompts_preview(body: PromptPreviewBody):
+    """不落盘地渲染一段提示词，供编辑时预览；列出未被填充的占位符。"""
+    from ..agent.prompt_store import MAX_PROMPT_LEN
+    from ..agent.prompts import PROMPT_NAMES, render_prompt
+    if body.which not in PROMPT_NAMES:
+        raise HTTPException(status_code=400, detail=f"未知提示词 {body.which!r}")
+    if len(body.text) > MAX_PROMPT_LEN:
+        raise HTTPException(status_code=400, detail=f"提示词过长（>{MAX_PROMPT_LEN} 字符）")
+    ctx = _preview_context(body.which)
+    overrides = {body.which: body.text} if body.text else {}
+    rendered = render_prompt(body.which, ctx, overrides)
+    missing = sorted(set(re.findall(r"\{\{\s*(\w+)\s*\}\}", rendered)))
+    return {"rendered": rendered, "missing_vars": missing}
+
+
+@app.post("/api/config/prompts/save")
+def prompts_save(body: PromptSaveBody):
+    """保存一条覆盖并记历史（text 为空=恢复出厂）；校验失败转 400。"""
+    from ..agent.prompt_store import PromptStoreError, save_override
+    try:
+        settings = load_settings(SETTINGS_PATH)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
+    try:
+        return save_override(settings, body.which, body.text, body.rationale, source="web")
+    except PromptStoreError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ------------------------------------------------------------------
 # 静态前端（生产构建产物存在时托管，单端口部署）
 # ------------------------------------------------------------------
 

@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 
-from ..prompts import setup_system_prompt
+from ..prompt_store import load_overrides
+from ..prompts import build_context_setup, render_prompt
 from ..skill import Skill, SkillLimits
 
 SETUP_TOOLS = [
@@ -235,6 +236,7 @@ class SetupSkill(Skill):
         self.space_path = space_path
         self.train_script_path = train_script_path
         self._src = Path(train_script_path).read_text(encoding="utf-8", errors="replace")
+        self._prompts = load_overrides(settings)   # prompts.yaml 覆盖（无文件→{}→出厂默认）
         self._executor = SetupExecutor(settings_path, space_path,
                                        train_script_path, journal)
 
@@ -245,7 +247,9 @@ class SetupSkill(Skill):
         return self._executor
 
     def system_prompt(self) -> str:
-        return setup_system_prompt(self.train_script_path, self._src)
+        return render_prompt("setup_system",
+                             build_context_setup(self.train_script_path, self._src),
+                             self._prompts)
 
     def opening_message(self) -> str:
         return ("请按 system 中的流程为这个训练脚本生成配置："

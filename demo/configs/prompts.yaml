@@ -1,0 +1,28 @@
+# ============================================================
+# tansuo_agent 提示词覆盖（agent 全局行为，不分分区）
+# 与 settings.yaml 同目录；由 Web「提示词」页读写，也可手工编辑。
+#
+# 语义：
+# - 每条值为""（空串）= 使用出厂默认模板，行为与未配置时完全一致。
+# - 填入自定义文本后，agent 下次唤醒即用新模板（无需重启服务）。
+# - 模板里可引用 {{变量}} 占位符，渲染时按运行时上下文填充；
+#   未知占位符会原样保留（Web 预览会列出"未填充"项，便于排查）。
+#
+# 各提示词可用占位符：
+# - tuning_system：    {{experiment_name}} {{metrics_block}} {{space_describe}} {{total_trials}}
+# - tuning_wake_brief：{{round_no}} {{max_wake_rounds}} {{finished_count}}
+#                      {{total}} {{budget_left}} {{space_version}}
+# - setup_system：     {{train_script_path}} {{train_script_src}}
+#
+# version/history 由保存逻辑自动维护（每次保存 +1 并留全量快照，支持回滚），
+# 手工编辑时可不填，下次经 Web 保存会自动补齐。
+# ============================================================
+
+version: 0
+
+prompts:
+  tuning_system: ""
+  tuning_wake_brief: ""
+  setup_system: ""
+
+history: []

@@ -14,7 +14,9 @@ import json
 
 from ...analysis import learning_curves, summarize
 from ...journal import SPACE_PATCH
-from ..prompts import tuning_system_prompt, tuning_wake_brief
+from ..prompt_store import load_overrides
+from ..prompts import (build_context_tuning_system, build_context_tuning_wake,
+                       render_prompt)
 from ..skill import Skill, SkillLimits
 
 TUNING_TOOLS = [
@@ -265,6 +267,7 @@ class TuneSkill(Skill):
         self.orch = orchestrator
         self.round_no = round_no
         self._executor = TuneExecutor(orchestrator)
+        self._prompts = load_overrides(settings)   # prompts.yaml 覆盖（无文件→{}→出厂默认）
 
     def tools(self) -> list[dict]:
         return TUNING_TOOLS
@@ -273,10 +276,14 @@ class TuneSkill(Skill):
         return self._executor
 
     def system_prompt(self) -> str:
-        return tuning_system_prompt(self.settings, self.orch.space)
+        return render_prompt("tuning_system",
+                             build_context_tuning_system(self.settings, self.orch.space),
+                             self._prompts)
 
     def opening_message(self) -> str:
-        return tuning_wake_brief(self.round_no, self.settings, self.orch)
+        return render_prompt("tuning_wake_brief",
+                             build_context_tuning_wake(self.round_no, self.settings, self.orch),
+                             self._prompts)
 
     def limits(self) -> SkillLimits:
         cfg = self.settings.agent

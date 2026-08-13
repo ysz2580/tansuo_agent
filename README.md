@@ -17,6 +17,8 @@ E:\tansuo_agent\
 ├── cli.py                  # 命令行入口（run/runs/space/report/check/api/setup/init）
 ├── tansuo\                 # agent 框架本体
 │   ├── agent\              # 通用 agent 内核：client / hooks(权限) / skill / loop
+│   │   ├── prompts.py      # 提示词模板：出厂默认 + {{变量}} 占位渲染
+│   │   ├── prompt_store.py # prompts.yaml 覆盖 / 版本 / 历史回滚（前后端同步）
 │   │   └── skills\         # 内置技能：tune(调参监督) / config(配置生成)
 │   ├── config.py           # settings.yaml 加载与强校验
 │   ├── cohort.py           # 记录分区：记录永不删除 + 三指纹自动分区 + 迁移
@@ -28,10 +30,10 @@ E:\tansuo_agent\
 ├── tansuo\web\             # Web 后端：FastAPI（只读查询 + 运行驱动 + API 配置切换）
 ├── web\                    # Web 前端：Vite + React + TS + Tailwind + shadcn/ui
 ├── demo\                   # 演示场景（MNIST 小 CNN，CPU 可跑）
-│   ├── configs\            # settings.yaml + search_space.yaml（带详尽注释）
+│   ├── configs\            # settings.yaml + search_space.yaml + prompts.yaml（带详尽注释）
 │   ├── train_mnist.py      # 演示训练脚本（遵守子进程协议）
 │   └── my_adapter_template.py  # 你自己的训练任务接入模板
-└── tests\                  # 分区 110 / 对比 22 / 热启动 16 / 空间护栏 34 / 条件空间 30 / 协议 12 / 权限降级 21 / 运行时 23 断言
+└── tests\                  # 分区 110 / 对比 22 / 热启动 16 / 提示词 28 / 空间护栏 34 / 条件空间 30 / 协议 12 / 权限降级 21 / 运行时 23 断言
                             # + e2e_cli_smoke / e2e_web_smoke 端到端冒烟（真实子进程）
 ```
 
@@ -149,9 +151,10 @@ Web 界面顶部的分区选择器同样可切换回看任意历史分区；仪�
 ## Web 可视化界面（shadcn/ui 前端）
 
 仪表盘（试验统计/最优配置/收敛信号/学习曲线）、试验表（逐 epoch 曲线）、
-搜索空间演化（补丁时间线）、agent 决策时间线、**跨分区对比**（同目标分区的最优值/
-参数对照/学习曲线叠加，目标分组可切换）、运行控制（启动/停止/实时日志）、
-大模型 API 切换（探测→写回 settings.yaml）与报告查看，全部在浏览器里完成。
+搜索空间演化（补丁时间线）、agent 决策时间线、**提示词管理**（agent 三条提示词的
+编辑/预览/版本/回滚）、**跨分区对比**（同目标分区的最优值/参数对照/学习曲线叠加，
+目标分组可切换）、运行控制（启动/停止/实时日志）、大模型 API 切换
+（探测→写回 settings.yaml）与报告查看，全部在浏览器里完成。
 顶部**分区选择器**可回看任意历史记录分区（记录永不删除；「最新分区」自动跟随
 新开的分区），仪表盘在训练代码、数据集或优化目标已变化时横幅提示"下次运行将
 自动新开分区"：
@@ -175,6 +178,12 @@ cd web && npm run dev            # 前端 :5173，/api 自动代理到 :8000
 - **API 切换**：设置页改 model / base_url / auth_token，保存前先做两级探测
   （ping + tool-use），失败不落盘。token 留空 = 保持现有 `${ENV:...}` 环境变量引用；
   填明文 = 写入 settings.yaml（界面会警告密钥入库风险）。
+- **提示词管理**：「提示词」页可编辑 agent 的三条提示词（调参 system / 每轮唤醒简报 /
+  配置 setup）。模板用 `{{变量}}` 占位符（如 `{{total_trials}}`、`{{space_describe}}`），
+  渲染时按运行时上下文填充；「预览渲染」先看效果再保存，未填充的占位符会被列出。
+  空覆盖 = 用出厂默认，保存后 agent 下次唤醒即生效。每次保存记版本与全量快照，
+  「迭代历史」可一键载入旧版本文本回滚。落盘在同目录 `prompts.yaml`（可手工编辑），
+  前后端同一份文件，天然同步。
 - **等价 CLI**：`python cli.py api`（自动探测候选模型并写回）与
   `python cli.py check`（仅探测）在终端完成同样的事。
 

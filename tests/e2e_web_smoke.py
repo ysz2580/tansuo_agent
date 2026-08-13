@@ -219,6 +219,49 @@ with tempfile.TemporaryDirectory() as td:
         ok("显式指定单分区返回一条", len(cp1["cohorts"]) == 1 and cp1["cohorts"][0]["id"] == one)
         ok("未知分区 404", _expect_404("/api/runs/compare?cohorts=9999-99999999-999999"))
 
+        print("== 12. 提示词管理（前后端同步）==")
+        import urllib.error
+        pr = api("/api/config/prompts")
+        ok("三条提示词 + 版本 0 + 空历史",
+           len(pr["prompts"]) == 3 and pr["version"] == 0 and pr["history"] == [])
+        tune = next(p for p in pr["prompts"] if p["name"] == "tuning_system")
+        ok("初始 override 为空、生效=默认、含可用变量",
+           tune["override"] == "" and tune["effective"] == tune["default"]
+           and "total_trials" in tune["vars"])
+        pv = api("/api/config/prompts/preview",
+                 {"which": "tuning_system", "text": ""})
+        ok("预览默认模板：实验名注入且无未填充占位符",
+           "websmoke" in pv["rendered"] and pv["missing_vars"] == [])
+        pv2 = api("/api/config/prompts/preview",
+                  {"which": "tuning_wake_brief", "text": "轮 {{round_no}} / 余 {{budget_left}}"})
+        ok("预览自定义简报按样例上下文渲染", pv2["rendered"] == "轮 1 / 余 4")
+        sv = api("/api/config/prompts/save",
+                 {"which": "tuning_system", "text": "自定义：预算 {{total_trials}}",
+                  "rationale": "冒烟覆盖"})
+        ok("保存 version=1 且落 prompts.yaml",
+           sv["version"] == 1 and (tmp / "prompts.yaml").exists())
+        pr2 = api("/api/config/prompts")
+        tune2 = next(p for p in pr2["prompts"] if p["name"] == "tuning_system")
+        ok("GET 反映覆盖（effective=override）且历史 +1",
+           tune2["override"] == "自定义：预算 {{total_trials}}"
+           and tune2["effective"] == tune2["override"] and len(pr2["history"]) == 1)
+        pv3 = api("/api/config/prompts/preview",
+                  {"which": "tuning_system", "text": tune2["override"]})
+        ok("覆盖模板按真实 total_trials 渲染", pv3["rendered"] == "自定义：预算 4")
+        try:
+            api("/api/config/prompts/save",
+                {"which": "tuning_system", "text": "x", "rationale": "   "})
+            raise AssertionError("FAIL: 空 rationale 应被拒（400）")
+        except urllib.error.HTTPError as e:
+            ok("空 rationale 保存被拒（400）", e.code == 400)
+        sv2 = api("/api/config/prompts/save",
+                  {"which": "tuning_system", "text": "", "rationale": "恢复出厂"})
+        ok("空文本=恢复出厂且仍计版本留痕",
+           sv2["version"] == 2
+           and next(p for p in api("/api/config/prompts")["prompts"]
+                    if p["name"] == "tuning_system")["effective"]
+           == tune["default"])
+
         print("\nWeb 冒烟全部通过")
     finally:
         if proc and proc.poll() is None:

@@ -59,6 +59,7 @@ pruner:
   n_warmup_steps: 1         # 每个试验至少跑满 N 步才参与剪枝比较
 
 # ---------- LLM agent（监督者） ----------
+# 提示词（system/唤醒简报/setup）可在同目录 prompts.yaml 覆盖，或用 Web「提示词」页管理。
 agent:
   enabled: true             # false 等价于 --no-agent
   model: qwen3-max

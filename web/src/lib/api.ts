@@ -233,6 +233,52 @@ export interface SaveResult {
   warnings: string[]
 }
 
+// 提示词管理（/api/config/prompts）：全局配置，前后端同步、带版本与回滚
+export interface PromptInfo {
+  name: "tuning_system" | "tuning_wake_brief" | "setup_system"
+  override: string      // 用户覆盖文本；空串=用出厂默认
+  default: string       // 出厂默认模板
+  effective: string     // override 或 default（供编辑器加载）
+  vars: string[]        // 该提示词可用的 {{var}} 占位符
+}
+
+export interface PromptHistoryEntry {
+  ts: string
+  version: number
+  which: string
+  rationale: string
+  source: string
+  text: string          // 该版本生效的完整文本（载入此版本=用 text 覆盖）
+  hash: string
+}
+
+export interface PromptsResp {
+  version: number
+  prompts: PromptInfo[]
+  history: PromptHistoryEntry[]
+}
+
+export interface PromptPreviewBody {
+  which: string
+  text: string
+}
+
+export interface PromptPreviewResp {
+  rendered: string
+  missing_vars: string[]
+}
+
+export interface PromptSaveBody {
+  which: string
+  text: string
+  rationale: string
+}
+
+export interface PromptSaveResp {
+  version: number
+  entry: PromptHistoryEntry
+}
+
 // ---------- 端点 ----------
 
 export const api = {
@@ -263,4 +309,10 @@ export const api = {
     http<ProbeResult>("/config/agent/probe", { method: "POST", body: JSON.stringify(body) }),
   save: (body: AgentConfigBody) =>
     http<SaveResult>("/config/agent/save", { method: "POST", body: JSON.stringify(body) }),
+  // 提示词管理（全局，不分分区）
+  prompts: () => http<PromptsResp>("/config/prompts"),
+  promptsPreview: (body: PromptPreviewBody) =>
+    http<PromptPreviewResp>("/config/prompts/preview", { method: "POST", body: JSON.stringify(body) }),
+  promptsSave: (body: PromptSaveBody) =>
+    http<PromptSaveResp>("/config/prompts/save", { method: "POST", body: JSON.stringify(body) }),
 }
