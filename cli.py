@@ -2,7 +2,7 @@
 
 子命令：
   run    跑超参数搜索（--no-agent 纯 Optuna 巡航；默认预算见 settings.yaml）
-  runs   查看记录分区（记录永不删除；按双指纹自动分区）
+  runs   查看记录分区（记录永不删除；按三指纹自动分区；runs compare 跨分区对比）
   space  查看当前搜索空间与补丁历史（space show）
   check  探测 LLM 端点连通性（Phase 5 提供）
   init   生成离线配置模板兜底（Phase 6 提供）
@@ -22,6 +22,7 @@ import optuna
 from tansuo.cohort import (CohortError, abs_data_dir, apply_cohort, code_fingerprint,
                            cohort_stats, list_cohorts, load_cohort, migrate_legacy,
                            resolve_for_run)
+from tansuo.compare import compare_cohorts
 from tansuo.config import ConfigError, load_settings
 from tansuo.journal import Journal
 from tansuo.orchestrator import Orchestrator
@@ -356,6 +357,65 @@ def cmd_runs_show(args) -> int:
     return 0
 
 
+def _fmt_value(v) -> str:
+    """对比表格里的参数值展示：数值 6 位有效数字，其余原样。"""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, (int, float)):
+        return f"{v:.6g}"
+    return str(v)
+
+
+def cmd_runs_compare(args) -> int:
+    """跨分区对比：优化目标相同的分区并排比最优结果。"""
+    try:
+        settings = load_settings(args.settings)
+        base = Path.cwd()
+        data_dir = abs_data_dir(settings, base)
+        result = compare_cohorts(data_dir, args.cohorts or None, settings,
+                                 base_dir=base)
+    except ConfigError as e:
+        print(f"配置错误：{e}", file=sys.stderr)
+        return 2
+    except CohortError as e:
+        print(f"无法对比：{e}", file=sys.stderr)
+        return 2
+    pm = result["primary"] or {}
+    dir_s = "越大越好" if pm.get("direction") == "maximize" else "越小越好"
+    n = len(result["cohorts"])
+    print(f"== 跨分区对比（主指标 {pm.get('name')}，{dir_s}，"
+          f"目标指纹 {str(result['objective_hash'])[:8]}，共 {n} 个分区）==")
+    for e in result["cohorts"]:
+        best = f"{e['best']['value']:.6g}" if e["best"] else "-"
+        trial = f"#{e['best']['trial']}" if e["best"] else "-"
+        lock = "（db 被占用，统计降级）" if e["locked"] else ""
+        note = f" 备注「{e['note']}」" if e["note"] else ""
+        print(f"  {e['id']}  {e.get('created_at') or '-'}"
+              f"  试验 {e['completed']:>4}  最优 {best:>12}  最优试验 {trial:>6}"
+              f"  代码 {str(e.get('code_hash') or '-')[:8]}"
+              f"  数据 {str(e.get('data_hash') or '-')[:8]}{lock}{note}")
+    names: list = []
+    for e in result["cohorts"]:
+        if e["best"]:
+            for k in e["best"]["params"]:
+                if k not in names:
+                    names.append(k)
+    if names:
+        ids = [e["id"] for e in result["cohorts"]]
+        width = max(20, max(len(i) for i in ids) + 2)
+        print("\n最优配置对比（列为分区，'-' 表示该最优试验未取样此参数）：")
+        print(f"  {'参数':<16}" + "".join(f"{i:>{width}}" for i in ids))
+        for name in names:
+            cells = []
+            for e in result["cohorts"]:
+                v = (e["best"] or {}).get("params", {}).get(name)
+                cells.append(_fmt_value(v) if v is not None else "-")
+            print(f"  {name:<16}" + "".join(f"{c:>{width}}" for c in cells))
+    else:
+        print("\n（各分区都还没有完成的试验，暂无最优配置可对比）")
+    return 0
+
+
 def cmd_api(args) -> int:
     from tansuo.agent.api_setup import run_api_setup
     return run_api_setup(args.settings, model=args.model)
@@ -471,11 +531,16 @@ def build_parser() -> argparse.ArgumentParser:
     pr.set_defaults(fn=cmd_run)
 
     pru = sub.add_parser("runs", parents=[common],
-                         help="列出记录分区（记录永不删除，按双指纹自动分区）")
+                         help="列出记录分区（记录永不删除，按三指纹自动分区）")
     pru_sub = pru.add_subparsers(dest="runs_cmd")
     pru_show = pru_sub.add_parser("show", parents=[common], help="查看某个分区的详细信息")
     pru_show.add_argument("cohort_id", help="分区 ID（如 0001-20260811-120000 或 0000-legacy）")
     pru_show.set_defaults(fn=cmd_runs_show)
+    pru_cmp = pru_sub.add_parser("compare", parents=[common],
+                                 help="跨分区对比（仅优化目标相同的分区可比）")
+    pru_cmp.add_argument("cohorts", nargs="*",
+                         help="参与对比的分区 ID；缺省 = 与当前 settings 目标指纹相同的全部分区")
+    pru_cmp.set_defaults(fn=cmd_runs_compare)
     pru.set_defaults(fn=cmd_runs)
 
     ps = sub.add_parser("space", parents=[common], help="搜索空间管理")

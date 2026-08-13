@@ -16,6 +16,7 @@ import DashboardPage from "@/pages/DashboardPage"
 import TrialsPage from "@/pages/TrialsPage"
 import SpacePage from "@/pages/SpacePage"
 import AgentPage from "@/pages/AgentPage"
+import ComparePage from "@/pages/ComparePage"
 import SettingsPage from "@/pages/SettingsPage"
 
 function RunIndicator() {
@@ -92,6 +93,7 @@ export default function App() {
             <TabsTrigger value="trials">试验</TabsTrigger>
             <TabsTrigger value="space">搜索空间</TabsTrigger>
             <TabsTrigger value="agent">Agent</TabsTrigger>
+            <TabsTrigger value="compare">对比</TabsTrigger>
             <TabsTrigger value="settings">运行与设置</TabsTrigger>
           </TabsList>
           {/* key 随分区变化整体重挂载各页：轮询立即按新分区重新拉数 */}
@@ -99,6 +101,8 @@ export default function App() {
           <TabsContent value="trials" className="mt-4"><TrialsPage key={cohort ?? "latest"} /></TabsContent>
           <TabsContent value="space" className="mt-4"><SpacePage key={cohort ?? "latest"} /></TabsContent>
           <TabsContent value="agent" className="mt-4"><AgentPage key={cohort ?? "latest"} /></TabsContent>
+          {/* 对比页自管分区选择（多分区视图），不随全局分区选择器重挂载 */}
+          <TabsContent value="compare" className="mt-4"><ComparePage /></TabsContent>
           <TabsContent value="settings" className="mt-4"><SettingsPage key={cohort ?? "latest"} /></TabsContent>
         </Tabs>
 

@@ -12,23 +12,27 @@ import type { CurvePoint, TrialCurve } from "@/lib/api"
 
 const COLORS = ["#2563eb", "#16a34a", "#dc2626", "#9333ea", "#ea580c", "#0891b2"]
 
-/** 多条试验曲线叠加：x=epoch，每个试验一条线。 */
+/** 多条试验曲线叠加：x=epoch，每个试验一条线。
+ *  seriesLabel 可自定义曲线名（跨分区对比时用分区号命名，避免 trial# 冲突）。 */
 export function CurvesChart({
   curves,
   metric,
   height = 260,
+  seriesLabel,
 }: {
   curves: TrialCurve[]
   metric: string
   height?: number
+  seriesLabel?: (c: TrialCurve) => string
 }) {
+  const label = seriesLabel ?? ((c: TrialCurve) => `trial#${c.trial}`)
   const maxEpoch = Math.max(0, ...curves.flatMap((c) => c.curve.map((p) => p.epoch)))
   const rows: Record<string, number>[] = []
   for (let e = 1; e <= maxEpoch; e++) {
     const row: Record<string, number> = { epoch: e }
     for (const c of curves) {
       const p = c.curve.find((x) => x.epoch === e)
-      if (p && typeof p[metric] === "number") row[`trial#${c.trial}`] = p[metric] as number
+      if (p && typeof p[metric] === "number") row[label(c)] = p[metric] as number
     }
     rows.push(row)
   }
@@ -46,9 +50,9 @@ export function CurvesChart({
         <Legend />
         {curves.map((c, i) => (
           <Line
-            key={c.trial}
+            key={label(c)}
             type="monotone"
-            dataKey={`trial#${c.trial}`}
+            dataKey={label(c)}
             stroke={COLORS[i % COLORS.length]}
             strokeWidth={2}
             dot={{ r: 2 }}

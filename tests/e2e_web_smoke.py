@@ -206,6 +206,19 @@ with tempfile.TemporaryDirectory() as td:
         st6 = wait_idle()
         ok("数据集改回 → 恢复 0004 续跑", st6["last_cohort"] == c4)
 
+        print("== 11. 跨分区对比端点 ==")
+        # 本冒烟全程目标未变：0001-0005 五个分区同属一个可比组
+        cp = api("/api/runs/compare")
+        ok("缺省对比组含全部五个同目标分区", len(cp["cohorts"]) == 5)
+        ok("对比基准含主指标与方向",
+           cp["primary"]["name"] == "val_acc" and cp["primary"]["direction"] == "maximize")
+        ok("每个分区结构完整（best/curve 字段齐全）",
+           all({"best", "curve", "completed", "locked"} <= set(e) for e in cp["cohorts"]))
+        one = cp["cohorts"][0]["id"]
+        cp1 = api(f"/api/runs/compare?cohorts={one}")
+        ok("显式指定单分区返回一条", len(cp1["cohorts"]) == 1 and cp1["cohorts"][0]["id"] == one)
+        ok("未知分区 404", _expect_404("/api/runs/compare?cohorts=9999-99999999-999999"))
+
         print("\nWeb 冒烟全部通过")
     finally:
         if proc and proc.poll() is None:

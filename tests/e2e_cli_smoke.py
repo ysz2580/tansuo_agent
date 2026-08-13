@@ -127,4 +127,19 @@ with tempfile.TemporaryDirectory() as td:
     ok("目标变化新开分区且原因具体", "[记录] 新开分区 0004-" in r10.stdout
        and "优化目标变化" in r10.stdout)
 
+    print("== 8. runs compare 跨分区对比 ==")
+    # 现状：0001/0002/0003 同目标（maximize），0004 目标为 minimize
+    c2 = next(p for p in runs_root.iterdir() if p.name.startswith("0002-"))
+    c4 = next(p for p in runs_root.iterdir() if p.name.startswith("0004-"))
+    r11 = run_cli(tmp, "runs", "compare", *S)
+    ok("缺省组含当前目标可比的全部三个分区",
+       c1.name in r11.stdout and c2.name in r11.stdout and c3.name in r11.stdout)
+    ok("异目标分区 0004 不在缺省组", c4.name not in r11.stdout)
+    ok("对比头部与参数对比表齐全",
+       "跨分区对比" in r11.stdout and "最优配置对比" in r11.stdout)
+    r12 = run_cli(tmp, "runs", "compare", c1.name, c2.name, *S)
+    ok("显式指定两个分区对比成功", c1.name in r12.stdout and c2.name in r12.stdout)
+    r13 = run_cli(tmp, "runs", "compare", c1.name, c4.name, *S, expect=2)
+    ok("跨目标对比被拒并说明原因", "优化目标不一致" in r13.stderr)
+
 print(f"\nCLI 冒烟全部通过：{PASS} 项")

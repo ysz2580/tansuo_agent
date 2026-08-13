@@ -89,3 +89,16 @@ def create_or_load_study(settings, storage: optuna.storages.BaseStorage | None =
         pruner=make_pruner(settings.pruner),
         load_if_exists=True,
     )
+
+
+def dispose_study(study) -> None:
+    """释放 sqlite 连接池（Windows 下避免 ~30s 句柄残留、临时目录清理失败）。
+    study._storage 是 _CachedStorage 包装层，引擎在 _backend 上。"""
+    storage = getattr(study, "_storage", None)
+    backend = getattr(storage, "_backend", storage)
+    engine = getattr(backend, "engine", None)
+    if engine is not None:
+        try:
+            engine.dispose()
+        except Exception:   # noqa: BLE001
+            pass

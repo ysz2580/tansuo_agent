@@ -177,6 +177,33 @@ export interface RunsResp {
   default: string | null
 }
 
+// 跨分区对比（/api/runs/compare）：仅优化目标指纹相同的分区可比
+export interface CompareBest {
+  trial: number
+  value: number
+  params: Record<string, unknown>
+}
+
+export interface CompareCohort {
+  id: string
+  created_at: string | null
+  note: string
+  code_hash: string | null
+  data_hash: string | null
+  completed: number
+  locked: boolean
+  best: CompareBest | null
+  top_k: CompareBest[]
+  curve: CurvePoint[]
+}
+
+export interface CompareResp {
+  objective_hash: string
+  primary: { name: string; direction: string }
+  watch: string[]
+  cohorts: CompareCohort[]
+}
+
 export interface AgentConfig {
   model: string
   base_url: string
@@ -220,8 +247,12 @@ export const api = {
   report: (cohort?: string | null) => http<ReportResp>(`/report${qs(cohort)}`),
   reportGenerate: (cohort?: string | null) =>
     http<{ report: string; best: string }>(`/report/generate${qs(cohort)}`, { method: "POST" }),
-  // 分区列表 + 当前双指纹 + 可比性
+  // 分区列表 + 当前三指纹 + 可比性
   runs: () => http<RunsResp>("/runs"),
+  // 跨分区对比：cohorts 缺省 → 后端取与当前目标指纹相同的全部分区
+  runsCompare: (cohorts?: string[]) =>
+    http<CompareResp>(`/runs/compare${cohorts && cohorts.length
+      ? `?cohorts=${encodeURIComponent(cohorts.join(","))}` : ""}`),
   runStatus: () => http<RunStatus>("/run/status"),
   runLog: (tail = 300) => http<RunLogResp>(`/run/log?tail=${tail}`),
   runStart: (body: { trials?: number; wake_every?: number; no_agent?: boolean; fresh?: boolean; new_cohort?: boolean; note?: string; workers?: number; max_duration_h?: number }) =>

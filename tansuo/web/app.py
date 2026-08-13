@@ -24,10 +24,11 @@ from pydantic import BaseModel, Field
 from ..analysis import learning_curves, summarize
 from ..cohort import (CohortError, abs_data_dir, apply_cohort, code_fingerprint,
                       cohort_stats, list_cohorts, load_cohort, resolve_for_run)
+from ..compare import CompareError, compare_cohorts
 from ..config import ConfigError, load_settings
 from ..journal import TRIAL_END, Journal
 from ..space import SearchSpace, SpaceError
-from ..study import create_or_load_study
+from ..study import create_or_load_study, dispose_study
 from .run_manager import RunManager
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -295,6 +296,25 @@ def runs_list():
             "default": items[-1]["id"] if items else None}
 
 
+@app.get("/api/runs/compare")
+def runs_compare(cohorts: str | None = Query(
+        default=None,
+        description="参与对比的分区 ID（逗号分隔）；缺省 = 与当前目标指纹相同的全部分区")):
+    """跨分区对比：优化目标指纹相同的分区并排比最优值 / top-k / 最优试验学习曲线。"""
+    try:
+        settings = load_settings(SETTINGS_PATH)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    ids = [s.strip() for s in cohorts.split(",") if s.strip()] if cohorts else None
+    try:
+        return compare_cohorts(abs_data_dir(settings, PROJECT_ROOT), ids, settings,
+                               base_dir=PROJECT_ROOT)
+    except CompareError as e:      # 目标不一致等不可比情形（先于 CohortError 捕获）
+        raise HTTPException(status_code=400, detail=str(e))
+    except CohortError as e:       # 分区不存在 / 无分区可比
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 # ------------------------------------------------------------------
 # 运行驱动（子进程）
 # ------------------------------------------------------------------
@@ -322,20 +342,6 @@ def run_log(tail: int = Query(default=200, ge=1, le=5000)):
     st = RUN.status()
     st["text"] = RUN.log_tail(tail)
     return st
-
-
-def _dispose_study(study) -> None:
-    """释放 sqlite 连接池（Windows 下避免 ~30s 句柄残留）。
-    study._storage 是 _CachedStorage 包装层，引擎在 _backend 上。"""
-    backend = getattr(getattr(study, "_storage", None), "_backend", None)
-    engine = getattr(backend, "engine", None) if backend else None
-    if engine is None:
-        engine = getattr(getattr(study, "_storage", None), "engine", None)
-    if engine is not None:
-        try:
-            engine.dispose()
-        except Exception:   # noqa: BLE001
-            pass
 
 
 def _orphan_cleanup_for(cohort) -> list[int]:
@@ -398,7 +404,7 @@ def run_start(body: RunStartBody):
                                     detail=f"数据库正被占用，稍后再试（{e}）")
             finally:
                 if study_t is not None:
-                    _dispose_study(study_t)
+                    dispose_study(study_t)
         trials_arg = finished + trials_arg
     try:
         return RUN.start(target.path, trials=trials_arg,
