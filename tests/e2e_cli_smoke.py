@@ -1,4 +1,5 @@
-"""CLI 端到端冒烟：迁移 → 0001 → 改脚本 → 0002 → --fresh 零删除 → runs/report/拒绝续跑。
+"""CLI 端到端冒烟：迁移 → 0001 → 改脚本 → 0002 → --fresh 零删除 → runs/report/拒绝续跑
+→ 跨分区对比 → 新分区热启动。
 
 独立脚本直跑：python tests/e2e_cli_smoke.py（约 1-2 分钟，起真实子进程）。
 """
@@ -144,5 +145,17 @@ with tempfile.TemporaryDirectory() as td:
     ok("显式指定两个分区对比成功", c1.name in r12.stdout and c2.name in r12.stdout)
     r13 = run_cli(tmp, "runs", "compare", c1.name, c4.name, *S, expect=2)
     ok("跨目标对比被拒并说明原因", "优化目标不一致" in r13.stderr)
+
+    print("== 9. 新分区热启动 ==")
+    # 同目标历史分区 0001/0002/0003 都有成果；--new 开 0005 应自动入队种子
+    r14 = run_cli(tmp, "run", *S, "--trials", "1", "--no-agent", "--new")
+    ok("新分区 0005 出现热启动提示", "[热启动]" in r14.stdout
+       and "[记录] 新开分区 0005-" in r14.stdout)
+    ok("种子来源含同目标历史分区", "0001-" in r14.stdout)
+    ok("异目标分区不作为种子来源", "来源分区" in r14.stdout
+       and r14.stdout.split("来源分区：")[1].split("）")[0].find("0004-") < 0)
+    r15 = run_cli(tmp, "run", *S, "--trials", "1", "--no-agent", "--new",
+                  "--warm-start", "0")
+    ok("--warm-start 0 关闭热启动", "[热启动]" not in r15.stdout)
 
 print(f"\nCLI 冒烟全部通过：{PASS} 项")

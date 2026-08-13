@@ -82,6 +82,7 @@ class BudgetCfg:
     data_fraction: float = 1.0   # 训练集抽样比例（加速开关，注入 TANSUO_DATA_FRACTION）
     workers: int = 1             # 并行试验数（多线程 ask/tell + 每试验独立子进程）
     max_duration_h: float | None = None   # 会话时间预算（小时）；到点优雅收尾
+    warm_start: int = 3          # 新分区热启动：入队同目标旧分区 top-k 配置为种子试验（0=关）
 
 
 @dataclass
@@ -205,6 +206,7 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         data_fraction=float(b.get("data_fraction", 1.0)),
         workers=int(b.get("workers", 1)),
         max_duration_h=float(max_duration_h) if max_duration_h is not None else None,
+        warm_start=int(b.get("warm_start", 3)),
     )
     _require(budget.total_trials >= 1, "budget.total_trials 必须 ≥ 1")
     _require(1 <= budget.wake_every <= budget.total_trials,
@@ -215,6 +217,8 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
              f"budget.workers 应在 [1, 32] 内（1=串行），实际 {budget.workers}")
     _require(budget.max_duration_h is None or budget.max_duration_h > 0,
              f"budget.max_duration_h 必须是正数（小时），实际 {budget.max_duration_h}")
+    _require(0 <= budget.warm_start <= 8,
+             f"budget.warm_start 应在 [0, 8] 内（0=不热启动），实际 {budget.warm_start}")
 
     # ---- pruner ----
     p = raw.get("pruner") or {}

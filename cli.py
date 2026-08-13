@@ -29,6 +29,7 @@ from tansuo.orchestrator import Orchestrator
 from tansuo.runner import TrialRunner
 from tansuo.space import SearchSpace, SpaceError
 from tansuo.study import create_or_load_study
+from tansuo.warmstart import warm_start_study
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -61,6 +62,8 @@ def _make_runtime(args, settings=None):
         settings = load_settings(args.settings)
     if args.seed is not None:
         settings.budget.seed = args.seed
+    if getattr(args, "warm_start", None) is not None:
+        settings.budget.warm_start = args.warm_start
     if getattr(args, "model", None):
         settings.agent.model = args.model
     data_dir = Path(settings.data_dir)
@@ -86,6 +89,7 @@ def cmd_run(args) -> int:
     if args.note and not force_new and not args.cohort:
         print("提示：--note 会写入分区 meta.yaml（本次新建分区时生效）。")
     base = Path.cwd()
+    root_data_dir = abs_data_dir(settings, base)   # apply_cohort 改写前留根目录
     try:
         mig = migrate_legacy(settings, base_dir=base)
         if mig["moved"]:
@@ -129,6 +133,20 @@ def cmd_run(args) -> int:
     if args.hours is not None and args.hours <= 0:
         print("参数错误：--hours 必须是正数（小时）", file=sys.stderr)
         return 2
+    if args.warm_start is not None and args.warm_start < 0:
+        print("参数错误：--warm-start 不能为负数（0=不热启动）", file=sys.stderr)
+        return 2
+
+    # ---- 新分区热启动：尚无任何完结试验时，入队同目标旧分区的 top 配置 ----
+    k = settings.budget.warm_start
+    if k > 0 and orch.finished_count() == 0:
+        ws = warm_start_study(root_data_dir, settings, orch.study, orch.space,
+                              orch.journal, base_dir=base, k=min(k, total))
+        if ws["enqueued"]:
+            srcs = "、".join(sorted({p["source"] for p in ws["seeds"]}))
+            print(f"[热启动] 已入队 {ws['enqueued']} 条历史最优配置作为种子试验"
+                  f"（来源分区：{srcs}）——种子会真实重跑并计入预算；"
+                  "budget.warm_start=0 可关闭")
 
     agent_on = settings.agent.enabled and not args.no_agent
     supervisor = None
@@ -553,6 +571,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="并行试验数（默认取 settings budget.workers，1=串行）")
     pr.add_argument("--hours", type=float, default=None,
                     help="会话时间预算（小时）：到点在途试验跑完后优雅收尾")
+    pr.add_argument("--warm-start", type=int, default=None,
+                    help="新分区热启动种子数（默认取 settings budget.warm_start=3，0=关闭）")
     pr.add_argument("--new", action="store_true",
                     help="强制新开一个记录分区（不删除任何历史记录）")
     pr.add_argument("--note", default=None, help="分区备注（写入 meta.yaml，便于日后辨认）")

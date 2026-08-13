@@ -49,6 +49,8 @@ budget:
                             # python 函数模式并行要求用户函数线程安全
   # max_duration_h: 8       # 可选时间预算（小时）：到点不再派发新试验，在途试验跑完
                             # 即以 time_budget_exhausted 收尾。CLI --hours 可临时覆盖
+  # warm_start: 3           # 新分区热启动种子数：代码/数据集变化新开分区时，把同目标
+                            # 旧分区最优的 N 个配置入队优先重跑（0=关闭）。CLI --warm-start
 
 # ---------- 早停剪枝器 ----------
 pruner:
