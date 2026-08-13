@@ -29,6 +29,8 @@ function RunIndicator() {
 const COMPARABLE_META: Record<RunInfo["comparable"], { label: string; cls: string }> = {
   match: { label: "✔ 可比", cls: "bg-emerald-600/15 text-emerald-700 dark:text-emerald-400" },
   "code-changed": { label: "△ 代码已变", cls: "bg-amber-600/15 text-amber-700 dark:text-amber-400" },
+  "data-changed": { label: "△ 数据集已变", cls: "bg-amber-600/15 text-amber-700 dark:text-amber-400" },
+  "code-data-changed": { label: "△ 代码+数据集已变", cls: "bg-amber-600/15 text-amber-700 dark:text-amber-400" },
   "objective-changed": { label: "✘ 目标已变", cls: "bg-red-600/15 text-red-700 dark:text-red-400" },
   legacy: { label: "历史记录", cls: "bg-gray-600/15 text-gray-600 dark:text-gray-400" },
 }

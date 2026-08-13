@@ -98,13 +98,19 @@ def cmd_run(args) -> int:
         return 2
     action = info["action"]
     if action == "continue":
-        print(f"[记录] 续跑分区 {cohort.id}（双指纹一致）｜ 记录目录：{cohort.path}")
+        print(f"[记录] 续跑分区 {cohort.id}（三指纹一致）｜ 记录目录：{cohort.path}")
     elif action == "created":
         print(f"[记录] 新开分区 {cohort.id}：{info['reason']}")
     else:  # explicit
-        tail = "" if info["code_match"] else "（代码指纹不一致，按你的指定继续）"
+        tails = []
+        if not info["code_match"]:
+            tails.append("代码指纹不一致")
+        if not info.get("data_match", True):
+            tails.append("数据集指纹不一致")
+        tail = f"（{'、'.join(tails)}，按你的指定继续）" if tails else ""
         print(f"[记录] 续跑指定分区 {cohort.id}{tail}")
-    fp_match = (action != "explicit") or bool(info.get("code_match"))
+    fp_match = (action != "explicit") or (bool(info.get("code_match"))
+                                          and bool(info.get("data_match", True)))
 
     try:
         settings, orch = _make_runtime(args, settings=settings)
@@ -260,23 +266,35 @@ def cmd_runs(args) -> int:
         meta = c.meta or {}
         oh = str(meta.get("objective_hash") or "-")[:8]
         ch = str(meta.get("code_hash") or "-")[:8]
+        dh = str(meta.get("data_hash") or "-")[:8]
         if not (meta.get("objective_hash") or meta.get("code_hash")):
             comp = "— 历史记录（无指纹）"
         elif meta.get("objective_hash") != fp.objective_hash:
             comp = "✘ 目标已变，不可直接比较"
-        elif meta.get("code_hash") != fp.code_hash:
-            comp = "△ 目标一致、训练代码已变"
         else:
-            comp = "✔ 与当前指纹完全一致"
+            code_diff = meta.get("code_hash") != fp.code_hash
+            data_diff = meta.get("data_hash") != fp.data_hash
+            if code_diff and data_diff:
+                comp = "△ 目标一致、训练代码与数据集已变"
+            elif code_diff:
+                comp = "△ 目标一致、训练代码已变"
+            elif data_diff:
+                comp = ("△ 目标一致、数据集已变" if meta.get("data_hash")
+                        else "△ 目标一致、无数据集指纹（旧记录）")
+            else:
+                comp = "✔ 与当前指纹完全一致"
         best = f"{st['best']:.6g}" if st["best"] is not None else "-"
         lock = "（db 被占用，统计降级）" if st["locked"] else ""
         note = meta.get("note") or ""
         note_s = f" 备注「{note}」" if note else ""
         print(f"  {c.id}  {meta.get('created_at', '-')}"
               f"  试验 {st['completed']:>4}  最优 {best:>12}"
-              f"  目标 {oh}  代码 {ch}  {comp}{lock}{note_s}")
+              f"  目标 {oh}  代码 {ch}  数据 {dh}  {comp}{lock}{note_s}")
     rel = "" if fp.reliable else "（不可靠：未定位到脚本文件，仅哈希了命令串）"
-    print(f"当前指纹：目标={fp.objective_hash} 代码={fp.code_hash}{rel}")
+    data_rel = "" if fp.data_reliable else \
+        "（数据集未跟踪：python 模式且未声明 experiment.dataset）"
+    print(f"当前指纹：目标={fp.objective_hash} 代码={fp.code_hash}"
+          f" 数据集={fp.data_hash}{rel}{data_rel}")
     return 0
 
 
@@ -304,6 +322,7 @@ def cmd_runs_show(args) -> int:
     if meta.get("objective_hash"):
         print(f"objective_hash：{meta['objective_hash']}")
         print(f"code_hash：{meta['code_hash']}")
+        print(f"data_hash：{meta.get('data_hash') or '（无——创建于数据集分区引入前）'}")
         oi = meta.get("objective_inputs") or {}
         print(f"优化目标：{oi.get('primary', '-')} ｜ data_fraction={oi.get('data_fraction', '-')}")
         ci = meta.get("code_inputs") or {}
@@ -318,6 +337,13 @@ def cmd_runs_show(args) -> int:
             print(f"未定位到：{', '.join(ci['missing'])}")
         if ci.get("skipped"):
             print(f"跳过（过大）：{', '.join(ci['skipped'])}")
+        di = meta.get("data_inputs") or {}
+        if di:
+            vals = di.get("values") or []
+            print(f"数据集指纹（mode={di.get('mode', '-')}）："
+                  + (" ".join(vals) if vals else "（无取值）")
+                  + ("；未跟踪——声明 experiment.dataset 可参与分区隔离"
+                     if di.get("mode") == "untracked" else ""))
     pm = meta.get("primary_metric") or {}
     if pm:
         print(f"主指标：{pm.get('name')}（{pm.get('direction')}）")

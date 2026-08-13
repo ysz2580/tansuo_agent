@@ -137,7 +137,7 @@ with tempfile.TemporaryDirectory() as td:
         print("== 4. 改训练代码 → summary 横幅标记 ==")
         (tmp / "train.py").write_text(TRAIN + "# edited\n", encoding="utf-8")
         s = api("/api/summary")
-        ok("code_fingerprint_changed=true", s["code_fingerprint_changed"] is True)
+        ok("fingerprint_changed=true（代码已变）", s["fingerprint_changed"] is True)
 
         print("== 5. 再 run/start → 自动新分区且换算从 0 起 ==")
         api("/api/run/start", {"trials": 1, "no_agent": True})
@@ -181,6 +181,30 @@ with tempfile.TemporaryDirectory() as td:
         after = {x["id"] for x in api("/api/runs")["runs"]}
         ok("历史分区全部保留", before <= after)
         ok("fresh 开了新分区", (st4["last_cohort"] or "").startswith("0004-"))
+        c4 = st4["last_cohort"]
+
+        print("== 10. 数据集指纹（第三维度）==")
+        orig = settings_yaml.read_text(encoding="utf-8")
+        cfg = yaml.safe_load(orig)
+        cfg["experiment"]["dataset"] = "smoke-A"
+        settings_yaml.write_text(yaml.safe_dump(cfg, allow_unicode=True),
+                                 encoding="utf-8")
+        s = api("/api/summary")
+        ok("数据集声明变化 → 横幅标记", s["fingerprint_changed"] is True)
+        api("/api/run/start", {"trials": 1, "no_agent": True})
+        st5 = wait_idle()
+        ok("数据集变化新开分区 0005", (st5["last_cohort"] or "").startswith("0005-"))
+        c5 = st5["last_cohort"]
+        r = api("/api/runs")
+        comp = {x["id"]: x["comparable"] for x in r["runs"]}
+        ok("0001 标记 code-data-changed（旧代码+无数据集声明）",
+           comp[c1] == "code-data-changed")
+        ok("0004 标记 data-changed", comp[c4] == "data-changed")
+        ok("0005 标记 match", comp[c5] == "match")
+        settings_yaml.write_text(orig, encoding="utf-8")  # 撤销声明=改回数据集
+        api("/api/run/start", {"trials": 1, "no_agent": True})
+        st6 = wait_idle()
+        ok("数据集改回 → 恢复 0004 续跑", st6["last_cohort"] == c4)
 
         print("\nWeb 冒烟全部通过")
     finally:

@@ -40,7 +40,7 @@ export interface Summary {
   eta_s: number | null
   watch: { name: string; direction: string }[]
   cohort: string | null
-  code_fingerprint_changed: boolean
+  fingerprint_changed: boolean
 }
 
 export interface Trial {
@@ -141,7 +141,13 @@ export interface RunLogResp extends RunStatus {
 }
 
 // 记录分区（cohort）：一条不可删除的历史记录单元
-export type RunComparable = "match" | "code-changed" | "objective-changed" | "legacy"
+export type RunComparable =
+  | "match"
+  | "code-changed"
+  | "data-changed"
+  | "code-data-changed"
+  | "objective-changed"
+  | "legacy"
 
 export interface RunInfo {
   id: string
@@ -149,6 +155,7 @@ export interface RunInfo {
   note: string
   objective_hash: string | null
   code_hash: string | null
+  data_hash: string | null
   primary_metric: { name: string; direction: string } | null
   completed: number
   best: number | null
@@ -160,7 +167,13 @@ export interface RunInfo {
 
 export interface RunsResp {
   runs: RunInfo[]
-  current: { objective_hash: string; code_hash: string; reliable: boolean }
+  current: {
+    objective_hash: string
+    code_hash: string
+    data_hash: string
+    reliable: boolean
+    data_reliable: boolean
+  }
   default: string | null
 }
 

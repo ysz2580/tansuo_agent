@@ -1,19 +1,24 @@
-"""实验记录分区管理（cohort）：记录永不删除 + 双指纹自动分区。
+"""实验记录分区管理（cohort）：记录永不删除 + 三指纹自动分区。
 
 背景：调参记录（optuna study db / journal / 空间快照 / 报告）过去混在同一个
 data_dir 里，`--fresh` 一删全没；用户改了训练代码后新旧结果还会混进同一个
-study 做对比分析——不可比的数据互相污染。
+study 做对比分析——不可比的数据互相污染。同一份代码跑不同数据集同理：
+结果范围天然不同，也不可混在一起。
 
 本模块的分区（cohort）模型：
 - 每个分区是 `data_dir/runs/<NNNN>-<YYYYMMDD-HHMMSS>/` 下的独立目录，自带
   meta.yaml / db / journal.jsonl / space_v*.yaml / reports/，互不干扰；
-- **双指纹**决定续跑还是新开：
+- **三指纹**决定续跑还是新开：
   * objective_hash = 主指标 name:direction + data_fraction——"目标语义"。
     它变了意味着新旧结果根本不可比，而且 Optuna 加载既有 study 时会**静默
     丢弃**请求的 direction（create_study load_if_exists 只按库里的方向走），
     混跑会让排序/剪枝/报告全部静默反向——所以 objective 不符时显式续跑被硬拒绝；
   * code_hash = 训练代码内容（入口脚本/entry 模块/fingerprint_paths 附加文件）。
     仅它变化时允许显式续跑旧分区（带警告），自动模式则新开分区；
+  * data_hash = 数据集身份（experiment.dataset 显式声明；未声明时取命令行
+    剔除解释器/脚本/-m 模块后的参数）。语义与 code_hash 同级：不同数据集的
+    结果不可直接比较，混跑会污染搜索历史，但不会静默反转排序——所以显式
+    续跑仅警告放行，自动模式新开分区；数据集改回旧值会恢复对应旧分区；
 - `apply_cohort` 只改写 settings 的 data_dir 与 storage.url（绝对路径），
   journal/快照/报告/study 全链路自动落入分区——下游零改动；
 - 旧版扁平布局的文件在 run 启动时被**搬**进 `runs/0000-legacy/`（只搬不删，
@@ -47,9 +52,12 @@ class CohortError(ValueError):
 class Fingerprint:
     objective_hash: str          # 12 位 hex：主指标 name:direction + data_fraction
     code_hash: str               # 12 位 hex：训练代码内容（或命令串兜底）
+    data_hash: str               # 12 位 hex：数据集身份（声明值或命令行参数）
     objective_inputs: dict       # 参与 objective 指纹的字段（审计/展示用）
     code_inputs: dict            # {"mode": files|command-string, "files": [...], ...}
+    data_inputs: dict            # {"mode": declared|command-args|untracked, "values": [...]}
     reliable: bool               # False = 没定位到代码文件，指纹只覆盖命令字符串
+    data_reliable: bool          # False = 数据集身份不可见（python 模式且未声明）
 
 
 @dataclass
@@ -182,8 +190,47 @@ def _collect_code_files(settings, base_dir: Path) -> tuple[list[Path], list[str]
     return files, missing, [], mode
 
 
+def _collect_data_signal(settings) -> tuple[str, list[str]]:
+    """数据集指纹的取值来源。返回 (mode, values)：
+
+    - declared：experiment.dataset 显式声明（首选）——按声明字符串原样哈希，
+      不读文件系统（数据集动辄 GB 级，名称/路径足以区分身份）；
+    - command-args：未声明时，命令行剔除解释器、.py 脚本 token、-m 及其模块
+      后剩余的参数（覆盖 `--data X` 这类参数驱动的数据集切换）；
+    - untracked：python 函数模式且未声明——数据集不可见，建议显式声明。
+    """
+    declared = [str(v).strip() for v in (getattr(settings, "dataset", None) or [])]
+    declared = [v for v in declared if v]
+    if declared:
+        return "declared", declared
+    adapter = settings.adapter
+    if adapter.mode == "python":
+        return "untracked", []
+    cmd = list(adapter.command)
+    args: list[str] = []
+    skip_next = False
+    for i, tok in enumerate(cmd):
+        if skip_next:
+            skip_next = False
+            continue
+        if i == 0:               # 解释器（python 等）
+            continue
+        if tok == "-m":          # -m 模块：模块名与 -m 本身都不是数据集参数
+            skip_next = True
+            continue
+        if tok.endswith(".py"):  # 脚本 token（存在与否都按脚本排除）
+            continue
+        args.append(tok)
+    return "command-args", args
+
+
+def _fmt_data_values(values: list[str] | None) -> str:
+    values = values or []
+    return " ".join(values) if values else "（无）"
+
+
 def code_fingerprint(settings, base_dir: str | Path | None = None) -> Fingerprint:
-    """计算双指纹。base_dir：相对脚本路径的解析基准（CLI 传 CWD、Web 传项目根）。"""
+    """计算三指纹。base_dir：相对脚本路径的解析基准（CLI 传 CWD、Web 传项目根）。"""
     base = Path(base_dir).resolve() if base_dir else Path.cwd()
     primary = settings.metrics.primary
     objective_inputs = {
@@ -220,8 +267,15 @@ def code_fingerprint(settings, base_dir: str | Path | None = None) -> Fingerprin
         reliable = False
     code_inputs = {"mode": mode, "files": file_entries,
                    "missing": missing, "skipped": skipped}
-    return Fingerprint(objective_hash, code_hash, objective_inputs,
-                       code_inputs, reliable)
+
+    # 数据集指纹：只哈希值列表（不含 mode）——声明与命令行推导出相同值时不分裂
+    data_mode, data_values = _collect_data_signal(settings)
+    data_hash = _sha256_text(json.dumps(data_values, ensure_ascii=False))[:12]
+    data_inputs = {"mode": data_mode, "values": data_values}
+    data_reliable = data_mode != "untracked"
+
+    return Fingerprint(objective_hash, code_hash, data_hash, objective_inputs,
+                       code_inputs, data_inputs, reliable, data_reliable)
 
 
 # ----------------------------------------------------------------------
@@ -334,8 +388,10 @@ def create_cohort(data_dir: str | Path, fp: Fingerprint, settings,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "objective_hash": fp.objective_hash,
         "code_hash": fp.code_hash,
+        "data_hash": fp.data_hash,
         "objective_inputs": fp.objective_inputs,
         "code_inputs": fp.code_inputs,
+        "data_inputs": fp.data_inputs,
         "note": note or "",
         "primary_metric": {"name": primary.name, "direction": primary.direction},
         "settings_digest": {"data_fraction": settings.budget.data_fraction,
@@ -366,9 +422,11 @@ def resolve_for_run(settings, *, force_new: bool = False, cohort_id: str | None 
     """决定本次 run 用哪个分区。返回 (cohort, info)，info 含 action/reason/匹配情况。
 
     - 显式 cohort_id：objective 不符 → CohortError 硬拒绝（Optuna 会静默沿用库里
-      的方向，混跑必污染）；仅 code 不符 → 警告但允许；
+      的方向，混跑必污染）；data/code 不符 → 警告但允许（不同数据集/代码的结果
+      不可直接比较，但数据本身有效，跨数据集热启动等属合理的自主决定）；
     - force_new：无条件新开；
-    - 自动：续跑最新的"双指纹均匹配"分区（代码改回旧版→恢复旧分区）；否则新开。
+    - 自动：续跑最新的"三指纹均匹配"分区（代码/数据集改回旧版→恢复旧分区）；
+      否则新开。老分区无 data_hash（数据集分区引入前创建）视为不匹配。
     """
     if force_new and cohort_id:
         raise CohortError("--new/--fresh（新开分区）与 --cohort（指定分区）不能同时使用")
@@ -382,45 +440,69 @@ def resolve_for_run(settings, *, force_new: bool = False, cohort_id: str | None 
                               f"（请先 `python cli.py run` 让旧记录完成迁移）")
         obj_match = cohort.meta.get("objective_hash") == fp.objective_hash
         code_match = cohort.meta.get("code_hash") == fp.code_hash
+        data_match = cohort.meta.get("data_hash") == fp.data_hash
         if not obj_match:
             old = cohort.meta.get("objective_inputs") or {}
             raise CohortError(
                 f"拒绝续跑分区 {cohort_id}：优化目标已变化（{_objective_diff_reason(old, fp.objective_inputs)}）。\n"
                 f"Optuna 加载既有 study 时会静默沿用库内方向，混跑会让排序/剪枝/报告全部失真。\n"
                 f"请直接 `python cli.py run`（自动新开分区），旧分区记录会完整保留。")
+        if not data_match:
+            if cohort.meta.get("data_hash"):
+                old_vals = (cohort.meta.get("data_inputs") or {}).get("values") or []
+                log(f"警告：分区 {cohort_id} 的数据集指纹与当前不一致"
+                    f"（{_fmt_data_values(old_vals)} → {_fmt_data_values(fp.data_inputs.get('values'))}），"
+                    f"按你的指定继续。不同数据集的结果不可直接比较，混跑会污染搜索历史。")
+            else:
+                log(f"警告：分区 {cohort_id} 创建于数据集分区引入前，无数据集指纹记录，"
+                    f"无法核验数据集一致性，按你的指定继续。")
         if not code_match:
             log(f"警告：分区 {cohort_id} 的训练代码指纹与当前不一致"
                 f"（{cohort.meta.get('code_hash')} → {fp.code_hash}），按你的指定继续。")
         return cohort, {"action": "explicit", "reason": f"指定续跑分区 {cohort_id}",
-                        "objective_match": True, "code_match": code_match}
+                        "objective_match": True, "code_match": code_match,
+                        "data_match": data_match}
 
     if force_new:
         cohort = create_cohort(data_dir, fp, settings, note)
         return cohort, {"action": "created", "reason": "按要求新开分区",
-                        "objective_match": False, "code_match": False}
+                        "objective_match": False, "code_match": False,
+                        "data_match": False}
 
     cohorts = [c for c in list_cohorts(data_dir) if not c.virtual and not c.incomplete]
-    for c in reversed(cohorts):   # 最新优先：代码改回旧版时恢复对应旧分区
+    for c in reversed(cohorts):   # 最新优先：代码/数据集改回旧版时恢复对应旧分区
         if (c.meta.get("objective_hash") == fp.objective_hash
-                and c.meta.get("code_hash") == fp.code_hash):
+                and c.meta.get("code_hash") == fp.code_hash
+                and c.meta.get("data_hash") == fp.data_hash):
             return c, {"action": "continue", "reason": "指纹一致，续跑既有分区",
-                       "objective_match": True, "code_match": True}
+                       "objective_match": True, "code_match": True, "data_match": True}
 
-    # 需要新开分区：说明原因
+    # 需要新开分区：说明原因（按实际变化项，可同时并报）
     real = [c for c in cohorts if c.meta.get("objective_hash") or c.meta.get("code_hash")]
     if not real:
         reason = "首次运行，创建分区"
     else:
         latest = real[-1]
+        reasons = []
         if latest.meta.get("objective_hash") != fp.objective_hash:
-            reason = ("优化目标变化：" + _objective_diff_reason(
+            reasons.append("优化目标变化：" + _objective_diff_reason(
                 latest.meta.get("objective_inputs") or {}, fp.objective_inputs))
-        else:
-            reason = (f"训练代码指纹变化：{latest.meta.get('code_hash')} → {fp.code_hash}"
-                      "（旧分区记录保留，可随时查看）")
+        if latest.meta.get("data_hash") != fp.data_hash:
+            if not latest.meta.get("data_hash"):
+                reasons.append("旧分区无数据集指纹记录（数据集分区为新版本引入，"
+                               "无法确认数据集一致")
+            else:
+                old_vals = (latest.meta.get("data_inputs") or {}).get("values") or []
+                reasons.append("数据集变化："
+                               f"{_fmt_data_values(old_vals)} → "
+                               f"{_fmt_data_values(fp.data_inputs.get('values'))}")
+        if latest.meta.get("code_hash") != fp.code_hash:
+            reasons.append(f"训练代码指纹变化：{latest.meta.get('code_hash')} → "
+                           f"{fp.code_hash}")
+        reason = "；".join(reasons) + "（旧分区记录保留，可随时查看）"
     cohort = create_cohort(data_dir, fp, settings, note)
     return cohort, {"action": "created", "reason": reason,
-                    "objective_match": False, "code_match": False}
+                    "objective_match": False, "code_match": False, "data_match": False}
 
 
 # ----------------------------------------------------------------------

@@ -47,10 +47,10 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-4">
-      {summary.code_fingerprint_changed && (
+      {summary.fingerprint_changed && (
         <Alert className="border-amber-300 bg-amber-50 dark:bg-amber-950/30">
           <AlertDescription>
-            训练代码或优化目标已变化：下次运行将自动新开记录分区，当前分区的历史结果原样保留、不受影响。
+            训练代码、数据集或优化目标已变化：下次运行将自动新开记录分区，当前分区的历史结果原样保留、不受影响。
           </AlertDescription>
         </Alert>
       )}

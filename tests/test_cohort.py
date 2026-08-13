@@ -1,10 +1,12 @@
-"""分区管理测试：双指纹 / 续跑决策 / 旧布局迁移 / 分区化落盘（可直接
+"""分区管理测试：三指纹 / 续跑决策 / 旧布局迁移 / 分区化落盘（可直接
 `python tests/test_cohort.py` 运行）。
 
 覆盖：
-- 双指纹：objective（主指标 name:direction + data_fraction）与 code（训练代码内容）
-  各自的敏感项与稳定项；-m 模块/python entry 定位；fingerprint_paths 附加路径；
-  命令串兜底（reliable=False）
+- 三指纹：objective（主指标 name:direction + data_fraction）、code（训练代码内容）
+  与 data（数据集身份）各自的敏感项与稳定项；-m 模块/python entry 定位；
+  fingerprint_paths 附加路径；命令串兜底（reliable=False）
+- 数据集指纹：experiment.dataset 显式声明、命令行参数自动兜底、python 模式
+  untracked、数据集切换/改回的续跑决策、无 data_hash 老分区的兼容
 - 续跑决策：同指纹续跑、代码变化自动新开、force_new、显式 --cohort 的警告/硬拒绝
   （objective 不符拒绝——Optuna 会静默沿用库内方向）、代码改回恢复旧分区
 - 目录/编号：seq 取自目录名、无 meta 目录容忍、非规则目录忽略、冲突重试
@@ -18,6 +20,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -73,6 +76,8 @@ def make_settings(tmp: Path, name: str, *, script_text: str | None = None,
                   direction: str = "maximize", primary: str = "val_acc",
                   data_fraction: float = 0.5, timeout: int = 60, workers: int = 1,
                   fingerprint_paths: list | None = None,
+                  dataset: "str | list | None" = None,
+                  extra_args: list | None = None,
                   storage_name: str = "t.db", extra_budget: str = ""):
     """在 tmp 下写训练脚本（可选）+ settings.yaml 并加载。"""
     if script_text is not None:
@@ -84,15 +89,20 @@ def make_settings(tmp: Path, name: str, *, script_text: str | None = None,
     if fingerprint_paths is not None:
         items = ", ".join(str(p) for p in fingerprint_paths)
         fp_yaml = f"\n  fingerprint_paths: [{items}]"
+    ds_yaml = ""
+    if dataset is not None:
+        items = [dataset] if isinstance(dataset, str) else list(dataset)
+        ds_yaml = "\n  dataset: [" + ", ".join(json.dumps(v) for v in items) + "]"
+    args_yaml = "".join(", " + json.dumps(a) for a in (extra_args or []))
     text = (
         "experiment:\n"
         f"  name: {name}\n"
-        f"  data_dir: {data_dir.as_posix()}{fp_yaml}\n"
+        f"  data_dir: {data_dir.as_posix()}{fp_yaml}{ds_yaml}\n"
         "metrics:\n"
         f"  primary: {{name: {primary}, direction: {direction}}}\n"
         "adapter:\n"
         "  mode: subprocess\n"
-        f'  command: ["{exe}", "{script.as_posix()}"]\n'
+        f'  command: ["{exe}", "{script.as_posix()}"{args_yaml}]\n'
         "  config_via: env\n"
         f"  timeout_s: {timeout}\n"
         f"budget: {{total_trials: 4, wake_every: 2, seed: 1, workers: {workers}, "
@@ -236,6 +246,130 @@ def test_fingerprint_module_mode(tmp: Path) -> None:
     finally:
         sys.path.remove(str(tmp))
         sys.modules.pop("fake_train_mod", None)
+
+
+# ======================================================================
+# 一b、数据集指纹（第三维度）
+# ======================================================================
+def test_dataset_fingerprint(tmp: Path) -> None:
+    print("\n== 数据集指纹 ==")
+    # 显式声明
+    s1 = make_settings(tmp, "ds1", script_text="x = 1\n", dataset="mnist-5k")
+    f1 = code_fingerprint(s1, tmp)
+    ok("声明数据集 → data_hash 为 12 位 hex 且稳定",
+       len(f1.data_hash) == 12 and all(c in "0123456789abcdef" for c in f1.data_hash)
+       and code_fingerprint(s1, tmp).data_hash == f1.data_hash)
+    ok("data_inputs 记录 mode=declared 与原值",
+       f1.data_inputs == {"mode": "declared", "values": ["mnist-5k"]})
+    ok("声明模式下 data_reliable=True", f1.data_reliable is True)
+    s2 = make_settings(tmp, "ds2", script_text="x = 1\n", dataset="cifar10")
+    ok("数据集声明变化 → data_hash 变", code_fingerprint(s2, tmp).data_hash != f1.data_hash)
+    s3 = make_settings(tmp, "ds3", script_text="x = 1\n", dataset=["mnist-5k"])
+    ok("str 与单元素 list 归一等价（同哈希）",
+       code_fingerprint(s3, tmp).data_hash == f1.data_hash)
+    s4 = make_settings(tmp, "ds4", script_text="x = 1\n", dataset=["train_a", "val_a"])
+    ok("多数据集列表参与指纹",
+       code_fingerprint(s4, tmp).data_hash != f1.data_hash
+       and code_fingerprint(s4, tmp).data_inputs["values"] == ["train_a", "val_a"])
+    s_iso = make_settings(tmp, "ds_iso", script_text="x = 1\n")
+    f_iso_before = code_fingerprint(s_iso, tmp)
+    s_iso.dataset = ["cifar10"]
+    f_iso_after = code_fingerprint(s_iso, tmp)
+    ok("数据集声明变化不影响 code/objective 哈希",
+       f_iso_after.code_hash == f_iso_before.code_hash
+       and f_iso_after.objective_hash == f_iso_before.objective_hash
+       and f_iso_after.data_hash != f_iso_before.data_hash)
+
+    # 未声明 → 命令行参数兜底
+    s5 = make_settings(tmp, "ds5", script_text="x = 1\n", extra_args=["--data", "A"])
+    f5 = code_fingerprint(s5, tmp)
+    ok("未声明 → command-args 兜底（剔除解释器与脚本）",
+       f5.data_inputs == {"mode": "command-args", "values": ["--data", "A"]}
+       and f5.data_reliable is True)
+    s6 = make_settings(tmp, "ds6", script_text="x = 1\n", extra_args=["--data", "B"])
+    ok("数据集参数切换 → data_hash 变", code_fingerprint(s6, tmp).data_hash != f5.data_hash)
+    s7 = make_settings(tmp, "ds7", script_text="x = 1\n")
+    s8 = make_settings(tmp, "ds8", script_text="y = 2\n")
+    ok("无参数命令行 → data_hash 跨配置恒定",
+       code_fingerprint(s7, tmp).data_hash == code_fingerprint(s8, tmp).data_hash
+       and code_fingerprint(s7, tmp).data_inputs["mode"] == "command-args")
+    s9 = make_settings(tmp, "ds9", script_text="x = 1\n", dataset=["--data", "A"])
+    ok("声明与命令行推导出相同值不分裂", code_fingerprint(s9, tmp).data_hash == f5.data_hash)
+
+    # python 模式：未声明不可见，声明后可靠
+    s_py = make_settings(tmp, "ds_py", script_text=None)
+    s_py.adapter.mode = "python"
+    s_py.adapter.entry = "whatever:run"
+    f_py = code_fingerprint(s_py, tmp)
+    ok("python 模式未声明 → untracked 且 data_reliable=False",
+       f_py.data_inputs == {"mode": "untracked", "values": []}
+       and f_py.data_reliable is False)
+    s_py.dataset = ["myds"]
+    ok("python 模式显式声明后 data_reliable=True",
+       code_fingerprint(s_py, tmp).data_reliable is True
+       and code_fingerprint(s_py, tmp).data_inputs["mode"] == "declared")
+
+    # 运行参数不敏感
+    s1.adapter.timeout_s = 999
+    s1.budget.workers = 4
+    ok("timeout/workers 变化不改 data_hash", code_fingerprint(s1, tmp).data_hash == f1.data_hash)
+
+
+def test_resolve_dataset(tmp: Path) -> None:
+    print("\n== 数据集续跑决策 ==")
+    logs: list[str] = []
+    s = make_settings(tmp, "drs", script_text="v = 1\n", extra_args=["--data", "A"])
+    c1, i1 = resolve_for_run(s, base_dir=tmp, log=logs.append)
+    ok("首跑建分区且 meta 含 data_inputs",
+       i1["action"] == "created" and c1.meta["data_inputs"]["values"] == ["--data", "A"]
+       and c1.meta["data_hash"])
+    c2, i2 = resolve_for_run(s, base_dir=tmp, log=logs.append)
+    ok("同数据集续跑同一分区", i2["action"] == "continue" and c2.id == c1.id)
+
+    exe, script = s.adapter.command[0], s.adapter.command[1]
+    s.adapter.command = [exe, script, "--data", "B"]
+    c3, i3 = resolve_for_run(s, base_dir=tmp, log=logs.append)
+    ok("数据集变化自动新开分区", i3["action"] == "created" and c3.id != c1.id)
+    ok("新开原因说明数据集变化明细",
+       "数据集变化" in i3["reason"] and "--data B" in i3["reason"])
+
+    s.adapter.command = [exe, script, "--data", "A"]
+    c4, i4 = resolve_for_run(s, base_dir=tmp, log=logs.append)
+    ok("数据集改回 → 恢复旧分区", i4["action"] == "continue" and c4.id == c1.id)
+
+    logs.clear()
+    c5, i5 = resolve_for_run(s, cohort_id=c3.id, base_dir=tmp, log=logs.append)
+    ok("显式续跑数据集不符分区放行（软拦截）",
+       i5["action"] == "explicit" and c5.id == c3.id and i5["data_match"] is False)
+    ok("给出数据集不一致警告", any("数据集指纹" in m for m in logs))
+
+    # 无数据集指纹的老分区（数据集分区引入前创建）：警告+放行
+    from tansuo.cohort import abs_data_dir
+    fp_now = code_fingerprint(s, tmp)
+    c_old = create_cohort(abs_data_dir(s, tmp), fp_now, s, "old")
+    meta = yaml.safe_load((c_old.path / "meta.yaml").read_text(encoding="utf-8"))
+    meta.pop("data_hash")
+    meta.pop("data_inputs")
+    (c_old.path / "meta.yaml").write_text(
+        yaml.safe_dump(meta, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    logs.clear()
+    c6, i6 = resolve_for_run(s, cohort_id=c_old.id, base_dir=tmp, log=logs.append)
+    ok("显式续跑无数据指纹的老分区放行", i6["action"] == "explicit" and c6.id == c_old.id)
+    ok("提示无法核验数据集一致性", any("无法核验数据集" in m for m in logs))
+
+    # 升级兼容：所有分区都无 data_hash 时自动新开且原因明确（不回填旧 meta）
+    s_up = make_settings(tmp, "drs_up", script_text="v = 1\n")
+    c_up, _ = resolve_for_run(s_up, base_dir=tmp, log=logs.append)
+    meta_up = yaml.safe_load((c_up.path / "meta.yaml").read_text(encoding="utf-8"))
+    meta_up.pop("data_hash")
+    meta_up.pop("data_inputs")
+    (c_up.path / "meta.yaml").write_text(
+        yaml.safe_dump(meta_up, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    logs.clear()
+    c_up2, i_up2 = resolve_for_run(s_up, base_dir=tmp, log=logs.append)
+    ok("升级兼容：老分区无 data_hash → 自动新开分区",
+       i_up2["action"] == "created" and c_up2.id != c_up.id)
+    ok("原因说明旧分区无数据集指纹记录", "无数据集指纹记录" in i_up2["reason"])
 
 
 # ======================================================================
@@ -570,6 +704,28 @@ def test_config(tmp: Path) -> None:
         encoding="utf-8")
     expect_error("fingerprint_paths 非列表 → ConfigError", ConfigError, load_settings, p)
 
+    print("\n== config：dataset ==")
+    s_ds = make_settings(tmp, "cfg_ds", script_text="v = 1\n", dataset="mnist")
+    ok("dataset 接受字符串并归一为列表", s_ds.dataset == ["mnist"])
+    s_ds2 = make_settings(tmp, "cfg_ds2", script_text="v = 1\n", dataset=["a", "b"])
+    ok("dataset 接受字符串列表", s_ds2.dataset == ["a", "b"])
+    p2 = tmp / "cfg_ds_bad_settings.yaml"
+    p2.write_text(
+        "experiment: {name: cfg_ds_bad, data_dir: " + (tmp / "d2").as_posix()
+        + ", dataset: 42}\n"
+        "metrics:\n  primary: {name: v, direction: maximize}\n"
+        "adapter:\n  mode: subprocess\n  command: [\"python\", \"x.py\"]\n",
+        encoding="utf-8")
+    expect_error("dataset 非字符串/列表 → ConfigError", ConfigError, load_settings, p2)
+    p3 = tmp / "cfg_ds_bad2_settings.yaml"
+    p3.write_text(
+        "experiment: {name: cfg_ds_bad2, data_dir: " + (tmp / "d3").as_posix()
+        + ", dataset: [a, \"\"]}\n"
+        "metrics:\n  primary: {name: v, direction: maximize}\n"
+        "adapter:\n  mode: subprocess\n  command: [\"python\", \"x.py\"]\n",
+        encoding="utf-8")
+    expect_error("dataset 含空字符串 → ConfigError", ConfigError, load_settings, p3)
+
 
 if __name__ == "__main__":
     import tempfile
@@ -577,7 +733,9 @@ if __name__ == "__main__":
         tmp = Path(td)
         test_fingerprint(tmp)
         test_fingerprint_module_mode(tmp)
+        test_dataset_fingerprint(tmp)
         test_resolve(tmp)
+        test_resolve_dataset(tmp)
         test_ids_and_dirs(tmp)
         test_migration(tmp)
         test_virtual_legacy(tmp)

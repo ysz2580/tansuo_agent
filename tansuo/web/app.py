@@ -117,17 +117,18 @@ def summary(cohort: str | None = Query(default=None)):
     s["watch"] = [{"name": m.name, "direction": m.direction}
                   for m in settings.metrics.watch]
     s["cohort"] = coh.id if coh else None
-    # 代码指纹变化提示（仅对最新实体分区有意义：下次运行将自动新开分区）
-    s["code_fingerprint_changed"] = False
+    # 三指纹变化提示（仅对最新实体分区有意义：下次运行将自动新开分区）
+    s["fingerprint_changed"] = False
     if coh is not None and not coh.virtual and coh.meta.get("code_hash"):
         try:
             root = abs_data_dir(load_settings(SETTINGS_PATH), PROJECT_ROOT)
             latest = [c for c in list_cohorts(root) if not c.virtual]
             if latest and latest[-1].id == coh.id:
                 fp = code_fingerprint(settings, PROJECT_ROOT)
-                s["code_fingerprint_changed"] = (
+                s["fingerprint_changed"] = (
                     fp.code_hash != coh.meta.get("code_hash")
-                    or fp.objective_hash != coh.meta.get("objective_hash"))
+                    or fp.objective_hash != coh.meta.get("objective_hash")
+                    or fp.data_hash != coh.meta.get("data_hash"))
         except (ConfigError, CohortError):
             pass
     # ETA：最近 ≤10 次已完结试验平均耗时 × 剩余预算 ÷ 并发数（无样本返回 null）
@@ -259,16 +260,24 @@ def runs_list():
             comparable = "legacy"          # 历史记录（无指纹）
         elif meta.get("objective_hash") != fp.objective_hash:
             comparable = "objective-changed"   # 目标语义已变，不可直接比较
-        elif meta.get("code_hash") != fp.code_hash:
-            comparable = "code-changed"    # 目标一致、训练代码已变
         else:
-            comparable = "match"
+            code_diff = meta.get("code_hash") != fp.code_hash
+            data_diff = meta.get("data_hash") != fp.data_hash
+            if code_diff and data_diff:
+                comparable = "code-data-changed"
+            elif code_diff:
+                comparable = "code-changed"    # 目标一致、训练代码已变
+            elif data_diff:
+                comparable = "data-changed"    # 目标/代码一致、数据集已变（或无数据集指纹）
+            else:
+                comparable = "match"
         items.append({
             "id": c.id,
             "created_at": meta.get("created_at"),
             "note": meta.get("note") or "",
             "objective_hash": meta.get("objective_hash"),
             "code_hash": meta.get("code_hash"),
+            "data_hash": meta.get("data_hash"),
             "primary_metric": meta.get("primary_metric"),
             "completed": st["completed"],
             "best": st["best"],
@@ -280,7 +289,9 @@ def runs_list():
     return {"runs": items,
             "current": {"objective_hash": fp.objective_hash,
                         "code_hash": fp.code_hash,
-                        "reliable": fp.reliable},
+                        "data_hash": fp.data_hash,
+                        "reliable": fp.reliable,
+                        "data_reliable": fp.data_reliable},
             "default": items[-1]["id"] if items else None}
 
 

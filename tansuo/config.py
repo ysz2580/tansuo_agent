@@ -121,6 +121,7 @@ class Settings:
     agent: AgentCfg = field(default_factory=AgentCfg)
     storage: StorageCfg = field(default_factory=StorageCfg)
     fingerprint_paths: list[str] = field(default_factory=list)  # 分区代码指纹附加文件/目录
+    dataset: list[str] = field(default_factory=list)  # 数据集标识（参与分区数据集指纹）
     source_path: str = ""
     raw: dict = field(default_factory=dict)
 
@@ -266,6 +267,19 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         _require(isinstance(v, str) and v.strip(),
                  f"experiment.fingerprint_paths[{i}] 必须是非空字符串路径，实际：{v!r}")
         fingerprint_paths.append(v.strip())
+    # 数据集标识：字符串或字符串列表（名称/路径皆可，原样参与数据集指纹，不读文件）
+    ds_raw = exp.get("dataset")
+    dataset: list[str] = []
+    if ds_raw is not None:
+        if isinstance(ds_raw, str):
+            ds_raw = [ds_raw]
+        _require(isinstance(ds_raw, list),
+                 "experiment.dataset 必须是字符串或字符串列表（数据集名称/路径），"
+                 f"实际是 {type(ds_raw).__name__}")
+        for i, v in enumerate(ds_raw):
+            _require(isinstance(v, str) and v.strip(),
+                     f"experiment.dataset[{i}] 必须是非空字符串，实际：{v!r}")
+            dataset.append(v.strip())
     return Settings(
         experiment_name=str(exp.get("name", "experiment")).strip() or "experiment",
         data_dir=str(exp.get("data_dir", "data")).strip() or "data",
@@ -276,6 +290,7 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         agent=agent,
         storage=storage,
         fingerprint_paths=fingerprint_paths,
+        dataset=dataset,
         source_path=str(path),
         raw=raw,
     )
