@@ -21,7 +21,7 @@ import optuna
 
 from tansuo.cohort import (CohortError, abs_data_dir, apply_cohort, code_fingerprint,
                            cohort_stats, list_cohorts, load_cohort, migrate_legacy,
-                           resolve_for_run)
+                           resolve_for_run, update_cohort_env)
 from tansuo.compare import compare_cohorts
 from tansuo.config import ConfigError, load_settings
 from tansuo.journal import Journal
@@ -112,6 +112,8 @@ def cmd_run(args) -> int:
         print(f"[记录] 续跑指定分区 {cohort.id}{tail}")
     fp_match = (action != "explicit") or (bool(info.get("code_match"))
                                           and bool(info.get("data_match", True)))
+    if action != "created":
+        update_cohort_env(cohort)   # 续跑留痕：依赖/机器可能已与创建时不同
 
     try:
         settings, orch = _make_runtime(args, settings=settings)
@@ -350,6 +352,16 @@ def cmd_runs_show(args) -> int:
         print(f"主指标：{pm.get('name')}（{pm.get('direction')}）")
     if meta.get("storage_url"):
         print(f"外部存储：{meta['storage_url']}")
+    env = meta.get("environment")
+    if env:
+        print(f"环境审计（创建时）：{_fmt_env(env)}")
+        print(f"机器：{env.get('hostname') or '-'} ｜ {env.get('platform') or '-'}"
+              f" ｜ {env.get('cpu_count') or '-'} 核")
+        last = meta.get("environment_last")
+        if last and _env_sig(last) != _env_sig(env):
+            print(f"最近运行环境（{last.get('collected_at', '-')}）：{_fmt_env(last)}")
+    else:
+        print("环境审计：（无记录——分区创建于环境审计引入前）")
     st = cohort_stats(cohort)
     best = f"{st['best']:.6g}" if st["best"] is not None else "-"
     print(f"已完成试验：{st['completed']} ｜ 最优值：{best}"
@@ -364,6 +376,26 @@ def _fmt_value(v) -> str:
     if isinstance(v, (int, float)):
         return f"{v:.6g}"
     return str(v)
+
+
+def _fmt_env(env: dict) -> str:
+    """环境审计单行展示：python / optuna / torch / GPU。"""
+    parts = [f"python {env.get('python') or '-'}",
+             f"optuna {env.get('optuna') or '-'}",
+             (f"torch {env['torch']}" if env.get("torch") else "torch 未安装")]
+    gpus = env.get("gpus") or []
+    if gpus:
+        parts.append(f"CUDA 可用（{'、'.join(gpus)}）")
+    elif env.get("cuda_available"):
+        parts.append("CUDA 可用")
+    else:
+        parts.append("无 CUDA GPU")
+    return " ｜ ".join(parts)
+
+
+def _env_sig(env: dict | None) -> dict:
+    """环境签名（剔除采集时间），用于判断最近运行环境是否与创建时不同。"""
+    return {k: v for k, v in (env or {}).items() if k != "collected_at"}
 
 
 def cmd_runs_compare(args) -> int:

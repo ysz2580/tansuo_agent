@@ -110,6 +110,9 @@ with tempfile.TemporaryDirectory() as td:
     print("== 5. runs show / report --cohort ==")
     r7 = run_cli(tmp, "runs", "show", c1.name, *S)
     ok("show 输出指纹覆盖文件", "指纹覆盖文件" in r7.stdout and "train.py" in r7.stdout)
+    ok("show 输出环境审计", "环境审计（创建时）" in r7.stdout and "机器：" in r7.stdout)
+    r7b = run_cli(tmp, "runs", "show", "0000-legacy", *S)
+    ok("legacy 分区无环境审计如实提示", "无记录" in r7b.stdout)
     r8 = run_cli(tmp, "report", "--cohort", c1.name, *S)
     ok("为旧分区生成报告", f"为分区 {c1.name} 生成报告" in r8.stdout
        and (c1 / "reports" / "report.md").exists())

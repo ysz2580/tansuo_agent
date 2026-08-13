@@ -31,7 +31,7 @@ E:\tansuo_agent\
 │   ├── configs\            # settings.yaml + search_space.yaml（带详尽注释）
 │   ├── train_mnist.py      # 演示训练脚本（遵守子进程协议）
 │   └── my_adapter_template.py  # 你自己的训练任务接入模板
-└── tests\                  # 分区 101 / 对比 22 / 空间护栏 34 / 条件空间 30 / 协议 12 / 权限降级 21 / 运行时 23 断言
+└── tests\                  # 分区 110 / 对比 22 / 空间护栏 34 / 条件空间 30 / 协议 12 / 权限降级 21 / 运行时 23 断言
                             # + e2e_cli_smoke / e2e_web_smoke 端到端冒烟（真实子进程）
 ```
 
@@ -118,6 +118,12 @@ data_dir\runs\
 
 旧版本创建的分区没有 data_hash，升级后首次运行会自动新开一个分区（原因里会说明，
 旧记录完整保留）。
+
+每个分区的 meta.yaml 还记录**环境审计**信息：python / optuna / torch 版本、CUDA
+是否可用与 GPU 型号、主机名与操作系统、CPU 核数。分区可能跨天、跨依赖升级、跨
+机器续跑，这些信息让事后能对上"这批试验是在什么环境下跑出来的"；每次续跑还会
+刷新最近一次运行的环境（`environment_last`）。`runs show ID` 直接展示；引入该功能
+之前创建的老分区显示"无记录"，不影响任何功能。
 
 `python cli.py runs` 列出所有分区，并标注每个分区与**当前**指纹的可比性
 （✔ 一致 / △ 代码或数据集已变 / ✘ 目标已变），`runs show ID` 查看指纹覆盖了哪些文件。

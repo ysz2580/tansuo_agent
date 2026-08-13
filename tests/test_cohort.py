@@ -17,6 +17,8 @@
 - E2E-lite：真实子进程跑一轮 → db/journal/快照/报告全在分区内，SESSION_START
   带分区审计字段；改脚本再跑自动落新分区且旧分区原封
 - config：experiment.fingerprint_paths 校验
+- 环境审计：meta 记录 python/optuna/torch/GPU/机器，torch 缺席容错，
+  续跑刷新 environment_last，不完整分区静默跳过
 """
 from __future__ import annotations
 
@@ -34,9 +36,9 @@ import optuna                                                    # noqa: E402
 import yaml                                                      # noqa: E402
 
 from tansuo.cohort import (LEGACY_ID, CohortError, apply_cohort,  # noqa: E402
-                           code_fingerprint, cohort_stats, create_cohort,
-                           list_cohorts, load_cohort, migrate_legacy,
-                           resolve_for_run)
+                           code_fingerprint, cohort_stats, collect_env_audit,
+                           create_cohort, list_cohorts, load_cohort,
+                           migrate_legacy, resolve_for_run, update_cohort_env)
 from tansuo.config import ConfigError, load_settings             # noqa: E402
 from tansuo.journal import SESSION_START, Journal                # noqa: E402
 from tansuo.orchestrator import Orchestrator                     # noqa: E402
@@ -727,6 +729,52 @@ def test_config(tmp: Path) -> None:
     expect_error("dataset 含空字符串 → ConfigError", ConfigError, load_settings, p3)
 
 
+# ======================================================================
+# 八、环境审计
+# ======================================================================
+def test_env_audit(tmp: Path) -> None:
+    print("\n== 环境审计 ==")
+    from unittest import mock
+
+    audit = collect_env_audit()
+    ok("审计含 python/optuna 版本",
+       bool(audit["python"]) and bool(audit["optuna"]))
+    ok("审计含机器信息（hostname/platform/cpu_count）",
+       bool(audit["hostname"]) and bool(audit["platform"])
+       and (audit["cpu_count"] or 0) >= 1)
+    ok("GPU 字段为合法值（gpus 列表 / cuda_available 布尔）",
+       isinstance(audit["gpus"], list) and isinstance(audit["cuda_available"], bool))
+
+    # torch 未安装 → 不导入不报错，字段留 None
+    with mock.patch("importlib.util.find_spec", return_value=None):
+        a2 = collect_env_audit()
+    ok("torch 缺席 → torch=None 且其余字段不受影响",
+       a2["torch"] is None and a2["python"] == audit["python"])
+
+    s = make_settings(tmp, "env", script_text="v = 1\n")
+    c = create_cohort(Path(s.data_dir), code_fingerprint(s, tmp), s)
+    ok("create_cohort 把 environment 写入 meta",
+       bool(c.meta.get("environment"))
+       and c.meta["environment"]["python"] == audit["python"])
+    c2 = load_cohort(Path(s.data_dir), c.id, settings=s)
+    ok("environment 随 meta.yaml 落盘往返",
+       (c2.meta.get("environment") or {}).get("hostname") == audit["hostname"])
+
+    update_cohort_env(c2)
+    ok("续跑刷新写入 environment_last",
+       bool(c2.meta.get("environment_last"))
+       and c2.meta["environment_last"]["python"] == audit["python"])
+    c3 = load_cohort(Path(s.data_dir), c.id, settings=s)
+    ok("environment_last 已落盘", bool(c3.meta.get("environment_last")))
+
+    # 不完整分区（无 meta）→ 静默跳过不报错
+    runs = Path(s.data_dir) / "runs"
+    (runs / "0009-19000101-000000").mkdir(parents=True)
+    inc = load_cohort(Path(s.data_dir), "0009-19000101-000000", settings=s)
+    update_cohort_env(inc)
+    ok("不完整分区刷新被静默跳过", not inc.meta.get("environment_last"))
+
+
 if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -743,4 +791,5 @@ if __name__ == "__main__":
         test_list_and_stats(tmp)
         test_e2e(tmp)
         test_config(tmp)
+        test_env_audit(tmp)
     print(f"\n全部通过：{PASS} 项断言")

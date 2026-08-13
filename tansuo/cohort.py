@@ -364,6 +364,66 @@ def load_cohort(data_dir: str | Path, cohort_id: str, settings=None) -> Cohort:
     raise CohortError(f"找不到分区：{cohort_id}（`python cli.py runs` 查看全部可用分区）")
 
 
+def collect_env_audit() -> dict:
+    """采集运行环境审计信息（python/optuna/torch/GPU/机器），写入分区 meta。
+
+    用途：同一个分区可能跨天、跨机器、跨依赖升级续跑，环境信息让事后复盘
+    能对上"这批试验是在什么环境下跑出来的"。全部字段尽力而为——任何依赖
+    缺失或探测异常只留 None/空值，绝不影响分区创建与续跑。
+    """
+    import os
+    import platform
+    audit = {
+        "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "hostname": platform.node(),
+        "cpu_count": os.cpu_count(),
+        "optuna": None,
+        "torch": None,
+        "cuda_available": False,
+        "gpus": [],
+    }
+    try:
+        import optuna
+        audit["optuna"] = str(optuna.__version__)   # 强制纯 str（yaml 拒绝 str 子类）
+    except Exception:
+        pass
+    # torch 体积大、导入慢：先 find_spec 探测，未安装则完全不导入
+    try:
+        has_torch = importlib.util.find_spec("torch") is not None
+    except Exception:
+        has_torch = False
+    if has_torch:
+        try:
+            import torch
+            audit["torch"] = str(torch.__version__)
+            try:
+                audit["cuda_available"] = bool(torch.cuda.is_available())
+                if audit["cuda_available"]:
+                    audit["gpus"] = [str(torch.cuda.get_device_name(i))
+                                     for i in range(torch.cuda.device_count())]
+            except Exception:
+                pass   # CUDA 探测失败不影响版本记录
+        except Exception:
+            pass
+    return audit
+
+
+def update_cohort_env(cohort: Cohort) -> None:
+    """续跑时把当前运行环境记到 meta['environment_last']。
+
+    创建时的环境在 meta['environment']；分区活得久，依赖/机器可能变，
+    最近一次运行的环境同样值得留痕。虚拟/不完整分区没有可写 meta，跳过。
+    """
+    if cohort.virtual or cohort.incomplete or not cohort.meta:
+        return
+    meta = dict(cohort.meta)
+    meta["environment_last"] = collect_env_audit()
+    _write_meta(cohort.path, meta)
+    cohort.meta = meta
+
+
 def create_cohort(data_dir: str | Path, fp: Fingerprint, settings,
                   note: str | None = None) -> Cohort:
     """新建分区目录并写 meta.yaml。目录名冲突（并发/同秒）时 seq 递增重试。"""
@@ -397,6 +457,7 @@ def create_cohort(data_dir: str | Path, fp: Fingerprint, settings,
         "settings_digest": {"data_fraction": settings.budget.data_fraction,
                             "adapter_mode": settings.adapter.mode},
         "db_name": _url_basename(settings.storage.url),
+        "environment": collect_env_audit(),
     }
     _write_meta(path, meta)
     return Cohort(id=name, path=path, meta=meta)
