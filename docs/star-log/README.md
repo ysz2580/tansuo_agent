@@ -18,5 +18,6 @@
 | 2026-08-11 | 010 | [cli.py web --settings/--space 被静默忽略：app 模块在环境变量注入前就加载，永远回退 demo 配置](2026-08-11-010-cli-web-settings-env-order.md) | `cli` `web后端` `模块加载顺序` `环境变量` `配置` | ✅ 已解决 |
 | 2026-08-11 | 011 | [Optuna journal:// 存储在 Windows 上创建符号链接锁失败（WinError 1314 无特权），测试与降级存储不可用](2026-08-11-011-optuna-journal-storage-windows-symlink.md) | `optuna` `journal存储` `windows` `符号链接` `测试` | ✅ 已解决 |
 | 2026-08-11 | 012 | [Optuna create_study(load_if_exists=True) 静默丢弃请求的 direction，改主指标方向续跑会让排序/剪枝/报告整体反向](2026-08-11-012-optuna-silent-direction-poisoning.md) | `optuna` `direction` `断点续跑` `记录分区` `数据污染` | ✅ 已解决 |
+| 2026-08-13 | 013 | [git push 连续报 schannel TLS 握手失败：代理端口存活但上游断连，直连兜底推送](2026-08-13-013-git-push-schannel-proxy-upstream-down.md) | `git` `代理` `schannel` `TLS` `windows` `推送` | 🔶 绕过 |
 
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中
