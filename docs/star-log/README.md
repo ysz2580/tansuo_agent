@@ -20,5 +20,6 @@
 | 2026-08-11 | 012 | [Optuna create_study(load_if_exists=True) 静默丢弃请求的 direction，改主指标方向续跑会让排序/剪枝/报告整体反向](2026-08-11-012-optuna-silent-direction-poisoning.md) | `optuna` `direction` `断点续跑` `记录分区` `数据污染` | ✅ 已解决 |
 | 2026-08-13 | 013 | [git push 连续报 schannel TLS 握手失败：代理端口存活但上游断连，直连兜底推送](2026-08-13-013-git-push-schannel-proxy-upstream-down.md) | `git` `代理` `schannel` `TLS` `windows` `推送` | 🔶 绕过 |
 | 2026-08-13 | 014 | [torch.__version__ 是 str 子类，写入 meta.yaml 时 PyYAML safe_dump 拒绝序列化](2026-08-13-014-torch-version-str-subclass-yaml.md) | `pyyaml` `torch` `序列化` `环境审计` | ✅ 已解决 |
+| 2026-08-13 | 015 | [Agent 提示词硬编码导致监督策略迭代只能改代码：重构为 {{var}} 模板引擎（弃用 str.format），前端可编辑、版本化、可回滚](2026-08-13-015-prompt-template-override-rendering.md) | `提示词` `模板渲染` `设计决策` `web后端` `版本管理` | ✅ 已解决 |
 
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中
