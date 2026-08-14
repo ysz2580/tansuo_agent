@@ -92,13 +92,18 @@ def write_back_agent(settings_path: str, model: str | None = None,
     changed: list[str] = []
     errors: list[str] = []
     for name, value in fields.items():
-        pattern = re.compile(rf"^(?P<sp>\s*){name}:(\s*\S.*)?$", re.M)
-        if not pattern.search(text):
+        pattern = re.compile(rf"^(?P<sp>\s*){name}:(?P<rest>.*)$", re.M)
+        m = pattern.search(text)
+        if not m:
             errors.append(f"settings.yaml 中未找到 {name} 字段所在行，请手动编辑")
             continue
+        # 行尾注释原样保留（YAML：空白 + # 起注释），避免写回吞掉配置注释
+        cm = re.search(r"\s+#.*$", m.group("rest"))
+        comment = cm.group(0) if cm else ""
         rendered = _yaml_scalar(value)
         text, n = pattern.subn(
-            lambda m, _n=name, _r=rendered: f"{m.group('sp')}{_n}: {_r}",
+            lambda mm, _n=name, _r=rendered, _c=comment:
+            f"{mm.group('sp')}{_n}: {_r}{_c}",
             text, count=1)
         if n > 0:
             changed.append(name)

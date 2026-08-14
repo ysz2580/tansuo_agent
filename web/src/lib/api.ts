@@ -118,6 +118,14 @@ export interface AgentEvent {
   [key: string]: unknown
 }
 
+// 本分区调参会话的累计 token 用量（来自 agent_wakeup end 事件审计）
+export interface AgentTokenSummary {
+  rounds: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+}
+
 export interface ReportResp {
   exists: boolean
   updated?: string
@@ -156,6 +164,8 @@ export interface RunInfo {
   objective_hash: string | null
   code_hash: string | null
   data_hash: string | null
+  prompt_version: number
+  prompt_changed: boolean
   primary_metric: { name: string; direction: string } | null
   completed: number
   best: number | null
@@ -190,6 +200,7 @@ export interface CompareCohort {
   note: string
   code_hash: string | null
   data_hash: string | null
+  prompt_version: number
   completed: number
   locked: boolean
   best: CompareBest | null
@@ -279,6 +290,32 @@ export interface PromptSaveResp {
   entry: PromptHistoryEntry
 }
 
+// 通知配置（/api/config/notify）：webhook 推送（会话结束 / agent 降级）
+export interface NotifyConfig {
+  enabled: boolean
+  format: string            // generic / dingtalk / lark / slack
+  events: string[]          // session_end / agent_degrade
+  webhook_url_masked: string
+  webhook_url_source: string
+}
+
+export interface NotifySaveBody {
+  webhook_url?: string
+  format?: string
+  events?: string[]
+  enabled?: boolean
+}
+
+export interface NotifySaveResp {
+  write_back: { ok: boolean; changed: string[]; errors: string[] }
+  warnings: string[]
+}
+
+export interface NotifyTestResp {
+  ok: boolean
+  detail: string
+}
+
 // ---------- 端点 ----------
 
 export const api = {
@@ -289,7 +326,8 @@ export const api = {
     http<CurveResp>(`/trials/${n}/curve${qs(cohort)}`),
   curves: (cohort?: string | null) => http<CurvesResp>(`/curves${qs(cohort)}`),
   space: (cohort?: string | null) => http<SpaceResp>(`/space${qs(cohort)}`),
-  agentEvents: (cohort?: string | null) => http<{ events: AgentEvent[] }>(`/agent/events${qs(cohort)}`),
+  agentEvents: (cohort?: string | null) =>
+    http<{ events: AgentEvent[]; tokens: AgentTokenSummary }>(`/agent/events${qs(cohort)}`),
   report: (cohort?: string | null) => http<ReportResp>(`/report${qs(cohort)}`),
   reportGenerate: (cohort?: string | null) =>
     http<{ report: string; best: string }>(`/report/generate${qs(cohort)}`, { method: "POST" }),
@@ -309,6 +347,12 @@ export const api = {
     http<ProbeResult>("/config/agent/probe", { method: "POST", body: JSON.stringify(body) }),
   save: (body: AgentConfigBody) =>
     http<SaveResult>("/config/agent/save", { method: "POST", body: JSON.stringify(body) }),
+  // 通知配置（全局）
+  notifyConfig: () => http<NotifyConfig>("/config/notify"),
+  notifySave: (body: NotifySaveBody) =>
+    http<NotifySaveResp>("/config/notify/save", { method: "POST", body: JSON.stringify(body) }),
+  notifyTest: () =>
+    http<NotifyTestResp>("/config/notify/test", { method: "POST", body: "{}" }),
   // 提示词管理（全局，不分分区）
   prompts: () => http<PromptsResp>("/config/prompts"),
   promptsPreview: (body: PromptPreviewBody) =>

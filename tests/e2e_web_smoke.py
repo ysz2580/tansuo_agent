@@ -81,7 +81,12 @@ with tempfile.TemporaryDirectory() as td:
         "budget: {total_trials: 4, wake_every: 2, seed: 1, workers: 1, data_fraction: 0.5}\n"
         "pruner: {type: median, n_startup_trials: 2, n_warmup_steps: 0}\n"
         "agent: {enabled: false, model: none}\n"
-        "storage: {url: sqlite:///" + (data / "t.db").as_posix() + "}\n",
+        "storage: {url: sqlite:///" + (data / "t.db").as_posix() + "}\n"
+        "notify:\n"
+        "  enabled: true\n"
+        "  webhook_url: ${ENV:WEB_SMOKE_WEBHOOK_NOTSET:}\n"
+        "  format: generic\n"
+        "  events: [session_end, agent_degrade]\n",
         encoding="utf-8")
     space_yaml = tmp / "space.yaml"
     space_yaml.write_text(yaml.safe_dump({"params": [
@@ -131,6 +136,9 @@ with tempfile.TemporaryDirectory() as td:
         r = api("/api/runs")
         ok("列出 0001", len(r["runs"]) == 1 and r["runs"][0]["id"] == st["last_cohort"])
         ok("与当前指纹一致", r["runs"][0]["comparable"] == "match")
+        ok("runs 条目带提示词版本（无 prompts.yaml → 0 且未变化）",
+           r["runs"][0]["prompt_version"] == 0
+           and r["runs"][0]["prompt_changed"] is False)
         ok("default 指向最新", r["default"] == st["last_cohort"])
         c1 = r["runs"][0]["id"]
 
@@ -214,6 +222,8 @@ with tempfile.TemporaryDirectory() as td:
            cp["primary"]["name"] == "val_acc" and cp["primary"]["direction"] == "maximize")
         ok("每个分区结构完整（best/curve 字段齐全）",
            all({"best", "curve", "completed", "locked"} <= set(e) for e in cp["cohorts"]))
+        ok("对比条目带提示词版本字段",
+           all(isinstance(e.get("prompt_version"), int) for e in cp["cohorts"]))
         one = cp["cohorts"][0]["id"]
         cp1 = api(f"/api/runs/compare?cohorts={one}")
         ok("显式指定单分区返回一条", len(cp1["cohorts"]) == 1 and cp1["cohorts"][0]["id"] == one)
@@ -240,6 +250,9 @@ with tempfile.TemporaryDirectory() as td:
                   "rationale": "冒烟覆盖"})
         ok("保存 version=1 且落 prompts.yaml",
            sv["version"] == 1 and (tmp / "prompts.yaml").exists())
+        r = api("/api/runs")
+        ok("提示词版本递增后既有分区全部标记 prompt_changed",
+           all(x["prompt_changed"] is True for x in r["runs"]))
         pr2 = api("/api/config/prompts")
         tune2 = next(p for p in pr2["prompts"] if p["name"] == "tuning_system")
         ok("GET 反映覆盖（effective=override）且历史 +1",
@@ -261,6 +274,66 @@ with tempfile.TemporaryDirectory() as td:
            and next(p for p in api("/api/config/prompts")["prompts"]
                     if p["name"] == "tuning_system")["effective"]
            == tune["default"])
+
+        print("== 13. webhook 通知（配置写回 + 测试 + 会话结束实收）==")
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Cap(BaseHTTPRequestHandler):
+            bodies = []
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                _Cap.bodies.append(json.loads(self.rfile.read(length).decode("utf-8")))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *_):
+                pass
+
+        cap = ThreadingHTTPServer(("127.0.0.1", 0), _Cap)
+        threading.Thread(target=cap.serve_forever, daemon=True).start()
+        cap_url = f"http://127.0.0.1:{cap.server_address[1]}/robot"
+
+        nc = api("/api/config/notify")
+        ok("GET 返回初始通知配置（ENV 空默认 → 未设置）",
+           nc["enabled"] is True and nc["format"] == "generic"
+           and sorted(nc["events"]) == ["agent_degrade", "session_end"]
+           and nc["webhook_url_masked"] == "(未设置)", str(nc))
+        try:
+            api("/api/config/notify/save", {"format": "wechat"})
+            raise AssertionError("FAIL: 非法 format 应被拒（400）")
+        except urllib.error.HTTPError as e:
+            ok("保存拒绝非法 format（400）", e.code == 400)
+        sv3 = api("/api/config/notify/save",
+                  {"webhook_url": cap_url, "format": "dingtalk"})
+        ok("写回 webhook_url 与 format",
+           set(sv3["write_back"]["changed"]) == {"webhook_url", "format"}, str(sv3))
+        ok("明文写回触发告警", any("明文" in w for w in sv3["warnings"]),
+           str(sv3["warnings"]))
+        nc2 = api("/api/config/notify")
+        ok("GET 反映写回（format=dingtalk、url 已打码）",
+           nc2["format"] == "dingtalk" and nc2["webhook_url_masked"]
+           and nc2["webhook_url_masked"] != "(未设置)", str(nc2))
+        tr = api("/api/config/notify/test", method="POST")
+        ok("测试通知发送成功", tr["ok"] is True, str(tr))
+        ok("捕获服务器收到钉钉信封测试消息",
+           len(_Cap.bodies) == 1 and _Cap.bodies[0].get("msgtype") == "text"
+           and "测试" in _Cap.bodies[0]["text"]["content"], str(_Cap.bodies))
+
+        # 再跑一次会话（预算内的试验已全部完结 → resume-skip 收尾也要通知）
+        api("/api/run/start", {"trials": 1, "no_agent": True})
+        wait_idle()
+        t0 = time.time()
+        while time.time() - t0 < 5 and len(_Cap.bodies) < 2:
+            time.sleep(0.2)
+        fin = [b for b in _Cap.bodies
+               if "调参结束" in b.get("text", {}).get("content", "")]
+        ok("会话结束 webhook 实收（钉钉信封 + 结束原因）",
+           len(fin) == 1 and "budget_exhausted" in fin[0]["text"]["content"],
+           str(_Cap.bodies[1:]))
+        cap.shutdown()
 
         print("\nWeb 冒烟全部通过")
     finally:

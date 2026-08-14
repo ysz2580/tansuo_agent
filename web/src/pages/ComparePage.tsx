@@ -66,6 +66,8 @@ export default function ComparePage() {
   }
 
   const dirZh = cmp.primary.direction === "maximize" ? "越大越好" : "越小越好"
+  // 组内提示词版本不一致 → 监督者策略跨分区不同，差异归因需谨慎
+  const promptMismatch = new Set(cmp.cohorts.map((c) => c.prompt_version)).size > 1
   // 参数名并集（按首次出现顺序）
   const paramNames: string[] = []
   for (const c of cmp.cohorts) {
@@ -111,6 +113,15 @@ export default function ComparePage() {
         )}
       </div>
 
+      {promptMismatch && (
+        <Alert className="border-amber-500/50 bg-amber-600/10">
+          <AlertDescription className="text-amber-700 dark:text-amber-400">
+            组内提示词版本不一致（监督 agent 的策略在分区之间变过）——跨分区差异可能不全是
+            超参带来的，请谨慎对比。
+          </AlertDescription>
+        </Alert>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle className="text-base">分区概览</CardTitle>
@@ -128,6 +139,7 @@ export default function ComparePage() {
                   <TableHead>最优试验</TableHead>
                   <TableHead>代码</TableHead>
                   <TableHead>数据集</TableHead>
+                  <TableHead>提示词</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -144,6 +156,15 @@ export default function ComparePage() {
                     <TableCell>{c.best ? `#${c.best.trial}` : "-"}</TableCell>
                     <TableCell className="font-mono text-xs">{c.code_hash?.slice(0, 8) ?? "-"}</TableCell>
                     <TableCell className="font-mono text-xs">{c.data_hash?.slice(0, 8) ?? "-"}</TableCell>
+                    <TableCell className="font-mono text-xs">
+                      v{c.prompt_version}
+                      {promptMismatch && (
+                        <Badge variant="outline"
+                               className="ml-1.5 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-400">
+                          不一致
+                        </Badge>
+                      )}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

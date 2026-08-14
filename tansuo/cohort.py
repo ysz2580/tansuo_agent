@@ -424,6 +424,20 @@ def update_cohort_env(cohort: Cohort) -> None:
     cohort.meta = meta
 
 
+def _prompt_version(settings) -> int:
+    """当前 prompts.yaml 版本（分区创建时的提示词迭代状态，用于可比性标记）。
+
+    提示词改变 agent 监督行为但不改变训练输入 → 不参与续跑/新开分区决策
+    （见 resolve_for_run 的三指纹匹配），仅记录到 meta 供跨分区对比时标记。
+    无 prompts.yaml / 程序化 settings（无 source_path）→ 0。
+    """
+    try:
+        from .agent.prompt_store import current_version
+        return current_version(settings)
+    except Exception:   # noqa: BLE001 —— 分区创建不因提示词读取失败而受阻
+        return 0
+
+
 def create_cohort(data_dir: str | Path, fp: Fingerprint, settings,
                   note: str | None = None) -> Cohort:
     """新建分区目录并写 meta.yaml。目录名冲突（并发/同秒）时 seq 递增重试。"""
@@ -449,6 +463,7 @@ def create_cohort(data_dir: str | Path, fp: Fingerprint, settings,
         "objective_hash": fp.objective_hash,
         "code_hash": fp.code_hash,
         "data_hash": fp.data_hash,
+        "prompt_version": _prompt_version(settings),
         "objective_inputs": fp.objective_inputs,
         "code_inputs": fp.code_inputs,
         "data_inputs": fp.data_inputs,

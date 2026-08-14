@@ -23,8 +23,8 @@ sys.path.insert(0, str(TESTS_DIR))
 import optuna                                                  # noqa: E402
 
 from tansuo.config import ConfigError, load_settings           # noqa: E402
-from tansuo.journal import (FINISH, SESSION_START, TRIAL_END,  # noqa: E402
-                            TRIAL_FAIL, TRIAL_RETRY, Journal)
+from tansuo.journal import (AGENT_WAKEUP, FINISH, SESSION_START,  # noqa: E402
+                            TRIAL_END, TRIAL_FAIL, TRIAL_RETRY, Journal)
 from tansuo.orchestrator import Orchestrator                   # noqa: E402
 from tansuo.runner import TrialFailedError, TrialRunner        # noqa: E402
 from tansuo.space import SearchSpace                           # noqa: E402
@@ -263,6 +263,104 @@ def test_exception_guard(tmp: Path) -> None:
        len(fail_events) == 2 and all("未预期异常" in e.get("reason", "") for e in fail_events))
 
 
+def test_agent_token_usage(tmp: Path) -> None:
+    print("== LLM token 用量审计 ==")
+    from types import SimpleNamespace
+
+    from tansuo.agent.loop import AgentLoop, AgentSupervisor, make_gate
+    from tansuo.agent.skill import Skill, SkillLimits
+
+    def make_resp(in_t, out_t, blocks=None, stop="end_turn"):
+        return SimpleNamespace(
+            content=blocks if blocks is not None
+            else [SimpleNamespace(type="text", text="分析完成")],
+            stop_reason=stop,
+            usage=SimpleNamespace(input_tokens=in_t, output_tokens=out_t))
+
+    class FakeClient:
+        """按序吐出预设响应，记录调用。"""
+        def __init__(self, resps):
+            self.resps = list(resps)
+            self.calls: list[dict] = []
+            outer = self
+
+            class _Messages:
+                def create(self, **kw):
+                    outer.calls.append(kw)
+                    return outer.resps.pop(0)
+
+            self.messages = _Messages()
+
+    class _Executor:
+        def dispatch(self, name, tool_input):
+            return "ok"
+
+    class FakeSkill(Skill):
+        name = mode = "fake"
+
+        def tools(self):
+            return [{"name": "probe", "description": "探针",
+                     "input_schema": {"type": "object", "properties": {}}}]
+
+        def executor(self):
+            return _Executor()
+
+        def system_prompt(self):
+            return "sys"
+
+        def opening_message(self):
+            return "hi"
+
+        def limits(self):
+            return SkillLimits(max_turns=4, max_tool_calls=2)
+
+    child = 'import json\nprint(\'##TANSUO## {"type": "final", "value": 0.7}\')\n'
+    s = make_settings(tmp, child, "tokens")
+    orch = make_orch(s)
+    gate = make_gate(s, orch.journal, log=lambda *_: None)
+
+    # 1) AgentLoop 多次模型调用 → usage 逐次累加（第一次 tool_use，第二次收尾）
+    tool_block = SimpleNamespace(type="tool_use", id="tu1", name="probe", input={})
+    client = FakeClient([make_resp(100, 20, blocks=[tool_block], stop="tool_use"),
+                         make_resp(150, 30)])
+    loop = AgentLoop(s, client, orch.journal, gate, mode="fake", log=lambda *_: None)
+    text = loop.run(FakeSkill())
+    ok("AgentLoop 返回最后一段模型文本", text == "分析完成")
+    ok("两次调用的 usage 累加（in 250 / out 50）",
+       loop.round_input_tokens == 250 and loop.round_output_tokens == 50,
+       f"in={loop.round_input_tokens} out={loop.round_output_tokens}")
+
+    # 2) AgentSupervisor.wake：真实 TuneSkill + 假端点 → 审计事件带用量
+    sup = AgentSupervisor(s, orch,
+                          client=FakeClient([make_resp(300, 40)]),
+                          gate=gate, log=lambda *_: None)
+    sup.wake(orch)
+    ok("supervisor 会话累计 token（in 300 / out 40）",
+       sup.total_input_tokens == 300 and sup.total_output_tokens == 40)
+    ends = [e for e in orch.journal.load_events()
+            if e.get("kind") == AGENT_WAKEUP and e.get("phase") == "end"]
+    ok("agent_wakeup end 事件记录当轮与会话累计用量",
+       len(ends) == 1
+       and ends[0]["input_tokens"] == 300 and ends[0]["output_tokens"] == 40
+       and ends[0]["total_input_tokens"] == 300
+       and ends[0]["total_output_tokens"] == 40, str(ends))
+
+    # 3) journal.agent_token_summary：按轮次增量汇总（跨进程续跑安全）
+    summ = orch.journal.agent_token_summary()
+    ok("token 汇总 = 各轮增量之和",
+       summ == {"rounds": 1, "input_tokens": 300, "output_tokens": 40,
+                "total_tokens": 340}, str(summ))
+    # 再来一轮（续跑场景：新 supervisor 从 0 起算，汇总仍累加历史）
+    sup2 = AgentSupervisor(s, orch,
+                           client=FakeClient([make_resp(100, 10)]),
+                           gate=gate, log=lambda *_: None)
+    sup2.wake(orch)
+    summ2 = orch.journal.agent_token_summary()
+    ok("续跑新会话后汇总跨会话累加（in 400 / out 50）",
+       summ2["rounds"] == 2 and summ2["input_tokens"] == 400
+       and summ2["total_tokens"] == 450, str(summ2))
+
+
 def test_config_validation(tmp: Path) -> None:
     print("== 新字段配置校验 ==")
 
@@ -298,5 +396,6 @@ if __name__ == "__main__":
         test_parallel(tmp)
         test_time_budget_and_eta(tmp)
         test_exception_guard(tmp)
+        test_agent_token_usage(tmp)
         test_config_validation(tmp)
     print(f"\n全部通过：{PASS} 项断言")

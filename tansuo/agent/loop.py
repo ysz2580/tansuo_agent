@@ -39,6 +39,17 @@ class AgentLoop:
         self.gate = gate
         self.mode = mode
         self.log = log
+        # 本次 run() 的 token 用量累加器（供上层写审计/统计花费）
+        self.round_input_tokens = 0
+        self.round_output_tokens = 0
+
+    def _count_usage(self, resp) -> None:
+        """累计一次模型响应的 usage（个别响应无 usage 时跳过，不阻塞循环）。"""
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            return
+        self.round_input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+        self.round_output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
 
     def run(self, skill: Skill) -> str:
         cfg = self.settings.agent
@@ -57,6 +68,7 @@ class AgentLoop:
             resp = call_with_retry(
                 self.client, model=cfg.model, system=system, tools=tools,
                 max_tokens=skill.max_tokens(), messages=messages)
+            self._count_usage(resp)
             texts = [b.text for b in resp.content if b.type == "text" and b.text.strip()]
             tool_uses = [b for b in resp.content if b.type == "tool_use"]
             if texts:
@@ -104,6 +116,7 @@ class AgentLoop:
                                             "不要再调用工具。"})
                 resp = call_with_retry(self.client, model=cfg.model, system=system,
                                        max_tokens=1024, messages=messages)
+                self._count_usage(resp)
                 for b in resp.content:
                     if b.type == "text" and b.text.strip():
                         last_text = b.text
@@ -130,6 +143,9 @@ class AgentSupervisor:
         self.gate = gate or make_gate(settings, self.journal, log=log)
         self.log = log
         self.wake_count = 0
+        # 会话级 token 累计（每轮唤醒后从 AgentLoop 汇总，写进 AGENT_WAKEUP 审计）
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
 
     def wake(self, orchestrator=None) -> None:
         from .skills.tune import TuneSkill
@@ -150,10 +166,16 @@ class AgentSupervisor:
         except AgentEndpointError as e:
             self.journal.append(AGENT_ERROR, round=self.wake_count, error=str(e))
             raise
+        self.total_input_tokens += loop.round_input_tokens
+        self.total_output_tokens += loop.round_output_tokens
         if self.orch.finished_reason:
             self.log(f"[agent] 已决定结束搜索：{self.orch.finished_reason}")
         self.journal.append(AGENT_WAKEUP, round=self.wake_count, phase="end",
-                            note=(last_text or "")[:300])
+                            note=(last_text or "")[:300],
+                            input_tokens=loop.round_input_tokens,
+                            output_tokens=loop.round_output_tokens,
+                            total_input_tokens=self.total_input_tokens,
+                            total_output_tokens=self.total_output_tokens)
 
 
 # ==================================================================

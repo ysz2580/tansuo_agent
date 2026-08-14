@@ -61,6 +61,12 @@ function CohortSelector({ value, onChange }: { value: string | null; onChange: (
                 <span className="font-mono text-xs">{r.id}</span>
                 {r.note && <span className="text-muted-foreground ml-1 text-xs">{r.note}</span>}
                 <Badge variant="outline" className={`ml-1.5 text-[10px] ${meta.cls}`}>{meta.label}</Badge>
+                {r.prompt_changed && (
+                  <Badge variant="outline"
+                         className="ml-1 text-[10px] bg-amber-600/15 text-amber-700 dark:text-amber-400">
+                    △ 提示词已变
+                  </Badge>
+                )}
                 {r.locked && <span className="text-muted-foreground ml-1 text-[10px]">(统计降级)</span>}
               </SelectItem>
             )

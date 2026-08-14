@@ -3,7 +3,8 @@
 三类接口：
 1. 只读查询（summary/trials/curves/space/agent 事件/报告）——直接加载 SQLite study 与 journal；
 2. 运行驱动（run start/stop/status/log）——子进程拉起 `python cli.py run`，见 run_manager.py；
-3. API 配置切换（config/agent get/probe/save）——复用 probe_endpoint 探测、最小化写回 settings.yaml。
+3. API 配置切换（config/agent get/probe/save）——复用 probe_endpoint 探测、最小化写回 settings.yaml；
+   通知配置（config/notify get/save/test）同范式，见 tansuo/notify.py。
 
 路径来自环境变量 TANSUO_SETTINGS / TANSUO_SPACE（由 `cli.py web` 注入，取绝对路径），
 缺省回退到 demo 配置——这样 `uvicorn tansuo.web.app:app` 从项目根直接起也能用。
@@ -205,7 +206,8 @@ def space(cohort: str | None = Query(default=None)):
 @app.get("/api/agent/events")
 def agent_events(cohort: str | None = Query(default=None)):
     settings, space, study, journal, coh = _safe_load(cohort)
-    return {"events": journal.agent_events()}
+    return {"events": journal.agent_events(),
+            "tokens": journal.agent_token_summary()}
 
 
 @app.get("/api/report")
@@ -253,6 +255,8 @@ def runs_list():
         raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
     root = abs_data_dir(settings, PROJECT_ROOT)
     fp = code_fingerprint(settings, PROJECT_ROOT)
+    from ..agent.prompt_store import current_version
+    prompt_version_now = current_version(settings)
     items = []
     for c in list_cohorts(root, settings=settings):
         meta = c.meta or {}
@@ -279,6 +283,8 @@ def runs_list():
             "objective_hash": meta.get("objective_hash"),
             "code_hash": meta.get("code_hash"),
             "data_hash": meta.get("data_hash"),
+            "prompt_version": meta.get("prompt_version", 0),
+            "prompt_changed": meta.get("prompt_version", 0) != prompt_version_now,
             "primary_metric": meta.get("primary_metric"),
             "completed": st["completed"],
             "best": st["best"],
@@ -575,6 +581,89 @@ def agent_config_save(body: AgentConfigBody):
     return {"probe": result, "write_back": wb,
             "warnings": ["auth_token 已以明文写入 settings.yaml，注意不要误提交到公开仓库"]
             if fields["auth_token"] else []}
+
+
+# ------------------------------------------------------------------
+# 通知配置（notify：webhook_url / format / events / enabled）
+# ------------------------------------------------------------------
+
+class NotifySaveBody(BaseModel):
+    webhook_url: str | None = None
+    format: str | None = None
+    events: list[str] | None = None
+    enabled: bool | None = None
+
+
+def _notify_env_ref() -> bool:
+    """检查 settings.yaml 原文中 webhook_url 是否为 ${ENV:...} 引用。"""
+    try:
+        text = Path(SETTINGS_PATH).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r"^\s*webhook_url:\s*\$\{ENV:", text, re.M))
+
+
+@app.get("/api/config/notify")
+def notify_config_get():
+    try:
+        settings = load_settings(SETTINGS_PATH)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
+    cfg = settings.notify
+    from ..agent.api_setup import _mask
+    source = ("settings.yaml（${ENV:...} 引用环境变量）" if _notify_env_ref()
+              else ("settings.yaml（notify.webhook_url 明文）" if cfg.webhook_url
+                    else "未设置"))
+    return {"enabled": cfg.enabled,
+            "format": cfg.format,
+            "events": cfg.events,
+            "webhook_url_masked": _mask(cfg.webhook_url),
+            "webhook_url_source": source}
+
+
+@app.post("/api/config/notify/save")
+def notify_config_save(body: NotifySaveBody):
+    """把「显式给出的字段」最小化写回 settings.yaml 的 notify 块。
+
+    webhook_url 留空时保持 ${ENV:...} 引用，绝不把环境变量里的地址物化进
+    配置文件；明文写入则告警。
+    """
+    from ..notify import VALID_EVENTS, VALID_FORMATS, write_back_notify
+    fmt = (body.format or "").strip().lower() or None
+    if fmt is not None and fmt not in VALID_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"format 必须是 {'/'.join(VALID_FORMATS)} 之一，实际：'{fmt}'")
+    if body.events is not None:
+        for v in body.events:
+            if v not in VALID_EVENTS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"events 含非法值 '{v}'，必须是 {'/'.join(VALID_EVENTS)} 之一")
+    wb = write_back_notify(SETTINGS_PATH,
+                           webhook_url=(body.webhook_url or "").strip() or None,
+                           fmt=fmt, events=body.events, enabled=body.enabled)
+    if not wb["changed"] and wb["errors"]:
+        raise HTTPException(status_code=500, detail="；".join(wb["errors"]))
+    return {"write_back": wb,
+            "warnings": ["webhook_url 已以明文写入 settings.yaml，注意不要误提交到公开仓库"]
+            if (body.webhook_url or "").strip() else []}
+
+
+@app.post("/api/config/notify/test")
+def notify_config_test():
+    """用当前生效配置发一条测试通知，返回 {ok, detail}。"""
+    from ..notify import build_payload, send_webhook
+    try:
+        settings = load_settings(SETTINGS_PATH)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
+    cfg = settings.notify
+    if not cfg.webhook_url:
+        raise HTTPException(status_code=400, detail="webhook_url 为空，请先配置后再测试")
+    text = (f"【tansuo 通知测试】{settings.experiment_name}\n"
+            f"这是一条测试消息：webhook 配置（{cfg.format}）连通正常。")
+    return send_webhook(cfg.webhook_url, build_payload(cfg.format, text))
 
 
 # ------------------------------------------------------------------

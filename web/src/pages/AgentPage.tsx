@@ -13,9 +13,15 @@ const KIND_META: Record<string, { label: string; cls: string }> = {
 
 function eventBody(e: AgentEvent): string {
   switch (e.kind) {
-    case "agent_wakeup":
-      if (e.phase === "end") return `第 ${e.round} 轮结束${e.note ? `：${e.note}` : ""}`
+    case "agent_wakeup": {
+      if (e.phase === "end") {
+        const usage = typeof e.input_tokens === "number"
+          ? `（本轮 in ${e.input_tokens} / out ${e.output_tokens} tokens）`
+          : ""
+        return `第 ${e.round} 轮结束${usage}${e.note ? `：${e.note}` : ""}`
+      }
       return `第 ${e.round} 轮开始 ｜ 剩余预算 ${e.budget_left} ｜ 空间 v${e.space_version}`
+    }
     case "agent_tool_call": {
       const input = e.input ? JSON.stringify(e.input) : ""
       const brief = input.length > 120 ? input.slice(0, 120) + "…" : input
@@ -48,6 +54,14 @@ export default function AgentPage() {
         {Object.entries(counts).map(([k, n]) => (
           <span key={k}>{KIND_META[k]?.label ?? k} ×{n}</span>
         ))}
+        {data.tokens.total_tokens > 0 && (
+          <span className="text-blue-700 dark:text-blue-400"
+                title="本分区所有调参唤醒累计的大模型 token 用量（按 agent_wakeup 审计汇总）">
+            累计 tokens：{data.tokens.total_tokens.toLocaleString()}
+            （in {data.tokens.input_tokens.toLocaleString()} /
+            out {data.tokens.output_tokens.toLocaleString()}）
+          </span>
+        )}
       </div>
 
       {events.length === 0 ? (

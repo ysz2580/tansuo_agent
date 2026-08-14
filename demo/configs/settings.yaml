@@ -81,3 +81,14 @@ agent:
 # ---------- 结果存储 ----------
 storage:
   url: sqlite:///demo/data/tansuo.db   # 也支持 journal://demo/data/optuna_journal.jsonl
+
+# ---------- webhook 通知 ----------
+# 会话结束（跑完 / 中断 / 预算耗尽）或 agent 降级时推送一条消息，
+# 兼容钉钉 / 飞书 / Slack 自定义机器人。webhook_url 留空则不发送。
+# 推荐用 ${ENV:变量名} 引用，避免把含 token 的机器人地址提交进仓库；
+# 也可在 Web「设置」页配置并一键测试。
+notify:
+  enabled: true             # 总开关
+  webhook_url: ${ENV:TANSUO_WEBHOOK:}   # 机器人地址；空=不发通知
+  format: generic           # generic / dingtalk / lark / slack（各自机器人的 JSON 信封）
+  events: [session_end, agent_degrade]  # 订阅事件：会话结束 / agent 降级

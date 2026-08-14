@@ -3,6 +3,7 @@ import { toast } from "sonner"
 import {
   api,
   type AgentConfig,
+  type NotifyConfig,
   type ProbeResult,
   type ReportResp,
   type RunLogResp,
@@ -15,6 +16,13 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 
 export default function SettingsPage() {
@@ -22,6 +30,7 @@ export default function SettingsPage() {
     <div className="space-y-4">
       <RunPanel />
       <ApiConfigPanel />
+      <NotifyPanel />
       <ReportPanel />
     </div>
   )
@@ -279,6 +288,154 @@ function ApiConfigPanel() {
           </Button>
           <Button onClick={save} disabled={probing || saving}>
             {saving ? "探测并保存中…" : "探测并保存"}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+// ------------------------------------------------------------------
+// 通知配置（webhook：会话结束 / agent 降级推送）
+// ------------------------------------------------------------------
+
+const NOTIFY_FORMATS = [
+  { value: "generic", label: "通用（{\"text\": …}）" },
+  { value: "dingtalk", label: "钉钉自定义机器人" },
+  { value: "lark", label: "飞书自定义机器人" },
+  { value: "slack", label: "Slack incoming webhook" },
+]
+const NOTIFY_EVENT_META: Record<string, string> = {
+  session_end: "会话结束（跑完 / 中断 / 预算耗尽）",
+  agent_degrade: "agent 连续失败降级为无 agent 巡航",
+}
+
+function NotifyPanel() {
+  const { data: current, error } = usePolling<NotifyConfig>(api.notifyConfig, 15000)
+  const [url, setUrl] = useState("")
+  const [format, setFormat] = useState("")
+  const [events, setEvents] = useState<string[] | null>(null)
+  const [enabled, setEnabled] = useState<boolean | null>(null)
+  const [testing, setTesting] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const effEvents = events ?? current?.events ?? []
+  const effEnabled = enabled ?? current?.enabled ?? true
+
+  const toggleEvent = (name: string) => {
+    setEvents(effEvents.includes(name)
+      ? effEvents.filter((e) => e !== name)
+      : [...effEvents, name])
+  }
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      const r = await api.notifySave({
+        webhook_url: url.trim() || undefined,
+        format: format || undefined,
+        events: effEvents,
+        enabled: effEnabled,
+      })
+      toast.success(`已保存（写回字段：${r.write_back.changed.join(", ") || "无变化"}）`)
+      r.warnings.forEach((w) => toast.warning(w))
+      if (url.trim()) setUrl("")
+      setFormat("")
+      setEvents(null)
+      setEnabled(null)
+    } catch (e) {
+      toast.error(`保存失败：${e instanceof Error ? e.message : e}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const test = async () => {
+    setTesting(true)
+    try {
+      const r = await api.notifyTest()
+      if (r.ok) toast.success(`测试通知已送达：${r.detail}`)
+      else toast.error(`测试通知发送失败：${r.detail}`)
+    } catch (e) {
+      toast.error(`测试失败：${e instanceof Error ? e.message : e}`)
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Webhook 通知</CardTitle>
+        <CardDescription>
+          调参是长时任务：会话结束或 agent 降级时推送一条消息到钉钉 / 飞书 / Slack
+          等自定义机器人。webhook_url 推荐写成 ${"${ENV:变量名}"} 引用环境变量，
+          避免把含 token 的机器人地址明文提交进仓库；留空保存不改动现有值。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {error && <div className="text-red-600 text-sm">配置加载失败：{error}</div>}
+        {current && (
+          <div className="text-muted-foreground space-y-1 rounded-md border p-3 text-sm">
+            <div>
+              当前状态：
+              {current.enabled
+                ? <Badge className="ml-1 bg-emerald-600/15 text-emerald-700 dark:text-emerald-400">已启用</Badge>
+                : <Badge variant="secondary" className="ml-1">已停用</Badge>}
+              <span className="ml-2">格式：<span className="text-foreground font-mono">{current.format}</span></span>
+              <span className="ml-2">订阅事件：
+                <span className="text-foreground font-mono">{current.events.join(", ") || "（无）"}</span>
+              </span>
+            </div>
+            <div>
+              当前 webhook：<span className="text-foreground font-mono">{current.webhook_url_masked || "（未设置）"}</span>
+              <span className="ml-2">来源：{current.webhook_url_source}</span>
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-1">
+          <Label htmlFor="webhook">webhook_url</Label>
+          <Input id="webhook" type="password" placeholder="留空=保持现状；支持 ${ENV:变量名}"
+                 value={url} onChange={(e) => setUrl(e.target.value)} />
+        </div>
+        {url.trim() && !url.trim().startsWith("${ENV:") && (
+          <p className="text-amber-600 text-xs">
+            ⚠ 该地址将以明文写入 demo/configs/settings.yaml，注意不要把含 token 的配置提交到公开仓库。
+          </p>
+        )}
+
+        <div className="flex flex-wrap items-end gap-4">
+          <div className="space-y-1">
+            <Label>机器人格式</Label>
+            <Select value={format || current?.format || "generic"} onValueChange={setFormat}>
+              <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {NOTIFY_FORMATS.map((f) => (
+                  <SelectItem key={f.value} value={f.value}>{f.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex items-center gap-2 pb-2">
+            <Switch id="notify-enabled" checked={effEnabled} onCheckedChange={setEnabled} />
+            <Label htmlFor="notify-enabled">启用通知</Label>
+          </div>
+          {Object.entries(NOTIFY_EVENT_META).map(([name, label]) => (
+            <div key={name} className="flex items-center gap-2 pb-2">
+              <Switch id={`ev-${name}`} checked={effEvents.includes(name)}
+                      onCheckedChange={() => toggleEvent(name)} />
+              <Label htmlFor={`ev-${name}`}>{label}</Label>
+            </div>
+          ))}
+        </div>
+
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={test} disabled={testing || saving}>
+            {testing ? "发送中…" : "发送测试通知"}
+          </Button>
+          <Button onClick={save} disabled={testing || saving}>
+            {saving ? "保存中…" : "保存"}
           </Button>
         </div>
       </CardContent>

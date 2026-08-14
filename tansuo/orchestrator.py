@@ -49,6 +49,7 @@ class Orchestrator:
         self.finished_reason: str | None = None      # finish 工具/预算耗尽时设置
         self.agent_fail_streak = 0
         self.deadline: float | None = None           # 时间预算（monotonic 秒）
+        self.cohort_id: str | None = None            # 本次会话的记录分区（run() 注入）
         self._durations: deque = deque(maxlen=20)    # 最近完结试验耗时（ETA 用）
 
     # ---------------- 预算 ----------------
@@ -72,6 +73,37 @@ class Orchestrator:
         """agent 的 finish 工具调用入口。"""
         if not self.finished_reason:
             self.finished_reason = reason
+
+    # ---------------- webhook 通知（失败绝不影响搜索） ----------------
+    def _notify_finish(self, reason: str) -> None:
+        """会话结束通知（notify.enabled 且订阅 session_end 时发送）。"""
+        try:
+            from .notify import notify_finish
+            best_line = ""
+            try:
+                best_line = (f"trial#{self.study.best_trial.number} "
+                             f"{self.settings.metrics.primary.name}"
+                             f"={self.study.best_value:.4f}")
+            except ValueError:
+                pass   # 本次会话没有完成的试验
+            notify_finish(self.settings, reason=reason,
+                          finished=self.finished_count(), total=self.total,
+                          best_line=best_line,
+                          tokens=self.journal.agent_token_summary(),
+                          cohort_id=self.cohort_id, log=self.log)
+        except Exception as e:   # noqa: BLE001 —— 通知失败绝不影响搜索
+            self.log(f"[notify] 会话结束通知出错（已忽略）：{e}")
+
+    def _notify_degrade(self, limit: int) -> None:
+        """agent 连续失败达上限、降级为无 agent 巡航时的通知（会话继续）。"""
+        try:
+            from .notify import notify_degrade
+            notify_degrade(self.settings,
+                           detail=f"连续失败阈值：{limit} 次（agent."
+                                  f"max_consecutive_failures）",
+                           log=self.log)
+        except Exception as e:   # noqa: BLE001
+            self.log(f"[notify] agent 降级通知出错（已忽略）：{e}")
 
     # ---------------- 试验推进 ----------------
     def _run_one(self, trial, source: str) -> str:
@@ -184,6 +216,7 @@ class Orchestrator:
             self.total = total_trials
         if workers is not None:
             self.workers = workers
+        self.cohort_id = cohort
         wake_every = wake_every or self.settings.budget.wake_every
         hours = max_duration_h if max_duration_h is not None else self.settings.budget.max_duration_h
         if hours:
@@ -207,6 +240,7 @@ class Orchestrator:
         if self.budget_left() <= 0:
             self.log("预算内的试验已全部完结，无需再跑。")
             self.journal.append(FINISH, reason="budget_exhausted")
+            self._notify_finish("budget_exhausted")
             return
 
         try:
@@ -225,11 +259,13 @@ class Orchestrator:
                     supervisor = self._wake(supervisor)   # 返回 None 表示已降级禁用
         except KeyboardInterrupt:
             self.journal.append(FINISH, reason="interrupted", done=self.finished_count())
+            self._notify_finish("interrupted")
             self.log("\n已中断。运行 `python cli.py run --resume` 可从断点续跑。")
             return
 
         reason = self.finished_reason or "budget_exhausted"
         self.journal.append(FINISH, reason=reason, done=self.finished_count())
+        self._notify_finish(reason)
         try:
             self.log(f"\n结束（{reason}）：最优 trial#{self.study.best_trial.number} "
                      f"{self.settings.metrics.primary.name}={self.study.best_value:.4f}")
@@ -257,6 +293,7 @@ class Orchestrator:
             limit = self.settings.agent.max_consecutive_failures
             if self.agent_fail_streak >= limit:
                 self.log(f"[agent] 连续失败达到 {limit} 次，本会话自动降级为无 agent 巡航模式")
+                self._notify_degrade(limit)
                 return None
         else:
             self.agent_fail_streak = 0

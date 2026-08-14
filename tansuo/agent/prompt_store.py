@@ -78,6 +78,15 @@ def load_overrides(settings) -> dict:
             if k in PROMPT_NAMES}
 
 
+def current_version(settings) -> int:
+    """当前 prompts.yaml 版本（文件缺失 / 程序化 settings → 0）。
+
+    供分区 meta（create_cohort）与跨分区对比标记使用：提示词版本变化不改变
+    训练输入，不参与续跑/新开分区决策，仅作为可比性元数据记录与展示。
+    """
+    return int(load_doc(settings)["version"])
+
+
 def _atomic_write(path: Path, doc: dict) -> None:
     """temp + os.replace 原子写，避免半截文件。"""
     text = yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)

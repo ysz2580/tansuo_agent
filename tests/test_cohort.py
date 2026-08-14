@@ -19,6 +19,8 @@
 - config：experiment.fingerprint_paths 校验
 - 环境审计：meta 记录 python/optuna/torch/GPU/机器，torch 缺席容错，
   续跑刷新 environment_last，不完整分区静默跳过
+- 提示词版本：分区 meta 记 prompt_version（无 prompts.yaml=0），提示词变化
+  不新开分区（只记元数据），新开分区记录当前版本，save_override 递增后同步
 """
 from __future__ import annotations
 
@@ -775,6 +777,42 @@ def test_env_audit(tmp: Path) -> None:
     ok("不完整分区刷新被静默跳过", not inc.meta.get("environment_last"))
 
 
+def test_prompt_version(tmp: Path) -> None:
+    print("\n== 提示词版本进分区 meta ==")
+    from tansuo.agent.prompt_store import current_version, save_override
+    s = make_settings(tmp, "pv", script_text="v = 1\n")
+    logs: list[str] = []
+
+    # 无 prompts.yaml → prompt_version=0
+    c1, info1 = resolve_for_run(s, base_dir=tmp, log=logs.append)
+    ok("无 prompts.yaml 时分区 meta 记 prompt_version=0",
+       info1["action"] == "created" and c1.meta.get("prompt_version") == 0)
+
+    # 写 prompts.yaml（version=3）：模拟提示词已在 Web 页迭代过 3 次
+    (Path(s.source_path).parent / "prompts.yaml").write_text(
+        "version: 3\nprompts: {}\nhistory: []\n", encoding="utf-8")
+    ok("current_version 读到 prompts.yaml 版本", current_version(s) == 3)
+
+    # 提示词变化不改变训练输入 → 仍续跑同一分区（不新开）
+    c2, info2 = resolve_for_run(s, base_dir=tmp, log=logs.append)
+    ok("提示词版本变化不新开分区（续跑同一分区）",
+       info2["action"] == "continue" and c2.id == c1.id)
+
+    # 新开分区则记录当前提示词版本
+    c3, info3 = resolve_for_run(s, force_new=True, base_dir=tmp, log=logs.append)
+    ok("新开分区 meta 记录当前 prompt_version=3",
+       info3["action"] == "created" and c3.meta.get("prompt_version") == 3)
+    meta = yaml.safe_load((c3.path / "meta.yaml").read_text(encoding="utf-8"))
+    ok("prompt_version 随 meta.yaml 落盘", meta.get("prompt_version") == 3)
+
+    # save_override 再迭代一次（3→4）→ 下一个新分区记 4
+    save_override(s, "tuning_system", "测试覆盖文本", "单测验证版本递增",
+                  source="test")
+    c4, _ = resolve_for_run(s, force_new=True, base_dir=tmp, log=logs.append)
+    ok("save_override 递增后新分区 prompt_version 同步 +1",
+       c4.meta.get("prompt_version") == 4)
+
+
 if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -792,4 +830,5 @@ if __name__ == "__main__":
         test_e2e(tmp)
         test_config(tmp)
         test_env_audit(tmp)
+        test_prompt_version(tmp)
     print(f"\n全部通过：{PASS} 项断言")

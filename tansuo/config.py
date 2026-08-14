@@ -112,6 +112,19 @@ class StorageCfg:
 
 
 @dataclass
+class NotifyCfg:
+    """会话结束 / agent 降级的 webhook 通知（见 tansuo/notify.py）。
+
+    webhook_url 支持 ${ENV:变量名} 引用（load_settings 统一展开），
+    避免把含 token 的机器人地址明文提交进仓库。
+    """
+    enabled: bool = True
+    webhook_url: str = ""
+    format: str = "generic"   # generic / dingtalk / lark / slack
+    events: list = field(default_factory=lambda: ["session_end", "agent_degrade"])
+
+
+@dataclass
 class Settings:
     experiment_name: str = "experiment"
     data_dir: str = "data"
@@ -121,6 +134,7 @@ class Settings:
     pruner: PrunerCfg = field(default_factory=PrunerCfg)
     agent: AgentCfg = field(default_factory=AgentCfg)
     storage: StorageCfg = field(default_factory=StorageCfg)
+    notify: NotifyCfg = field(default_factory=NotifyCfg)
     fingerprint_paths: list[str] = field(default_factory=list)  # 分区代码指纹附加文件/目录
     dataset: list[str] = field(default_factory=list)  # 数据集标识（参与分区数据集指纹）
     source_path: str = ""
@@ -262,6 +276,29 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
     _require(storage.url.startswith(("sqlite:///", "journal://")),
              f"storage.url 必须以 sqlite:/// 或 journal:// 开头，实际：'{storage.url}'")
 
+    # ---- notify ----
+    from .notify import VALID_EVENTS, VALID_FORMATS
+    n = raw.get("notify") or {}
+    notify = NotifyCfg(
+        enabled=bool(n.get("enabled", True)),
+        webhook_url=str(n.get("webhook_url") or "").strip(),
+        format=(str(n.get("format", "generic")).strip().lower() or "generic"),
+    )
+    _require(notify.format in VALID_FORMATS,
+             f"notify.format 必须是 {'/'.join(VALID_FORMATS)} 之一，实际：'{notify.format}'")
+    ev_raw = n.get("events")
+    if ev_raw is not None:
+        _require(isinstance(ev_raw, list),
+                 f"notify.events 必须是列表（可选：{'/'.join(VALID_EVENTS)}），"
+                 f"实际是 {type(ev_raw).__name__}")
+        events: list = []
+        for i, v in enumerate(ev_raw):
+            v = str(v).strip()
+            _require(v in VALID_EVENTS,
+                     f"notify.events[{i}] 非法：'{v}'，必须是 {'/'.join(VALID_EVENTS)} 之一")
+            events.append(v)
+        notify.events = events
+
     exp = raw.get("experiment") or {}
     fp_paths_raw = exp.get("fingerprint_paths") or []
     _require(isinstance(fp_paths_raw, list),
@@ -293,6 +330,7 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         pruner=pruner,
         agent=agent,
         storage=storage,
+        notify=notify,
         fingerprint_paths=fingerprint_paths,
         dataset=dataset,
         source_path=str(path),

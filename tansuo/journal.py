@@ -67,3 +67,16 @@ class Journal:
     def agent_events(self) -> list[dict]:
         return [e for e in self.load_events()
                 if str(e.get("kind", "")).startswith("agent_")]
+
+    def agent_token_summary(self) -> dict:
+        """本分区调参会话的累计 token 用量（来自 agent_wakeup end 事件审计）。
+
+        每轮 end 事件带当轮增量 input_tokens/output_tokens；跨进程续跑时
+        supervisor 的会话累计会清零，故汇总一律按轮次增量求和。
+        老分区（用量审计引入前）→ 各项 0。
+        """
+        ends = [e for e in self.agent_events() if e.get("phase") == "end"]
+        ti = sum(int(e.get("input_tokens") or 0) for e in ends)
+        to = sum(int(e.get("output_tokens") or 0) for e in ends)
+        return {"rounds": len(ends), "input_tokens": ti, "output_tokens": to,
+                "total_tokens": ti + to}
