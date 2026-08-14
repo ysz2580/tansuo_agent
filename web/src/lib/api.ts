@@ -317,6 +317,74 @@ export interface NotifyTestResp {
   detail: string
 }
 
+// 项目管理（/api/projects）：项目 = 一个目录（训练代码 + 数据集），
+// tansuo 工作产物放 <项目>/.tansuo/；注册表在 ~/.tansuo_agent/projects.json
+export interface ProjectInfo {
+  id: string
+  name: string
+  dir: string                 // 项目目录（绝对路径）：一切相对路径的基准
+  settings_path: string
+  space_path: string
+  train_script: string        // 可空：未登记则不能跑 setup agent
+  created_at: string
+  last_used: string
+}
+
+export interface ProjectsResp {
+  projects: ProjectInfo[]
+  active_id: string | null
+}
+
+export interface ProjectCreateBody {
+  name?: string               // 缺省用目录名
+  dir: string
+  train_script?: string
+}
+
+export interface ProjectCreateResp extends ProjectInfo {
+  scaffolded: boolean         // true=新生成 .tansuo/ 模板；false=打开既有项目
+}
+
+export interface BrowseDirEntry {
+  name: string
+  path: string
+  has_children: boolean
+}
+
+export interface BrowseResp {
+  path: string                // ""=盘符/home 根视图
+  parent: string | null
+  dirs: BrowseDirEntry[]
+}
+
+export interface FilesResp {
+  path: string
+  files: string[]
+}
+
+// setup agent（配置会话）：与搜索硬互斥，状态结构与 RunStatus 同构
+export interface SetupStatus {
+  running: boolean
+  pid: number | null
+  args: string[]
+  log_path: string | null
+  started_at: string | null
+  exit_code: number | null
+  stopped: boolean
+  project_dir: string | null
+  settings_path: string | null
+  train_script: string | null
+}
+
+export interface SetupLogResp extends SetupStatus {
+  text: string
+}
+
+export interface SetupEventsResp {
+  events: AgentEvent[]
+  tokens: AgentTokenSummary
+}
+
 // ---------- 端点 ----------
 
 export const api = {
@@ -360,4 +428,27 @@ export const api = {
     http<PromptPreviewResp>("/config/prompts/preview", { method: "POST", body: JSON.stringify(body) }),
   promptsSave: (body: PromptSaveBody) =>
     http<PromptSaveResp>("/config/prompts/save", { method: "POST", body: JSON.stringify(body) }),
+  // 项目管理：注册 / 激活 / 新建（自动脚手架 .tansuo/）/ 删除（仅移除注册）
+  projects: () => http<ProjectsResp>("/projects"),
+  activeProject: () => http<ProjectInfo>("/projects/active"),
+  createProject: (body: ProjectCreateBody) =>
+    http<ProjectCreateResp>("/projects", { method: "POST", body: JSON.stringify(body) }),
+  activateProject: (id: string) =>
+    http<ProjectInfo>(`/projects/${encodeURIComponent(id)}/activate`,
+                      { method: "POST", body: "{}" }),
+  deleteProject: (id: string) =>
+    http<{ ok: boolean }>(`/projects/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  // 服务端目录浏览（浏览器无法枚举服务器文件夹）：path 空 → Windows 盘符 / 其他平台 home
+  browseDir: (path = "") =>
+    http<BrowseResp>(`/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+  browseFiles: (path: string, ext = ".py") =>
+    http<FilesResp>(`/fs/files?path=${encodeURIComponent(path)}&ext=${encodeURIComponent(ext)}`),
+  // setup agent（配置会话）：对指定项目跑配置 agent，与搜索硬互斥
+  setupStart: (projectId: string) =>
+    http<SetupStatus>(`/projects/${encodeURIComponent(projectId)}/setup`,
+                      { method: "POST", body: "{}" }),
+  setupStop: () => http<SetupStatus>("/setup/stop", { method: "POST", body: "{}" }),
+  setupStatus: () => http<SetupStatus>("/setup/status"),
+  setupLog: (tail = 300) => http<SetupLogResp>(`/setup/log?tail=${tail}`),
+  setupEvents: () => http<SetupEventsResp>("/setup/events"),
 }
