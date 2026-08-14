@@ -15,6 +15,7 @@ import dataclasses
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -779,6 +780,171 @@ def prompts_save(body: PromptSaveBody):
         return save_override(settings, body.which, body.text, body.rationale, source="web")
     except PromptStoreError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ------------------------------------------------------------------
+# 项目管理（注册 / 激活 / 删除 / 新建脚手架）+ 服务端目录浏览
+# ------------------------------------------------------------------
+
+class ProjectCreateBody(BaseModel):
+    name: str | None = Field(default=None, description="项目名；缺省用目录名")
+    dir: str = Field(description="项目目录（含训练代码与数据集）")
+    train_script: str | None = Field(default=None, description="主训练脚本路径（可空）")
+
+
+# 目录浏览排除的系统/保留目录（Windows 为主），避免噪音与越权窥探
+_EXCLUDE_DIRS = {"Windows", "Program Files", "Program Files (x86)", "ProgramData",
+                 "$Recycle.Bin", "System Volume Information", "Recovery", "PerfLogs",
+                 "MSOCache", "Intel", "AMD"}
+
+
+def _busy_reason() -> str | None:
+    """有任务在跑时返回原因（切换项目 / 启动 setup 前调用）；空闲返回 None。"""
+    if RUN.running:
+        return f"有搜索正在运行（pid={RUN.pid}），请先停止"
+    return None
+
+
+def _scaffold_project(dir_path: Path, train_script: str | None) -> None:
+    """在项目目录内创建 `.tansuo/` 工作子目录 + settings/space 模板。
+
+    相对路径（data_dir / storage.url / adapter.command）一律相对**项目目录**解析，
+    与 `_active_paths()` 返回的 project_dir（= base_dir = 子进程 cwd）一致。
+    """
+    from ..wizard import SETTINGS_TEMPLATE, SPACE_TEMPLATE
+    tansuo_dir = dir_path / ".tansuo"
+    tansuo_dir.mkdir(parents=True, exist_ok=True)
+    text = SETTINGS_TEMPLATE
+    text = text.replace("data_dir: data", "data_dir: .tansuo/data")
+    text = text.replace("sqlite:///data/tansuo.db",
+                        "sqlite:///.tansuo/data/tansuo.db")
+    if train_script:
+        try:
+            rel = Path(train_script).resolve().relative_to(dir_path)
+        except ValueError:
+            rel = Path(Path(train_script).name)   # 不在项目内 → 退化为文件名
+        text = text.replace('command: ["python", "path/to/your_train.py"]',
+                            f'command: ["python", "{rel.as_posix()}"]')
+    (tansuo_dir / "settings.yaml").write_text(text, encoding="utf-8")
+    (tansuo_dir / "search_space.yaml").write_text(SPACE_TEMPLATE, encoding="utf-8")
+
+
+def _has_subdirs(d: Path) -> bool:
+    try:
+        return any(c.is_dir() for c in d.iterdir())
+    except OSError:
+        return False
+
+
+def _browse_dir(p: Path) -> dict:
+    dirs = []
+    try:
+        for d in sorted(p.iterdir(), key=lambda x: x.name.lower()):
+            if not d.is_dir():
+                continue
+            if d.name.startswith(".") or d.name.startswith("$") \
+                    or d.name in _EXCLUDE_DIRS:
+                continue
+            dirs.append({"name": d.name, "path": str(d.resolve()),
+                         "has_children": _has_subdirs(d)})
+    except OSError:
+        pass
+    parent = str(p.parent) if p.parent != p else (
+        "" if sys.platform == "win32" else None)
+    return {"path": str(p), "parent": parent, "dirs": dirs}
+
+
+@app.get("/api/fs/browse")
+def fs_browse(path: str = Query(default="")):
+    """服务端目录浏览（浏览器无法枚举服务器文件夹）。只列目录、排除系统/隐藏目录。
+
+    path 为空 → Windows 列盘符 / 其他平台列 home；盘符根的 parent 为 ""（回盘符列表）。
+    """
+    if not path:
+        if sys.platform == "win32":
+            import string
+            dirs = [{"name": f"{letter}:", "path": f"{letter}:\\",
+                     "has_children": True}
+                    for letter in string.ascii_uppercase
+                    if Path(f"{letter}:\\").exists()]
+            return {"path": "", "parent": None, "dirs": dirs}
+        return _browse_dir(Path.home())
+    if ".." in Path(path).parts:
+        raise HTTPException(status_code=400, detail="路径不得包含 ..")
+    p = Path(path).resolve()
+    if not p.is_dir():
+        raise HTTPException(status_code=404, detail=f"不是目录：{p}")
+    return _browse_dir(p)
+
+
+@app.get("/api/fs/files")
+def fs_files(path: str = Query(...), ext: str = Query(default=".py")):
+    """列目录下指定扩展名的文件（默认 .py，供选择训练脚本）。"""
+    p = Path(path).resolve()
+    if not p.is_dir():
+        raise HTTPException(status_code=404, detail=f"不是目录：{p}")
+    try:
+        files = [f.name for f in sorted(p.iterdir(), key=lambda x: x.name.lower())
+                 if f.is_file() and f.suffix == ext]
+    except OSError:
+        files = []
+    return {"path": str(p), "files": files}
+
+
+@app.get("/api/projects")
+def projects_list():
+    act = PROJECTS.get_active()
+    return {"projects": PROJECTS.list_projects(),
+            "active_id": act["id"] if act else None}
+
+
+@app.get("/api/projects/active")
+def project_active():
+    act = PROJECTS.get_active()
+    if act is None:
+        raise HTTPException(status_code=404, detail="无激活项目")
+    return act
+
+
+@app.post("/api/projects")
+def project_create(body: ProjectCreateBody):
+    """新建/打开项目：目录已含 `.tansuo/settings.yaml` → 直接注册（打开）；
+    否则脚手架 `.tansuo/` 模板再注册（新建）。"""
+    dir_path = Path(body.dir).resolve()
+    if not dir_path.is_dir():
+        raise HTTPException(status_code=400,
+                            detail=f"项目目录不存在或不是目录：{body.dir}")
+    settings_path = dir_path / ".tansuo" / "settings.yaml"
+    space_path = dir_path / ".tansuo" / "search_space.yaml"
+    scaffolded = False
+    if not settings_path.exists():
+        _scaffold_project(dir_path, body.train_script)
+        scaffolded = True
+    try:
+        load_settings(settings_path)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"项目 settings.yaml 无效：{e}")
+    entry = PROJECTS.register(body.name or dir_path.name, dir_path,
+                              settings_path, space_path,
+                              train_script=body.train_script or "")
+    return {**entry, "scaffolded": scaffolded}
+
+
+@app.post("/api/projects/{project_id}/activate")
+def project_activate(project_id: str):
+    busy = _busy_reason()
+    if busy:
+        raise HTTPException(status_code=409, detail=busy)
+    try:
+        return PROJECTS.activate(project_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.delete("/api/projects/{project_id}")
+def project_delete(project_id: str):
+    PROJECTS.remove(project_id)   # 仅移除注册，不删文件（数据安全优先）
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------

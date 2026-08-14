@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -15,6 +16,12 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN = 'import json\nprint(\'##TANSUO## {"type": "final", "value": 0.7}\')\n'
+# 慢速训练脚本：每试验约 3s，供「运行中切换项目被拒」一类时序断言用
+TRAIN_SLOW = ('import time\n'
+              'print(\'##TANSUO## {"type": "epoch", "epoch": 0, '
+              '"metrics": {"val_acc": 0.5}}\')\n'
+              'time.sleep(3)\n'
+              'print(\'##TANSUO## {"type": "final", "value": 0.7}\')\n')
 PORT = 8123
 BASE = f"http://127.0.0.1:{PORT}"
 PASS = 0
@@ -340,6 +347,77 @@ with tempfile.TemporaryDirectory() as td:
            len(fin) == 1 and "budget_exhausted" in fin[0]["text"]["content"],
            str(_Cap.bodies[1:]))
         cap.shutdown()
+
+        print("== 14. 项目管理：注册 / 新建脚手架 / 激活切换 / 目录浏览 ==")
+        import urllib.error as _ue
+        pj = api("/api/projects")
+        ok("注册表至少 2 个项目（demo + env）", len(pj["projects"]) >= 2, str(pj))
+        ok("active_id 非空", pj["active_id"] is not None)
+        act = api("/api/projects/active")
+        ok("active 端点返回激活项", act.get("id") == pj["active_id"])
+
+        # 新建项目目录 + 慢速训练脚本（供运行中切换断言）
+        projc = tmp / "projC"
+        projc.mkdir()
+        (projc / "train.py").write_text(TRAIN_SLOW, encoding="utf-8")
+
+        # fs/browse：浏览 tmp 应见 projC；拒绝 ..
+        br = api("/api/fs/browse?path=" + urllib.parse.quote(str(tmp)))
+        ok("目录浏览列出 projC", any(d["name"] == "projC" for d in br["dirs"]), str(br))
+        try:
+            api("/api/fs/browse?path=" + urllib.parse.quote(str(tmp / "..")))
+            raise AssertionError("FAIL: 含 .. 的路径应被拒")
+        except _ue.HTTPError as e:
+            ok("目录浏览拒绝 ..（400）", e.code == 400)
+
+        # 新建项目 → 脚手架 .tansuo/
+        cr = api("/api/projects", {"name": "projC", "dir": str(projc),
+                                   "train_script": str(projc / "train.py")})
+        ok("新建项目返回 scaffolded=true", cr["scaffolded"] is True, str(cr))
+        ok(".tansuo/settings.yaml 已生成",
+           (projc / ".tansuo" / "settings.yaml").exists())
+        ok(".tansuo/search_space.yaml 已生成",
+           (projc / ".tansuo" / "search_space.yaml").exists())
+
+        # 激活新项目 → /api/runs 为空
+        api(f"/api/projects/{cr['id']}/activate", method="POST")
+        ok("激活后 active 指向新项目",
+           api("/api/projects/active")["id"] == cr["id"])
+        ok("新项目尚无分区", api("/api/runs")["runs"] == [])
+
+        # 新项目跑一次 → 验证 base_dir=projC 全链路（数据落 .tansuo/data）
+        api("/api/run/start", {"trials": 1, "no_agent": True})
+        stc = wait_idle()
+        ok("新项目运行正常退出", stc["exit_code"] == 0, str(stc))
+        ok("日志落在项目 .tansuo 目录内", ".tansuo" in (stc["log_path"] or ""),
+           str(stc.get("log_path")))
+        ok("新项目 summary 有 1 次完结",
+           api("/api/summary")["counts"]["completed"] == 1)
+
+        # 运行中切换项目 → 409
+        api("/api/run/start", {"trials": 2, "no_agent": True})
+        t0 = time.time()
+        while time.time() - t0 < 10 and not api("/api/run/status")["running"]:
+            time.sleep(0.1)
+        ok("新项目搜索已启动", api("/api/run/status")["running"])
+        demo_id = next(p["id"] for p in api("/api/projects")["projects"]
+                       if "内置示例" in p["name"])
+        try:
+            api(f"/api/projects/{demo_id}/activate", method="POST")
+            raise AssertionError("FAIL: 运行中切换项目应被拒")
+        except _ue.HTTPError as e:
+            ok("运行中切换项目被拒（409）", e.code == 409)
+        api("/api/run/stop", method="POST")
+        wait_idle()
+
+        # 切回 env 项目 → 历史分区仍在（前面已积累 >=5 个）
+        env_entry = next(p for p in api("/api/projects")["projects"]
+                         if Path(p["settings_path"]).resolve()
+                         == settings_yaml.resolve())
+        api(f"/api/projects/{env_entry['id']}/activate", method="POST")
+        ok("切回 env 项目历史分区仍在（>=5）",
+           len(api("/api/runs")["runs"]) >= 5,
+           str(len(api("/api/runs")["runs"])))
 
         print("\nWeb 冒烟全部通过")
     finally:
