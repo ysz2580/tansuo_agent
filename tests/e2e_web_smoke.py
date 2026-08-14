@@ -107,7 +107,11 @@ with tempfile.TemporaryDirectory() as td:
          "--port", str(PORT)],
         cwd=str(tmp), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         # 项目注册表隔离到临时目录：不污染用户真实的 ~/.tansuo_agent/projects.json
-        env={**os.environ, "TANSUO_PROJECT_STORE": str(tmp / "projects.json")})
+        # 假 LLM 端点：保证 setup 的 probe_endpoint 快速必败（exit 1），
+        # 即使开发机有真实凭据也不会命中真 LLM
+        env={**os.environ, "TANSUO_PROJECT_STORE": str(tmp / "projects.json"),
+             "ANTHROPIC_BASE_URL": "http://127.0.0.1:1",
+             "ANTHROPIC_AUTH_TOKEN": "smoke-fake"})
     try:
         # 等服务就绪
         t0 = time.time()
@@ -418,6 +422,56 @@ with tempfile.TemporaryDirectory() as td:
         ok("切回 env 项目历史分区仍在（>=5）",
            len(api("/api/runs")["runs"]) >= 5,
            str(len(api("/api/runs")["runs"])))
+
+        print("== 15. setup agent Web 化：互斥语义 + 子进程拉起（假端点必败） ==")
+        st0 = api("/api/setup/status")
+        ok("setup 初始空闲", st0["running"] is False and st0["exit_code"] is None)
+        try:
+            api("/api/projects/nonexistent/setup", method="POST")
+            raise AssertionError("FAIL: 未知项目 setup 应 404")
+        except _ue.HTTPError as e:
+            ok("未知项目 setup 被拒（404）", e.code == 404)
+        try:
+            api(f"/api/projects/{env_entry['id']}/setup", method="POST")
+            raise AssertionError("FAIL: 未登记训练脚本的项目 setup 应 400")
+        except _ue.HTTPError as e:
+            ok("未登记训练脚本 setup 被拒（400）", e.code == 400)
+
+        # 搜索运行中启动 setup → 409（反向互斥同理由 _busy_reason 统一裁决）
+        api(f"/api/projects/{cr['id']}/activate", method="POST")
+        api("/api/run/start", {"trials": 2, "no_agent": True})
+        t0 = time.time()
+        while time.time() - t0 < 10 and not api("/api/run/status")["running"]:
+            time.sleep(0.1)
+        ok("projC 搜索已启动（互斥前置）", api("/api/run/status")["running"])
+        try:
+            api(f"/api/projects/{cr['id']}/setup", method="POST")
+            raise AssertionError("FAIL: 搜索运行中 setup 应被拒")
+        except _ue.HTTPError as e:
+            ok("搜索运行中启动 setup 被拒（409）", e.code == 409)
+        api("/api/run/stop", method="POST")
+        wait_idle()
+
+        # 拉起 setup 子进程：假端点 → probe 必败 exit 1，日志含诊断
+        sp = api(f"/api/projects/{cr['id']}/setup", method="POST")
+        ok("setup 拉起返回 pid 与日志路径", bool(sp["pid"]) and bool(sp["log_path"]),
+           str(sp))
+        t0 = time.time()
+        st = None
+        while time.time() - t0 < 60:
+            st = api("/api/setup/status")
+            if st["exit_code"] is not None:
+                break
+            time.sleep(0.3)
+        else:
+            raise AssertionError("FAIL: setup 子进程 60s 未结束")
+        ok("假端点探测失败退出（exit_code=1）", st["exit_code"] == 1, str(st))
+        lg = api("/api/setup/log?tail=500")
+        ok("setup 日志含端点探测失败诊断", "端点探测失败" in lg["text"],
+           lg["text"][-300:])
+        ev = api("/api/setup/events")
+        ok("setup 事件端点可查（probe 失败未写 journal → 空列表）",
+           isinstance(ev["events"], list) and ev["events"] == [], str(ev))
 
         print("\nWeb 冒烟全部通过")
     finally:

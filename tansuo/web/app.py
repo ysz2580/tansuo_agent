@@ -33,6 +33,7 @@ from ..space import SearchSpace, SpaceError
 from ..study import create_or_load_study, dispose_study
 from .project_store import ProjectStore
 from .run_manager import RunManager
+from .setup_manager import SetupManager
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # 环境变量在 `cli.py web` 导入本模块前注入（STAR #010）——模块级捕获作 bootstrap/兜底。
@@ -47,6 +48,7 @@ PROJECTS = ProjectStore(PROJECT_ROOT,
                         store_path=os.environ.get("TANSUO_PROJECT_STORE"))
 PROJECTS.bootstrap_from_env(_ENV_SETTINGS, _ENV_SPACE)
 RUN = RunManager(PROJECT_ROOT)
+SETUP = SetupManager(PROJECT_ROOT)
 
 
 def _active_paths() -> tuple[str, str, Path]:
@@ -392,6 +394,9 @@ def _orphan_cleanup_for(cohort, project_dir: Path) -> list[int]:
 def run_start(body: RunStartBody):
     # 顺序：先解析目标分区 → 清理目标分区（及上次运行分区）的孤儿试验 →
     # 在**目标分区内**统计已完结数做「本次新增 N → 总预算」换算 → 显式 --cohort 启动 CLI。
+    busy = _busy_reason()
+    if busy:
+        raise HTTPException(status_code=409, detail=busy)
     settings_path, space_path, project_dir = _active_paths()
     try:
         settings0 = load_settings(settings_path)
@@ -799,9 +804,14 @@ _EXCLUDE_DIRS = {"Windows", "Program Files", "Program Files (x86)", "ProgramData
 
 
 def _busy_reason() -> str | None:
-    """有任务在跑时返回原因（切换项目 / 启动 setup 前调用）；空闲返回 None。"""
+    """有任务在跑时返回原因（切换项目 / 启动搜索 / 启动 setup 前调用）；空闲返回 None。
+
+    setup 与 run 硬互斥：两者都会写 settings/空间/分区状态，并发会互相踩踏。
+    """
     if RUN.running:
         return f"有搜索正在运行（pid={RUN.pid}），请先停止"
+    if SETUP.running:
+        return f"配置 agent 正在运行（pid={SETUP.pid}），请等待结束或先停止"
     return None
 
 
@@ -945,6 +955,86 @@ def project_activate(project_id: str):
 def project_delete(project_id: str):
     PROJECTS.remove(project_id)   # 仅移除注册，不删文件（数据安全优先）
     return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# 配置 agent（setup）Web 化：子进程驱动 `cli.py setup`，与搜索硬互斥
+# ------------------------------------------------------------------
+
+@app.post("/api/projects/{project_id}/setup")
+def project_setup(project_id: str):
+    """对指定项目跑配置 agent：读训练脚本 → LLM 起草 settings + search_space。
+
+    不要求该项目处于激活态（路径全部显式传给子进程），但要求登记了训练脚本。
+    """
+    busy = _busy_reason()
+    if busy:
+        raise HTTPException(status_code=409, detail=busy)
+    entry = next((p for p in PROJECTS.list_projects() if p["id"] == project_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    if not entry.get("train_script"):
+        raise HTTPException(status_code=400,
+                            detail="该项目未登记训练脚本，无法自动配置"
+                                   "（新建项目时请选择主训练脚本）")
+    settings_path = entry["settings_path"]
+    space_path = entry.get("space_path") or ""
+    project_dir = Path(entry["dir"])
+    try:
+        settings = load_settings(settings_path)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    data_dir = abs_data_dir(settings, project_dir)
+    try:
+        return SETUP.start(entry["train_script"], settings_path, space_path,
+                           project_dir, data_dir)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/setup/stop")
+def setup_stop():
+    try:
+        return SETUP.stop()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.get("/api/setup/status")
+def setup_status():
+    return SETUP.status()
+
+
+@app.get("/api/setup/log")
+def setup_log(tail: int = Query(default=200, ge=1, le=5000)):
+    st = SETUP.status()
+    st["text"] = SETUP.log_tail(tail)
+    return st
+
+
+def _setup_journal_path() -> Path | None:
+    """setup_journal.jsonl 定位：优先本次会话绑定的项目，回退当前激活项目
+    （服务重启后 SETUP 无绑定，仍能看历史会话事件）。"""
+    settings_path = SETUP.settings_path or _active_paths()[0]
+    project_dir = SETUP.project_dir or _active_paths()[2]
+    try:
+        settings = load_settings(settings_path)
+    except ConfigError:
+        return None
+    return abs_data_dir(settings, project_dir) / "setup_journal.jsonl"
+
+
+@app.get("/api/setup/events")
+def setup_events():
+    """setup 会话事件流（journal）。事件 kind 与调参会话同构
+    （session_start / agent_* / finish），前端渲染逻辑可复用 AgentPage。"""
+    jp = _setup_journal_path()
+    if jp is None or not jp.exists():
+        return {"events": [],
+                "tokens": {"rounds": 0, "input_tokens": 0,
+                           "output_tokens": 0, "total_tokens": 0}}
+    j = Journal(jp)
+    return {"events": j.load_events(), "tokens": j.agent_token_summary()}
 
 
 # ------------------------------------------------------------------
