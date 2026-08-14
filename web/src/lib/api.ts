@@ -32,6 +32,7 @@ export interface Summary {
   best: { trial: number; value: number; params: Record<string, unknown> } | null
   top_k: { trial: number; value: number; params: Record<string, unknown> }[]
   contrast: Record<string, unknown>
+  importances: Record<string, number>
   convergence: string
   experiment: string
   budget_total: number

@@ -1,10 +1,12 @@
-import { api, type Summary } from "@/lib/api"
+import { api, type Summary, type TrialsResp } from "@/lib/api"
 import { useCohort } from "@/lib/cohort"
 import { usePolling } from "@/lib/usePolling"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { CurvesChart, ProgressChart } from "@/components/CurvesChart"
+import { ImportanceChart } from "@/components/ImportanceChart"
+import { ParamRelationChart } from "@/components/ParamRelationChart"
 
 function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
   return (
@@ -35,6 +37,8 @@ export default function DashboardPage() {
   const cohort = useCohort()
   const { data: summary, error: sumErr } = usePolling<Summary>(() => api.summary(cohort), 5000)
   const { data: curves } = usePolling(() => api.curves(cohort), 10000)
+  // 试验列表：主指标走势与参数-取值关系图共用同一路轮询
+  const { data: trialsData } = usePolling(() => api.trials(cohort), 8000)
 
   if (sumErr) {
     return <Alert variant="destructive"><AlertDescription>加载失败：{sumErr}</AlertDescription></Alert>
@@ -80,7 +84,7 @@ export default function DashboardPage() {
             <CardTitle className="text-base">主指标走势（按试验序号）</CardTitle>
           </CardHeader>
           <CardContent>
-            <ProgressWithTrials primary={summary.primary} maximize={maximize} cohort={cohort} />
+            <ProgressWithTrials primary={summary.primary} maximize={maximize} data={trialsData} />
           </CardContent>
         </Card>
         <Card>
@@ -113,14 +117,35 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
       )}
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">参数重要度（哪些参数真正影响 {summary.primary}）</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ImportanceChart importances={summary.importances} />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">参数-取值关系（探索参数取值与 {summary.primary} 的关系）</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ParamRelationChart
+            trials={trialsData?.trials ?? []}
+            primary={summary.primary}
+            direction={summary.direction}
+          />
+        </CardContent>
+      </Card>
     </div>
   )
 }
 
-/** 从 /api/trials 取完成试验画主指标走势（独立轮询，避免拖慢顶部卡片）。 */
-function ProgressWithTrials({ primary, maximize, cohort }:
-                             { primary: string; maximize: boolean; cohort: string | null }) {
-  const { data } = usePolling(() => api.trials(cohort), 8000)
+/** 从已轮询的 /api/trials 数据画主指标走势（轮询在页面级，与关系图共用）。 */
+function ProgressWithTrials({ primary, maximize, data }:
+                             { primary: string; maximize: boolean; data: TrialsResp | null }) {
   if (!data) return <div className="text-muted-foreground py-8 text-center text-sm">加载中…</div>
   let best = maximize ? -Infinity : Infinity
   const points = data.trials

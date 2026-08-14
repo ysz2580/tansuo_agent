@@ -1,4 +1,4 @@
-"""试验结果分析：汇总、top-k、参数分布对比、学习曲线、收敛信号。
+"""试验结果分析：汇总、top-k、参数分布对比、参数重要度、学习曲线、收敛信号。
 
 供 agent 工具（get_study_summary / get_learning_curves）与最终报告共用。
 """
@@ -56,6 +56,29 @@ def param_contrast(ranked_trials: list) -> dict:
     return out
 
 
+def param_importances(study) -> dict:
+    """参数重要度排序：返回 {参数名: 重要度}（归一化、和≈1，值越大影响越大）。
+
+    optuna 默认 fANOVA 评估器依赖 scikit-learn（本项目未安装），改用 PED-ANOVA
+    （optuna v3.6+，仅依赖 numpy，随 optuna 自带）。守卫与 param_contrast 同范式：
+    完成试验 <2 直接返回 {}（评估器会抛 ValueError）；试验过多（>500）跳过以封顶
+    计算开销；任何评估失败都兜底 {}——分析层不炸汇总。
+    """
+    done = completed_trials(study)
+    if len(done) < 2 or len(done) > 500:
+        return {}
+    try:
+        import warnings
+
+        from optuna.importance import PedAnovaImportanceEvaluator
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # 实验性 API 警告不打扰调用方
+            return optuna.importance.get_param_importances(
+                study, evaluator=PedAnovaImportanceEvaluator())
+    except Exception:
+        return {}
+
+
 def convergence_hint(study, settings, window: int = 5) -> str:
     """收敛信号：最近 window 次完成试验相对之前最优有没有改进。"""
     maximize = settings.metrics.primary.direction == "maximize"
@@ -99,6 +122,7 @@ def summarize(study, settings, top_k: int = 5) -> dict:
         "top_k": [{"trial": t.number, "value": t.value, "params": dict(t.params)}
                   for t in rk[:top_k]],
         "contrast": param_contrast(rk),
+        "importances": param_importances(study),
         "convergence": convergence_hint(study, settings),
     }
 

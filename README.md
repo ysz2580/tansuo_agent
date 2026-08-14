@@ -27,14 +27,14 @@ E:\tansuo_agent\
 │   ├── space.py            # 搜索空间：envelope 护栏 + patch 引擎 + 快照
 │   ├── orchestrator.py     # 主循环：预算中枢、唤醒策略、断点续跑
 │   ├── runner.py/adapter.py# 试验执行 + 子进程/函数适配器（协议见下）
-│   └── analysis/report.py  # 汇总分析 + Markdown 报告 + best.yaml
+│   └── analysis/report.py  # 汇总分析（含参数重要度）+ Markdown 报告 + best.yaml
 ├── tansuo\web\             # Web 后端：FastAPI（只读查询 + 运行驱动 + API 配置切换）
 ├── web\                    # Web 前端：Vite + React + TS + Tailwind + shadcn/ui
 ├── demo\                   # 演示场景（MNIST 小 CNN，CPU 可跑）
 │   ├── configs\            # settings.yaml + search_space.yaml + prompts.yaml（带详尽注释）
 │   ├── train_mnist.py      # 演示训练脚本（遵守子进程协议）
 │   └── my_adapter_template.py  # 你自己的训练任务接入模板
-└── tests\                  # 分区 116 / 通知 32 / 空间护栏 34 / 条件空间 30 / 运行时 29 / 提示词 28 / 权限降级 21 / 对比 22 / 热启动 16 / 协议 12 断言
+└── tests\                  # 分区 116 / 通知 32 / 空间护栏 34 / 条件空间 30 / 运行时 29 / 提示词 28 / 权限降级 21 / 对比 28 / 热启动 16 / 协议 12 断言
                             # + e2e_cli_smoke / e2e_web_smoke 端到端冒烟（真实子进程）
 ```
 
@@ -50,8 +50,8 @@ python cli.py run                    # ④ 正式跑：30 次试验，agent 每 
 ```
 
 跑完看报告与 `best.yaml`（在当次搜索的分区目录内，如
-`demo/data/runs/0001-…/reports/report.md`；最优配置、top-k、参数对比、空间演化
-时间线、agent 决策摘要一应俱全）。
+`demo/data/runs/0001-…/reports/report.md`；最优配置、top-k、参数对比、参数重要度、
+空间演化时间线、agent 决策摘要一应俱全）。
 
 > 环境变量：`ANTHROPIC_AUTH_TOKEN`（必需）与 `ANTHROPIC_BASE_URL`（可选，默认
 > Anthropic 官方端点；用兼容端点如阿里云百炼时设置）。配置文件支持
@@ -162,7 +162,8 @@ Web 界面顶部的分区选择器同样可切换回看任意历史分区；仪�
 
 ## Web 可视化界面（shadcn/ui 前端）
 
-仪表盘（试验统计/最优配置/收敛信号/学习曲线）、试验表（逐 epoch 曲线）、
+仪表盘（试验统计/最优配置/收敛信号/学习曲线/**参数重要度**/**参数-取值关系图**）、
+试验表（逐 epoch 曲线）、
 搜索空间演化（补丁时间线）、agent 决策时间线（含本分区累计 token 用量）、
 **提示词管理**（agent 三条提示词的编辑/预览/版本/回滚）、**跨分区对比**
 （同目标分区的最优值/参数对照/学习曲线叠加，目标分组可切换）、运行控制
@@ -197,6 +198,11 @@ cd web && npm run dev            # 前端 :5173，/api 自动代理到 :8000
 - **token 用量**：agent 页顶部展示本分区所有唤醒累计的大模型 token 用量
   （输入/输出分开计，按 journal 审计事件汇总，跨续跑会话累加）；每轮唤醒结束
   事件也注明当轮用量。
+- **探索分析**：仪表盘底部两块——**参数重要度**（Optuna PED-ANOVA 评估，
+  归一化之和≈1，值越大该参数对主指标影响越大；完成试验过少或过多时如实提示
+  无法计算）与**参数-取值关系图**（任选一个参数看它的取值与主指标的散点关系，
+  数值/分类参数各自适配坐标轴，最优试验红点高亮）。agent 的汇总工具同步可见
+  重要度，用于聚焦高影响维度、冻结低影响维度。
 - **提示词管理**：「提示词」页可编辑 agent 的三条提示词（调参 system / 每轮唤醒简报 /
   配置 setup）。模板用 `{{变量}}` 占位符（如 `{{total_trials}}`、`{{space_describe}}`），
   渲染时按运行时上下文填充；「预览渲染」先看效果再保存，未填充的占位符会被列出。

@@ -1,6 +1,6 @@
 """Markdown 报告 + best.yaml 导出。
 
-报告内容：最优配置、top-k、参数对比、空间演化时间线、agent 决策摘要、
+报告内容：最优配置、top-k、参数对比、参数重要度、空间演化时间线、agent 决策摘要、
 watch 指标走势、收敛信号。
 """
 from __future__ import annotations
@@ -110,6 +110,21 @@ def generate_report(settings, study, space, journal: Journal,
         md.append("## 参数分布对比（top25% vs bottom25%）")
         md.append("")
         md += _fmt_contrast(s["contrast"])
+        md.append("")
+
+    # ---------- 参数重要度 ----------
+    md.append("## 参数重要度")
+    md.append("")
+    if s["importances"]:
+        md.append("按 Optuna PED-ANOVA 重要度评估（已归一化，各参数之和≈1），"
+                  "值越大对主指标影响越大：")
+        md.append("")
+        for name, imp in sorted(s["importances"].items(),
+                                key=lambda kv: kv[1], reverse=True):
+            md.append(f"- **{name}**：{imp:.3f}")
+        md.append("")
+    else:
+        md.append("（完成试验过少或过多，无法计算参数重要度）")
         md.append("")
 
     # ---------- 空间演化 ----------

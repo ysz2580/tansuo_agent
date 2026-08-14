@@ -23,7 +23,8 @@ TUNING_TOOLS = [
     {
         "name": "get_study_summary",
         "description": ("获取研究汇总：试验计数、当前最优、top-k 配置、"
-                        "top25%/bottom25% 参数分布对比、收敛信号、剩余预算。"
+                        "top25%/bottom25% 参数分布对比、参数重要度（哪些维度影响最大）、"
+                        "收敛信号、剩余预算。"
                         "每轮唤醒必须第一个调用。"),
         "input_schema": {
             "type": "object",

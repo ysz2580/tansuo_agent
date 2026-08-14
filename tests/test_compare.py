@@ -15,6 +15,7 @@ sys.path.insert(0, str(TESTS_DIR))
 import optuna                                        # noqa: E402
 from optuna.distributions import FloatDistribution   # noqa: E402
 
+from tansuo.analysis import param_importances, summarize            # noqa: E402
 from tansuo.cohort import CohortError, apply_cohort, resolve_for_run  # noqa: E402
 from tansuo.compare import (CompareError, compare_cohorts,            # noqa: E402
                             select_compare_cohorts)
@@ -111,8 +112,51 @@ def test_compare(tmp: Path):
     ok("incomplete 分区被跳过", all(c.id != "0009-19000101-000000" for c in sel2))
 
 
+TWO_PARAM_DIST = {"lr": FloatDistribution(0.01, 0.1),
+                  "dropout": FloatDistribution(0.0, 0.5)}
+
+
+def test_param_importances(tmp: Path):
+    # ---- 2 参数 × 6 试验：value 主要由 lr 驱动 ----
+    s = make_settings(tmp, "imp", script_text=CHILD_SIMPLE, direction="maximize")
+    c1, _ = resolve_for_run(s, base_dir=tmp)
+    sc = copy.deepcopy(s)
+    apply_cohort(sc, c1)
+    study = create_or_load_study(sc)
+    specs = [(0.90, 0.02, 0.1), (0.85, 0.03, 0.2), (0.70, 0.05, 0.1),
+             (0.60, 0.07, 0.3), (0.55, 0.08, 0.4), (0.50, 0.09, 0.2)]
+    for value, lr, dropout in specs:
+        study.add_trial(optuna.trial.create_trial(
+            value=value, params={"lr": lr, "dropout": dropout},
+            distributions=TWO_PARAM_DIST, state=optuna.trial.TrialState.COMPLETE))
+
+    print("== 参数重要度 ==")
+    imps = param_importances(study)
+    ok("2 参数 6 试验：两键均存在", set(imps) == {"lr", "dropout"}, str(imps))
+    ok("重要度为 [0,1] 浮点",
+       all(isinstance(v, float) and 0.0 <= v <= 1.0 for v in imps.values()), str(imps))
+    ok("归一化和≈1.0", abs(sum(imps.values()) - 1.0) < 1e-6, str(imps))
+    sm = summarize(study, sc)
+    ok("summarize 透出 importances 键且与独立函数一致", sm["importances"] == imps)
+    dispose(study)
+
+    # ---- 1 试验 → {}（评估器样本不足守卫）----
+    c2, _ = resolve_for_run(s, force_new=True, base_dir=tmp)
+    sc2 = copy.deepcopy(s)
+    apply_cohort(sc2, c2)
+    study2 = create_or_load_study(sc2)
+    study2.add_trial(optuna.trial.create_trial(
+        value=0.8, params={"lr": 0.05, "dropout": 0.2},
+        distributions=TWO_PARAM_DIST, state=optuna.trial.TrialState.COMPLETE))
+    ok("仅 1 次试验 → {}（避免评估器 ValueError）", param_importances(study2) == {})
+    ok("重要度为空时 summarize 也不炸", summarize(study2, sc2)["importances"] == {})
+    dispose(study2)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as td:
         test_compare(Path(td))
+    with tempfile.TemporaryDirectory() as td:
+        test_param_importances(Path(td))
     from test_cohort import PASS as _P
     print(f"\n全部通过：{_P} 项断言")

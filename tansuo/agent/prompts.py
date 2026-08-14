@@ -52,7 +52,7 @@ DEFAULT_PROMPTS: dict[str, str] = {
 
 # 你的工作方式
 每轮被唤醒时：
-1. **必调** get_study_summary：看计数、最优、top-k、参数分布对比（top25% vs bottom25%）、收敛信号、剩余预算。
+1. **必调** get_study_summary：看计数、最优、top-k、参数分布对比（top25% vs bottom25%）、参数重要度（importances）、收敛信号、剩余预算。重要度揭示哪些参数真正影响主指标——高影响维度优先聚焦搜索，持续低影响的维度可考虑冻结以省预算。
 2. 需要时调 get_learning_curves 判断状态：曲线还在明显下降→欠拟合（epochs 偏小）；loss 尖峰/NaN→发散（lr 过大）；已平台→该配置收敛了。
 3. 基于证据做决策，典型动作：
    - 参数分布对比显示某数值参数 top 组集中在下半区 → edit_search_space 用 narrow 收窄；

@@ -130,6 +130,8 @@ with tempfile.TemporaryDirectory() as td:
             raise AssertionError("存在失败试验，诊断信息见上")
         ok("2 次试验完结", s["counts"]["completed"] == 2,
            detail=json.dumps(s, ensure_ascii=False))
+        ok("summary 含参数重要度字段（dict；2 试验可能尚不可算）",
+           isinstance(s.get("importances"), dict), str(s.get("importances")))
         ok("日志落在分区内", "runs" in (st["log_path"] or "") and "0001-" in st["log_path"])
 
         print("== 3. /api/runs 可比性 ==")
@@ -181,6 +183,7 @@ with tempfile.TemporaryDirectory() as td:
         ok("报告生成在 0001 分区内", c1 in g["report"])
         rep = api(f"/api/report?cohort={c1}")
         ok("报告可读且含分区头", rep["exists"] and f"记录分区：{c1}" in rep["content"])
+        ok("报告含参数重要度段", "## 参数重要度" in rep["content"])
 
         print("== 9. fresh 别名 → 新分区而非删除 ==")
         before = {x["id"] for x in api("/api/runs")["runs"]}
