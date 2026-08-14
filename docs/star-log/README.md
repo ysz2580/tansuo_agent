@@ -24,5 +24,6 @@
 | 2026-08-14 | 016 | [三项用户视角优化（提示词版本进分区标记 / 跑完 webhook 通知 / LLM 花费可见）的设计权衡，及写回正则吞行尾注释的真实 bug](2026-08-14-016-prompt-mark-webhook-notify-token-usage.md) | `设计决策` `webhook通知` `token用量` `分区标记` `配置写回` | ✅ 已解决 |
 | 2026-08-14 | 017 | [参数重要度与参数-取值关系图的设计取舍，及 optuna 默认重要度评估器依赖 sklearn 的隐性陷阱](2026-08-14-017-param-importance-relation-chart.md) | `设计决策` `optuna` `参数重要度` `可视化` `依赖陷阱` | ✅ 已解决 |
 | 2026-08-14 | 018 | [直连兜底推送只清 http.proxy 不够：.git/config 的 [http]/[https] 各有一条代理；且 Test-NetConnection 通过 ≠ TCP 可用](2026-08-14-018-push-https-proxy-fallback-incomplete.md) | `git` `代理` `推送` `windows` `网络诊断` | 🔴 未解决 |
+| 2026-08-14 | 019 | [一键启动 bat 三连坑：LF 换行让 cmd 解析碎成片段、beta UTF-8 系统让 Default 编码撒谎、Vite 8 默认只绑 IPv6](2026-08-14-019-dev-bat-crlf-utf8-vite-ipv6.md) | `windows` `bat` `编码` `换行符` `vite` `一键启动` | ✅ 已解决 |
 
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中

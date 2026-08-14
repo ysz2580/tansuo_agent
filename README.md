@@ -183,6 +183,8 @@ cd web && npm install && npm run build
 # 方式二（开发热重载）：前后端分开跑
 python cli.py web                # 后端 :8000
 cd web && npm run dev            # 前端 :5173，/api 自动代理到 :8000
+
+# 或双击仓库根目录 dev.bat 一键启动前后端（各自独立窗口，关窗口即停）
 ```
 
 - **运行控制**：界面上「开始搜索」等价于 `python cli.py run`（子进程驱动，完整复用

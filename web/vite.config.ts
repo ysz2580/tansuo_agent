@@ -12,6 +12,8 @@ export default defineConfig({
     },
   },
   server: {
+    // 显式绑 IPv4 loopback：默认只绑 [::1]，http://127.0.0.1:5173 会拒连
+    host: "127.0.0.1",
     proxy: {
       // 开发模式下把 /api 代理到 FastAPI 后端（python cli.py web）
       "/api": {
