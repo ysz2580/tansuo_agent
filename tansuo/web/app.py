@@ -30,19 +30,40 @@ from ..config import ConfigError, load_settings
 from ..journal import TRIAL_END, Journal
 from ..space import SearchSpace, SpaceError
 from ..study import create_or_load_study, dispose_study
+from .project_store import ProjectStore
 from .run_manager import RunManager
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SETTINGS_PATH = os.environ.get(
-    "TANSUO_SETTINGS", str(PROJECT_ROOT / "demo" / "configs" / "settings.yaml"))
-SPACE_PATH = os.environ.get(
-    "TANSUO_SPACE", str(PROJECT_ROOT / "demo" / "configs" / "search_space.yaml"))
+# 环境变量在 `cli.py web` 导入本模块前注入（STAR #010）——模块级捕获作 bootstrap/兜底。
+_ENV_SETTINGS = os.environ.get("TANSUO_SETTINGS")
+_ENV_SPACE = os.environ.get("TANSUO_SPACE")
 
 app = FastAPI(title="tansuo_agent Web", description="智能调参 agent 可视化后端")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
-RUN = RunManager(PROJECT_ROOT, SETTINGS_PATH, SPACE_PATH)
+PROJECTS = ProjectStore(PROJECT_ROOT,
+                        store_path=os.environ.get("TANSUO_PROJECT_STORE"))
+PROJECTS.bootstrap_from_env(_ENV_SETTINGS, _ENV_SPACE)
+RUN = RunManager(PROJECT_ROOT)
+
+
+def _active_paths() -> tuple[str, str, Path]:
+    """当前激活项目的 (settings_path, space_path, project_dir)。
+
+    ProjectStore 激活项优先（且 settings 实际存在）；否则回退环境变量 + PROJECT_ROOT
+    （保持 STAR #010 的历史语义：`cli.py web --settings` 直接起也照旧工作）。
+    project_dir 是 abs_data_dir/code_fingerprint 的 base_dir，也是子进程 cwd。
+    """
+    p = PROJECTS.get_active()
+    if p and p.get("settings_path") and Path(p["settings_path"]).exists():
+        space = p.get("space_path") or ""
+        return p["settings_path"], space, Path(p["dir"])
+    return (
+        _ENV_SETTINGS or str(PROJECT_ROOT / "demo" / "configs" / "settings.yaml"),
+        _ENV_SPACE or str(PROJECT_ROOT / "demo" / "configs" / "search_space.yaml"),
+        PROJECT_ROOT,
+    )
 
 
 # ------------------------------------------------------------------
@@ -69,9 +90,10 @@ def _load_for(cohort_id: str | None = None):
     cohort_id 指定 → 该分区；缺省 → 最新分区；无任何分区 → 扁平布局（新装行为不变）。
     GET 路径不做物理迁移——未迁移的旧布局以虚拟 legacy 分区呈现。
     """
-    settings = load_settings(SETTINGS_PATH)
+    settings_path, space_path, project_dir = _active_paths()
+    settings = load_settings(settings_path)
     cohort = None
-    root = abs_data_dir(settings, PROJECT_ROOT)
+    root = abs_data_dir(settings, project_dir)
     if cohort_id:
         cohort = load_cohort(root, cohort_id, settings=settings)
         apply_cohort(settings, cohort)
@@ -81,7 +103,7 @@ def _load_for(cohort_id: str | None = None):
             cohort = cohorts[-1]
             apply_cohort(settings, cohort)
     data_dir = Path(settings.data_dir)
-    space = _load_space_with_snapshots(Path(SPACE_PATH), data_dir)
+    space = _load_space_with_snapshots(Path(space_path), data_dir)
     study = create_or_load_study(settings)
     journal = Journal(data_dir / "journal.jsonl")
     return settings, space, study, journal, cohort
@@ -123,10 +145,11 @@ def summary(cohort: str | None = Query(default=None)):
     s["fingerprint_changed"] = False
     if coh is not None and not coh.virtual and coh.meta.get("code_hash"):
         try:
-            root = abs_data_dir(load_settings(SETTINGS_PATH), PROJECT_ROOT)
+            settings_path, _, project_dir = _active_paths()
+            root = abs_data_dir(load_settings(settings_path), project_dir)
             latest = [c for c in list_cohorts(root) if not c.virtual]
             if latest and latest[-1].id == coh.id:
-                fp = code_fingerprint(settings, PROJECT_ROOT)
+                fp = code_fingerprint(settings, project_dir)
                 s["fingerprint_changed"] = (
                     fp.code_hash != coh.meta.get("code_hash")
                     or fp.objective_hash != coh.meta.get("objective_hash")
@@ -249,12 +272,13 @@ def time_iso(ts: float) -> str:
 @app.get("/api/runs")
 def runs_list():
     """记录分区列表 + 当前双指纹 + 各分区与当前指纹的可比性。"""
+    settings_path, _, project_dir = _active_paths()
     try:
-        settings = load_settings(SETTINGS_PATH)
+        settings = load_settings(settings_path)
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
-    root = abs_data_dir(settings, PROJECT_ROOT)
-    fp = code_fingerprint(settings, PROJECT_ROOT)
+    root = abs_data_dir(settings, project_dir)
+    fp = code_fingerprint(settings, project_dir)
     from ..agent.prompt_store import current_version
     prompt_version_now = current_version(settings)
     items = []
@@ -307,14 +331,15 @@ def runs_compare(cohorts: str | None = Query(
         default=None,
         description="参与对比的分区 ID（逗号分隔）；缺省 = 与当前目标指纹相同的全部分区")):
     """跨分区对比：优化目标指纹相同的分区并排比最优值 / top-k / 最优试验学习曲线。"""
+    settings_path, _, project_dir = _active_paths()
     try:
-        settings = load_settings(SETTINGS_PATH)
+        settings = load_settings(settings_path)
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
     ids = [s.strip() for s in cohorts.split(",") if s.strip()] if cohorts else None
     try:
-        return compare_cohorts(abs_data_dir(settings, PROJECT_ROOT), ids, settings,
-                               base_dir=PROJECT_ROOT)
+        return compare_cohorts(abs_data_dir(settings, project_dir), ids, settings,
+                               base_dir=project_dir)
     except CompareError as e:      # 目标不一致等不可比情形（先于 CohortError 捕获）
         raise HTTPException(status_code=400, detail=str(e))
     except CohortError as e:       # 分区不存在 / 无分区可比
@@ -350,14 +375,14 @@ def run_log(tail: int = Query(default=200, ge=1, le=5000)):
     return st
 
 
-def _orphan_cleanup_for(cohort) -> list[int]:
+def _orphan_cleanup_for(cohort, project_dir: Path) -> list[int]:
     """清理指定分区的孤儿 RUNNING 试验；cohort=None → 扁平布局根目录。"""
     try:
-        s = load_settings(SETTINGS_PATH)
+        s = load_settings(_active_paths()[0])
         if cohort is not None:
             apply_cohort(s, cohort)
         journal = Journal(Path(s.data_dir) / "journal.jsonl")
-        return _mark_orphaned_running_as_failed(s, journal)
+        return _mark_orphaned_running_as_failed(s, journal, project_dir)
     except (ConfigError, CohortError, sqlite3.Error):
         return []
 
@@ -366,15 +391,16 @@ def _orphan_cleanup_for(cohort) -> list[int]:
 def run_start(body: RunStartBody):
     # 顺序：先解析目标分区 → 清理目标分区（及上次运行分区）的孤儿试验 →
     # 在**目标分区内**统计已完结数做「本次新增 N → 总预算」换算 → 显式 --cohort 启动 CLI。
+    settings_path, space_path, project_dir = _active_paths()
     try:
-        settings0 = load_settings(SETTINGS_PATH)
+        settings0 = load_settings(settings_path)
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
-    root = abs_data_dir(settings0, PROJECT_ROOT)
+    root = abs_data_dir(settings0, project_dir)
     try:
         target, info = resolve_for_run(settings0,
                                        force_new=body.new_cohort or body.fresh,
-                                       note=body.note, base_dir=PROJECT_ROOT)
+                                       note=body.note, base_dir=project_dir)
     except CohortError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -382,12 +408,12 @@ def run_start(body: RunStartBody):
         try:
             prev = load_cohort(root, RUN.last_cohort, settings=settings0)
             if not prev.virtual:
-                _orphan_cleanup_for(prev)
+                _orphan_cleanup_for(prev, project_dir)
         except CohortError:
             pass
     elif RUN.last_cohort is None:
-        _orphan_cleanup_for(None)   # 升级前的扁平布局可能有历史孤儿
-    _orphan_cleanup_for(target)
+        _orphan_cleanup_for(None, project_dir)   # 升级前的扁平布局可能有历史孤儿
+    _orphan_cleanup_for(target, project_dir)
 
     trials_arg = body.trials
     if trials_arg is not None:
@@ -399,7 +425,7 @@ def run_start(body: RunStartBody):
         else:
             study_t = None
             try:
-                s_t = load_settings(SETTINGS_PATH)
+                s_t = load_settings(settings_path)
                 apply_cohort(s_t, target)
                 study_t = create_or_load_study(s_t)
                 finished = len(study_t.get_trials(
@@ -413,7 +439,9 @@ def run_start(body: RunStartBody):
                     dispose_study(study_t)
         trials_arg = finished + trials_arg
     try:
-        return RUN.start(target.path, trials=trials_arg,
+        return RUN.start(target.path, settings_path=settings_path,
+                         space_path=space_path, project_dir=project_dir,
+                         trials=trials_arg,
                          wake_every=body.wake_every, no_agent=body.no_agent,
                          workers=body.workers, max_duration_h=body.max_duration_h,
                          cohort=target.id, note=body.note)
@@ -430,23 +458,24 @@ def run_stop():
     # 杀进程树不会触发 orchestrator 的 FINISH 逻辑，进行中的试验会永远停在 RUNNING。
     # 把它如实标记为 FAIL（reason 写进 journal），避免仪表盘"进行中"计数永久失真。
     # 清理对象是本次运行所在的分区（RUN.last_cohort），而不是"最新分区"。
+    _, _, project_dir = _active_paths()
     marked: list[int] = []
     if RUN.last_cohort:
         try:
-            s0 = load_settings(SETTINGS_PATH)
-            c = load_cohort(abs_data_dir(s0, PROJECT_ROOT), RUN.last_cohort,
+            s0 = load_settings(_active_paths()[0])
+            c = load_cohort(abs_data_dir(s0, project_dir), RUN.last_cohort,
                             settings=s0)
-            marked = _orphan_cleanup_for(c)
+            marked = _orphan_cleanup_for(c, project_dir)
         except (ConfigError, CohortError):
             pass
     else:
-        marked = _orphan_cleanup_for(None)
+        marked = _orphan_cleanup_for(None, project_dir)
     if marked:
         st["marked_failed"] = marked
     return st
 
 
-def _mark_orphaned_running_as_failed(settings, journal) -> list[int]:
+def _mark_orphaned_running_as_failed(settings, journal, project_dir: Path) -> list[int]:
     """把被强制停止遗留的 RUNNING 试验改为 FAIL。返回处理的试验编号。"""
     url = settings.storage.url
     if not url.startswith("sqlite:///"):
@@ -454,7 +483,7 @@ def _mark_orphaned_running_as_failed(settings, journal) -> list[int]:
     db_rel = url[len("sqlite:///"):]
     db_path = Path(db_rel)
     if not db_path.is_absolute():
-        db_path = PROJECT_ROOT / db_rel
+        db_path = Path(project_dir) / db_rel
     if not db_path.exists():
         return []
     con = sqlite3.connect(str(db_path))
@@ -491,7 +520,7 @@ class AgentConfigBody(BaseModel):
 def _agent_env_refs() -> dict:
     """检查 settings.yaml 原文中 base_url/auth_token 是否为 ${ENV:...} 引用。"""
     try:
-        text = Path(SETTINGS_PATH).read_text(encoding="utf-8")
+        text = Path(_active_paths()[0]).read_text(encoding="utf-8")
     except OSError:
         return {"base_url": False, "auth_token": False}
     return {
@@ -502,7 +531,7 @@ def _agent_env_refs() -> dict:
 
 def _effective_cfg(body: AgentConfigBody):
     """请求字段 + 当前 settings + 环境变量兜底 → 用于探测的临时 AgentCfg。"""
-    settings = load_settings(SETTINGS_PATH)
+    settings = load_settings(_active_paths()[0])
     cfg = settings.agent
     token = ((body.auth_token or "").strip() or cfg.auth_token
              or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
@@ -518,7 +547,7 @@ def _effective_cfg(body: AgentConfigBody):
 @app.get("/api/config/agent")
 def agent_config_get():
     try:
-        settings = load_settings(SETTINGS_PATH)
+        settings = load_settings(_active_paths()[0])
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
     cfg = settings.agent
@@ -575,7 +604,7 @@ def agent_config_save(body: AgentConfigBody):
     fields = {"model": (body.model or "").strip() or None,
               "base_url": (body.base_url or "").strip() or None,
               "auth_token": (body.auth_token or "").strip() or None}
-    wb = write_back_agent(SETTINGS_PATH, **fields)
+    wb = write_back_agent(_active_paths()[0], **fields)
     if not wb["changed"] and wb["errors"]:
         raise HTTPException(status_code=500, detail="；".join(wb["errors"]))
     return {"probe": result, "write_back": wb,
@@ -597,7 +626,7 @@ class NotifySaveBody(BaseModel):
 def _notify_env_ref() -> bool:
     """检查 settings.yaml 原文中 webhook_url 是否为 ${ENV:...} 引用。"""
     try:
-        text = Path(SETTINGS_PATH).read_text(encoding="utf-8")
+        text = Path(_active_paths()[0]).read_text(encoding="utf-8")
     except OSError:
         return False
     return bool(re.search(r"^\s*webhook_url:\s*\$\{ENV:", text, re.M))
@@ -606,7 +635,7 @@ def _notify_env_ref() -> bool:
 @app.get("/api/config/notify")
 def notify_config_get():
     try:
-        settings = load_settings(SETTINGS_PATH)
+        settings = load_settings(_active_paths()[0])
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
     cfg = settings.notify
@@ -640,7 +669,7 @@ def notify_config_save(body: NotifySaveBody):
                 raise HTTPException(
                     status_code=400,
                     detail=f"events 含非法值 '{v}'，必须是 {'/'.join(VALID_EVENTS)} 之一")
-    wb = write_back_notify(SETTINGS_PATH,
+    wb = write_back_notify(_active_paths()[0],
                            webhook_url=(body.webhook_url or "").strip() or None,
                            fmt=fmt, events=body.events, enabled=body.enabled)
     if not wb["changed"] and wb["errors"]:
@@ -655,7 +684,7 @@ def notify_config_test():
     """用当前生效配置发一条测试通知，返回 {ok, detail}。"""
     from ..notify import build_payload, send_webhook
     try:
-        settings = load_settings(SETTINGS_PATH)
+        settings = load_settings(_active_paths()[0])
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
     cfg = settings.notify
@@ -685,12 +714,13 @@ def _preview_context(which: str) -> dict:
     """为预览构建尽力而为的上下文；运行时才有的量用样例值，取不到的留空
     （渲染后原样保留 {{var}}，missing_vars 会列出，便于编辑时排查）。"""
     from ..agent.prompts import build_context_tuning_system
+    settings_path, space_path, project_dir = _active_paths()
     try:
-        settings = load_settings(SETTINGS_PATH)
+        settings = load_settings(settings_path)
     except ConfigError:
         return {}
-    root = abs_data_dir(settings, PROJECT_ROOT)
-    space = _load_space_with_snapshots(Path(SPACE_PATH), root)
+    root = abs_data_dir(settings, project_dir)
+    space = _load_space_with_snapshots(Path(space_path), root)
     if which == "tuning_system":
         return build_context_tuning_system(settings, space)   # 全静态，可完整渲染
     if which == "tuning_wake_brief":
@@ -707,7 +737,7 @@ def prompts_get():
     from ..agent.prompt_store import load_doc
     from ..agent.prompts import DEFAULT_PROMPTS, PROMPT_NAMES, PROMPT_VARS
     try:
-        settings = load_settings(SETTINGS_PATH)
+        settings = load_settings(_active_paths()[0])
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
     doc = load_doc(settings)
@@ -742,7 +772,7 @@ def prompts_save(body: PromptSaveBody):
     """保存一条覆盖并记历史（text 为空=恢复出厂）；校验失败转 400。"""
     from ..agent.prompt_store import PromptStoreError, save_override
     try:
-        settings = load_settings(SETTINGS_PATH)
+        settings = load_settings(_active_paths()[0])
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"settings 加载失败：{e}")
     try:

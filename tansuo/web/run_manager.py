@@ -15,10 +15,10 @@ from pathlib import Path
 
 
 class RunManager:
-    def __init__(self, project_root: Path, settings_path: str, space_path: str):
+    def __init__(self, project_root: Path):
+        # project_root 仅用于定位 cli.py（代码安装目录，与"项目"无关，恒定）；
+        # settings/space/project_dir 在 start() 时由调用方传入（跟随激活项目）。
         self.project_root = Path(project_root)
-        self.settings_path = settings_path
-        self.space_path = space_path
         self.proc: subprocess.Popen | None = None
         self.pid: int | None = None
         self.args: list[str] = []
@@ -27,6 +27,7 @@ class RunManager:
         self.exit_code: int | None = None
         self.stopped: bool = False
         self.last_cohort: str | None = None   # 本次运行所在的记录分区（stop 清理用）
+        self.project_dir: Path | None = None  # 本次运行的项目目录（cwd/相对路径基准）
         self._log_f = None
 
     @property
@@ -54,9 +55,11 @@ class RunManager:
             "exit_code": self.exit_code,
             "stopped": self.stopped,
             "last_cohort": self.last_cohort,
+            "project_dir": str(self.project_dir) if self.project_dir else None,
         }
 
-    def start(self, data_dir: str | Path, trials: int | None = None,
+    def start(self, data_dir: str | Path, settings_path: str, space_path: str,
+              project_dir: str | Path, trials: int | None = None,
               wake_every: int | None = None, no_agent: bool = False,
               workers: int | None = None, max_duration_h: float | None = None,
               cohort: str | None = None, note: str | None = None) -> dict:
@@ -68,7 +71,7 @@ class RunManager:
         self.log_path = data_dir / f"web_run_{ts}.log"
         # -u：stdout 重定向到文件后默认块缓冲，前端要实时看日志必须无缓冲
         cmd = [sys.executable, "-u", str(self.project_root / "cli.py"), "run",
-               "--settings", self.settings_path, "--space", self.space_path]
+               "--settings", settings_path, "--space", space_path]
         if trials:
             cmd += ["--trials", str(trials)]
         if wake_every:
@@ -91,13 +94,14 @@ class RunManager:
         self._log_f = open(self.log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             cmd, stdout=self._log_f, stderr=subprocess.STDOUT,
-            cwd=str(self.project_root), **kwargs)
+            cwd=str(project_dir), **kwargs)   # cwd=项目目录：相对路径（训练脚本等）按此解析
         self.pid = self.proc.pid
         self.args = cmd
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.exit_code = None
         self.stopped = False
         self.last_cohort = cohort
+        self.project_dir = Path(project_dir)
         return self.status()
 
     def stop(self) -> dict:

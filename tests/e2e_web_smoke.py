@@ -3,6 +3,7 @@
 独立脚本直跑：python tests/e2e_web_smoke.py（约 2-4 分钟，占用端口 8123）。
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -97,7 +98,9 @@ with tempfile.TemporaryDirectory() as td:
         [sys.executable, str(ROOT / "cli.py"), "web",
          "--settings", str(settings_yaml), "--space", str(space_yaml),
          "--port", str(PORT)],
-        cwd=str(tmp), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        cwd=str(tmp), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        # 项目注册表隔离到临时目录：不污染用户真实的 ~/.tansuo_agent/projects.json
+        env={**os.environ, "TANSUO_PROJECT_STORE": str(tmp / "projects.json")})
     try:
         # 等服务就绪
         t0 = time.time()
