@@ -109,6 +109,11 @@ def main() -> int:
             kinds[e.get("kind")] = kinds.get(e.get("kind"), 0) + 1
         print(f"  [ok] setup 完成（耗时 {time.time() - t0:.0f}s），事件分布：{kinds}")
         print(f"  [ok] setup 累计 tokens：{ev['tokens']['total_tokens']}")
+        if not ev["events"]:
+            fail("setup 事件流为空：setup_journal.jsonl 定位与写入位置不一致"
+                 "（检查 _setup_journal_path 的 data_dir 绑定）")
+        if ev["tokens"]["total_tokens"] <= 0:
+            fail("setup 事件流 tokens=0：agent_token_summary 统计异常")
         if "===== 配置 agent 摘要 =====" in log_text:
             print("  ---- agent 摘要 ----")
             print("  " + log_text.split("===== 配置 agent 摘要 =====", 1)[1]
@@ -118,19 +123,26 @@ def main() -> int:
         space_txt = (proj_dir / ".tansuo" / "search_space.yaml").read_text(encoding="utf-8")
         print(f"  [ok] settings.yaml 已覆写（{len(settings_txt.splitlines())} 行），"
               f"search_space.yaml（{len(space_txt.splitlines())} 行）")
+        if "data_dir" in settings_txt and ".tansuo" not in settings_txt.split("data_dir", 1)[1][:60]:
+            print("  [warn] settings 的 data_dir 似乎不再指向 .tansuo/，隔离可能被破坏")
 
         print(f"== 3. 冒烟搜索（trials={args.trials}，带调参 agent） ==")
         api("/api/run/start", {"trials": args.trials, "wake_every": 2})
         t0 = time.time()
-        while time.time() - t0 < 3600:
+        rs = {}
+        while time.time() - t0 < 7200:   # 校准后 timeout 可能较大，单次试验更久
             rs = api("/api/run/status")
             if not rs["running"]:
                 break
             time.sleep(3)
         else:
-            fail("搜索 60 分钟未结束", api("/api/run/log?tail=80")["text"])
-        if rs["exit_code"] != 0:
-            fail(f"搜索退出码 {rs['exit_code']}", api("/api/run/log?tail=80")["text"])
+            fail("搜索 2 小时未结束", api("/api/run/log?tail=80")["text"])
+        if rs.get("exit_code") != 0:
+            fail(f"搜索退出码 {rs.get('exit_code')}", api("/api/run/log?tail=80")["text"])
+        # 运行日志必须落在项目 .tansuo 目录内（data_dir 隔离不被 setup 重写破坏）
+        if ".tansuo" not in (rs.get("log_path") or ""):
+            fail(f"运行日志未落在项目 .tansuo 目录：{rs.get('log_path')}"
+                 "（settings 的 data_dir 可能被 setup 重写丢失）")
         s = api("/api/summary")
         c = s["counts"]
         print(f"  [ok] 搜索完成（耗时 {time.time() - t0:.0f}s）：完结 {c['completed']}、"

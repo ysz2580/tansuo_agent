@@ -2,14 +2,58 @@
 
 工具集 5 个：read_train_script / save_settings / save_search_space /
 run_probe_trial / finish。
+
+两处确定性护栏（不依赖 LLM 自觉）：
+1. save_settings 整体覆写时自动保留既有配置里的「环境字段」（data_dir、
+   storage.url、agent 端点等部署事实）——否则 LLM 重写会丢脚手架的
+   .tansuo 隔离路径，运行数据会逃出项目工作目录；
+2. run_probe_trial 成功后按「探针耗时 × 空间最重配置折算 × 安全余量」
+   自动校准 adapter.timeout_s——否则轻探针 + 重空间会让正式搜索成片超时。
 """
 from __future__ import annotations
 
 import json
+import math
+from pathlib import Path
 
 from ..prompt_store import load_overrides
 from ..prompts import build_context_setup, render_prompt
 from ..skill import Skill, SkillLimits
+
+# save_settings 覆写时必须保留的「环境字段」（部署事实，不是 LLM 推断对象）。
+# 规则：新配置缺了才从旧配置补回；LLM 显式给出的值不覆盖。
+_PRESERVE_FIELDS = (
+    ("experiment", "data_dir"),
+    ("experiment", "fingerprint_paths"),
+    ("experiment", "dataset"),
+    ("storage", "url"),
+    ("agent", "model"),
+    ("agent", "base_url"),
+    ("agent", "auth_token"),
+)
+# timeout 校准上限（秒）：再重也不把单次试验红线抬到 2 小时以上，
+# 超限时返回 warning 让 agent 在 finish 摘要里建议收窄空间。
+_TIMEOUT_CAP_S = 7200
+
+
+def _deep_get(d: dict, path: tuple):
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur
+
+
+def _deep_set(d: dict, path: tuple, value) -> None:
+    cur = d
+    for k in path[:-1]:
+        nxt = cur.get(k)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[k] = nxt
+        cur = nxt
+    cur[path[-1]] = value
 
 SETUP_TOOLS = [
     {
@@ -138,6 +182,45 @@ class SetupExecutor:
         return f"===== {path} =====\n{text}"
 
     # ---------------- 写（经校验器） ----------------
+    def _load_existing_settings(self) -> dict:
+        """读目标位置现有 settings.yaml（供保留环境字段/timeout 棘轮）；无则 {}。"""
+        import yaml
+        p = Path(self.settings_path)
+        if not p.exists():
+            return {}
+        try:
+            old = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            return {}
+        return old if isinstance(old, dict) else {}
+
+    def _merge_env_fields(self, settings: dict) -> list[str]:
+        """把既有配置里的环境字段补进 LLM 新写的配置（只在缺失时补）。
+
+        返回补回的字段名列表（用于回执提示）。LLM 整体覆写时通常不知道
+        data_dir/storage.url 这些部署事实，丢了会破坏 .tansuo 隔离。
+        """
+        old = self._load_existing_settings()
+        if not old:
+            return []
+        merged = []
+        for field in _PRESERVE_FIELDS:
+            if _deep_get(settings, field) is None and _deep_get(old, field) is not None:
+                _deep_set(settings, field, _deep_get(old, field))
+                merged.append(".".join(field))
+        # timeout_s 棘轮：不允许 LLM 覆写时把已校准的超时调低
+        old_t = _deep_get(old, ("adapter", "timeout_s"))
+        new_t = _deep_get(settings, ("adapter", "timeout_s"))
+        if old_t is not None:
+            try:
+                if new_t is None or int(new_t) < int(old_t):
+                    _deep_set(settings, ("adapter", "timeout_s"), int(old_t))
+                    if new_t is not None:
+                        merged.append("adapter.timeout_s(保持不低于原值)")
+            except (TypeError, ValueError):
+                pass
+        return merged
+
     def _tool_save_settings(self, settings: dict) -> str:
         import os
         import tempfile
@@ -146,6 +229,7 @@ class SetupExecutor:
         from ...config import ConfigError, load_settings
         if not isinstance(settings, dict):
             return "settings 必须是对象"
+        merged = self._merge_env_fields(settings)
         try:
             text = yaml.safe_dump(settings, allow_unicode=True, sort_keys=False)
         except yaml.YAMLError as e:
@@ -164,7 +248,8 @@ class SetupExecutor:
                 pass
         Path(self.settings_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.settings_path).write_text(text, encoding="utf-8")
-        return f"settings.yaml 已写入 {self.settings_path}（校验通过）"
+        note = (f"；已自动保留既有环境字段：{', '.join(merged)}" if merged else "")
+        return f"settings.yaml 已写入 {self.settings_path}（校验通过{note}）"
 
     def _tool_save_search_space(self, params: list) -> str:
         from pathlib import Path
@@ -204,14 +289,97 @@ class SetupExecutor:
         except TrialFailedError as e:
             return f"探测试验失败：{e.full()}"
         curve = trial.user_attrs.get("curve") or []
-        return _json({
+        duration = round(time.perf_counter() - t0, 1)
+        result = {
             "status": "ok",
             "value": value,
-            "duration_s": round(time.perf_counter() - t0, 1),
+            "duration_s": duration,
             "params": dict(trial.params),
             "last_epoch": curve[-1] if curve else None,
             "hint": "端到端契约验证通过：配置可读、协议行解析正常、primary 指标存在",
-        })
+        }
+        calibration = self._calibrate_timeout(space, dict(trial.params), duration)
+        if calibration:
+            result["timeout_calibration"] = calibration
+        return _json(result)
+
+    def _calibrate_timeout(self, space, probe_params: dict, duration_s: float) -> dict | None:
+        """探针成功后按「最重配置」折算并回写 adapter.timeout_s。
+
+        为什么必须做：探针采样到的往往是较轻的配置（小 epochs/width），
+        而搜索空间 envelope 里的最重配置（最大 epochs 叠加更大 width/batch）
+        耗时可能数倍于探针。若沿用默认/LLM 拍的 timeout_s，正式搜索会成片超时。
+
+        折算：per_epoch = 探针耗时 / 探针 epochs；最重 ≈ per_epoch × 空间最大 epochs；
+        再乘 3 倍余量覆盖 width/batch/augment 等其他维度的额外耗时。
+        只在需要上调时回写 settings.yaml（校验通过才写），绝不下调。
+        """
+        import yaml
+        from ...config import ConfigError, load_settings
+        path = Path(self.settings_path)
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+
+        # 定位「训练轮数」参数（名含 epoch 的数值参数），取其 envelope 上界
+        ep = next((p for p in space.params
+                   if "epoch" in p.name.lower() and p.kind in ("int", "float")
+                   and p.high), None)
+        probe_ep = probe_params.get(ep.name) if ep else None
+        try:
+            ratio = (float(ep.high) / float(probe_ep)) if (ep and probe_ep) else 1.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio = 1.0
+        adapter = raw.get("adapter") if isinstance(raw.get("adapter"), dict) else {}
+        try:
+            current = int(adapter.get("timeout_s", 300))
+        except (TypeError, ValueError):
+            current = 300
+        recommended = int(math.ceil(duration_s * max(ratio, 1.0) * 3.0 / 10) * 10)
+        recommended = max(recommended, current, 300)
+        capped = recommended > _TIMEOUT_CAP_S
+        recommended = min(recommended, _TIMEOUT_CAP_S)
+
+        info = {
+            "probe_duration_s": duration_s,
+            "probe_epochs": probe_ep,
+            "space_max_epochs": float(ep.high) if ep else None,
+            "old_timeout_s": current,
+            "recommended_timeout_s": recommended,
+            "capped": capped,
+        }
+        if recommended <= current:
+            info["action"] = f"unchanged（当前 timeout_s={current} 已足够）"
+            return info
+        # 回写 adapter.timeout_s（走与 save_settings 相同的"临时文件+校验"路径）
+        adapter["timeout_s"] = recommended
+        raw["adapter"] = adapter
+        text = yaml.safe_dump(raw, allow_unicode=True, sort_keys=False)
+        import os
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".yaml")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            load_settings(tmp)
+        except ConfigError:
+            info["action"] = "校准值未通过校验，保持原 timeout_s 不变"
+            return info
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        path.write_text(text, encoding="utf-8")
+        info["action"] = (f"已把 adapter.timeout_s 从 {current} 提高到 {recommended}"
+                          "（探针耗时按空间最重配置折算并留 3 倍余量）")
+        if capped:
+            info["warning"] = ("达到 7200s 上限仍可能不够：建议收窄 epochs 上界、"
+                               "调低 budget.data_fraction，或让用户准备更长超时")
+        return info
 
     def _tool_finish(self, summary: str) -> str:
         summary = str(summary or "").strip()
@@ -247,8 +415,18 @@ class SetupSkill(Skill):
         return self._executor
 
     def system_prompt(self) -> str:
+        existing = None
+        p = Path(self.settings_path)
+        if p.exists():
+            try:
+                existing = p.read_text(encoding="utf-8")
+                if len(existing) > 6000:
+                    existing = existing[:6000] + "\n……（过长，截断）"
+            except OSError:
+                existing = None
         return render_prompt("setup_system",
-                             build_context_setup(self.train_script_path, self._src),
+                             build_context_setup(self.train_script_path, self._src,
+                                                 existing),
                              self._prompts)
 
     def opening_message(self) -> str:

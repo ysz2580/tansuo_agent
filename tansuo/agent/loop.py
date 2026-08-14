@@ -206,6 +206,13 @@ class SetupAgent:
         except AgentEndpointError as e:
             self.journal.append(AGENT_ERROR, mode="setup", error=str(e))
             raise
+        # setup 也记录本轮 token 用量：复用 agent_wakeup(phase=end) 审计事件，
+        # 使 agent_token_summary 对 setup 会话同样可见（花费可见，见 STAR #016）。
+        self.journal.append(AGENT_WAKEUP, mode="setup", round=1, phase="end",
+                            input_tokens=loop.round_input_tokens,
+                            output_tokens=loop.round_output_tokens,
+                            total_input_tokens=loop.round_input_tokens,
+                            total_output_tokens=loop.round_output_tokens)
         summary = skill.executor().summary or "（模型未调用 finish；配置可能未完成，请人工检查）"
         self.journal.append(FINISH, mode="setup", reason="setup_done",
                             summary=summary[:500])

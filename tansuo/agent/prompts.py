@@ -8,7 +8,7 @@
 - tuning_system：{{experiment_name}} {{metrics_block}} {{space_describe}} {{total_trials}}
 - tuning_wake_brief：{{round_no}} {{max_wake_rounds}} {{finished_count}}
                      {{total}} {{budget_left}} {{space_version}}
-- setup_system：{{train_script_path}} {{train_script_src}}
+- setup_system：{{train_script_path}} {{train_script_src}} {{existing_settings}}
 """
 from __future__ import annotations
 
@@ -20,8 +20,10 @@ PROMPT_VARS: dict[str, list[str]] = {
     "tuning_system": ["experiment_name", "metrics_block", "space_describe", "total_trials"],
     "tuning_wake_brief": ["round_no", "max_wake_rounds", "finished_count",
                           "total", "budget_left", "space_version"],
-    "setup_system": ["train_script_path", "train_script_src"],
+    "setup_system": ["train_script_path", "train_script_src", "existing_settings"],
 }
+
+_NO_EXISTING_SETTINGS = "（目标位置尚无 settings.yaml，全新起草）"
 
 _PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 
@@ -83,6 +85,12 @@ DEFAULT_PROMPTS: dict[str, str] = {
 {{train_script_src}}
 ```
 
+# 目标位置现有配置
+{{existing_settings}}
+若上面已有配置：其中的**环境字段**——experiment.data_dir / storage.url /
+agent.base_url / agent.auth_token / agent.model——是部署事实（数据落在哪、
+LLM 端点连哪），不是你的推断对象，save_settings 时原样带上，不要改动。
+
 # 推断来源（按优先级）
 1. argparse / click 定义：最可靠的超参数入口（名字、类型、默认值、choices）；
 2. 配置文件读取（yaml/json/config 对象）：跟踪其字段；
@@ -95,12 +103,25 @@ DEFAULT_PROMPTS: dict[str, str] = {
 - 其余放 watch 观测指标。
 - 若脚本尚未按协议打印 `##TANSUO##` 行，在 adapter 配置里保持 subprocess 模式，并在 finish 摘要中明确告诉用户需要怎么改脚本（协议格式会在探测试验失败信息中体现）。
 
+# 超时校准（硬性纪律）
+adapter.timeout_s 是单次试验的超时红线。搜索空间里**最重的配置**（最大 epochs
+叠加更大 width/batch 等）必须能在 timeout_s 内跑完，否则正式搜索会成片超时失败。
+- 写 settings 时给出你估计的 timeout_s（参考脚本单步/单轮计算量）。
+- run_probe_trial 返回 duration_s（探针耗时）与 timeout_calibration：系统已按
+  「探针耗时 ×(空间最大 epochs÷探针 epochs)× 3 倍余量」自动折算并回写了
+  timeout_s，阅读该字段了解最终值；若其 warning 提示仍可能不够，在 finish
+  摘要里建议用户收窄 epochs 上界或调低 budget.data_fraction。
+- 探针耗时已接近 timeout_s 的 1/2 时，说明空间重配置大概率超时，务必确认
+  校准结果已生效再 finish。
+
 # 流程（严格遵守）
 1. 需要时用 read_train_script 读主脚本 import 的本地模块/配置文件；
 2. save_settings 写 settings.yaml（经校验器校验，失败就按错误信息修正）；
 3. save_search_space 写 search_space.yaml（同样经校验器）；
 4. **必须** run_probe_trial 实跑一次探测试验验证端到端契约；失败时读错误信息（含 stderr 尾部）：是配置问题就改配置重试，是脚本问题就在 finish 摘要里给用户明确的修改建议；
-5. finish 输出摘要：推断了哪些参数/指标/方向、探测试验结果、哪些地方需要人工确认。
+5. 探针通过后核对 timeout_calibration：若系统未自动上调而你认为空间最重配置
+   会超时，重新 save_settings 提高 adapter.timeout_s；
+6. finish 输出摘要：推断了哪些参数/指标/方向、探测试验结果与最终 timeout_s、哪些地方需要人工确认。
 
 # 纪律
 - 不臆造脚本里不存在的参数；拿不准的参数在 finish 摘要里标注"需人工确认"。
@@ -142,10 +163,14 @@ def build_context_tuning_wake(round_no: int, settings, orchestrator) -> dict:
     }
 
 
-def build_context_setup(train_script_path: str, train_script_src: str) -> dict:
+def build_context_setup(train_script_path: str, train_script_src: str,
+                        existing_settings: str | None = None) -> dict:
     return {
         "train_script_path": train_script_path,
         "train_script_src": train_script_src,
+        "existing_settings": (existing_settings.strip()
+                              if existing_settings and existing_settings.strip()
+                              else _NO_EXISTING_SETTINGS),
     }
 
 

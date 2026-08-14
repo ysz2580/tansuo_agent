@@ -23,7 +23,9 @@ export function eventBody(e: AgentEvent): string {
         const usage = typeof e.input_tokens === "number"
           ? `（本轮 in ${e.input_tokens} / out ${e.output_tokens} tokens）`
           : ""
-        return `第 ${e.round} 轮结束${usage}${e.note ? `：${e.note}` : ""}`
+        return e.mode === "setup"
+          ? `配置会话完成${usage}`
+          : `第 ${e.round} 轮结束${usage}${e.note ? `：${e.note}` : ""}`
       }
       return `第 ${e.round} 轮开始 ｜ 剩余预算 ${e.budget_left} ｜ 空间 v${e.space_version}`
     }

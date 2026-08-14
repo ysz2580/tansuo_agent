@@ -1013,8 +1013,12 @@ def setup_log(tail: int = Query(default=200, ge=1, le=5000)):
 
 
 def _setup_journal_path() -> Path | None:
-    """setup_journal.jsonl 定位：优先本次会话绑定的项目，回退当前激活项目
-    （服务重启后 SETUP 无绑定，仍能看历史会话事件）。"""
+    """setup_journal.jsonl 定位：优先本次会话启动时绑定的 data_dir（= journal
+    实际写入位置，cmd_setup 开头按启动时的 settings 解析）；不能用 setup 结束后
+    的 settings 重新解析——setup agent 会覆写 settings.yaml，data_dir 可能变化。
+    服务重启后 SETUP 无绑定，回退按当前激活项目的 settings/project_dir 解析。"""
+    if SETUP.data_dir is not None:
+        return Path(SETUP.data_dir) / "setup_journal.jsonl"
     settings_path = SETUP.settings_path or _active_paths()[0]
     project_dir = SETUP.project_dir or _active_paths()[2]
     try:
