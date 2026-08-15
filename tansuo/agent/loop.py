@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+from ..analysis import build_wake_signals
 from ..journal import AGENT_ERROR, AGENT_TOOL_CALL, AGENT_WAKEUP, FINISH, SESSION_START
 from .client import AgentEndpointError, call_with_retry, make_client
 from .hooks import HookChain, PermissionGate
@@ -157,6 +158,13 @@ class AgentSupervisor:
         self.journal.append(AGENT_WAKEUP, round=self.wake_count,
                             budget_left=self.orch.budget_left(),
                             space_version=self.orch.space.version)
+        # 确定性护栏信号（失败警报/收敛提示）：写审计 + 打日志，并随 wake brief 注入
+        signals = build_wake_signals(self.orch)
+        if signals:
+            self.journal.append(AGENT_WAKEUP, round=self.wake_count, phase="signals",
+                                signals=signals)
+            for s in signals:
+                self.log(f"[护栏] {s}")
         self.log(f"\n[agent] 第 {self.wake_count} 轮唤醒：分析试验结果……")
         skill = TuneSkill(self.settings, self.orch, self.wake_count)
         loop = AgentLoop(self.settings, self.client, self.journal, self.gate,

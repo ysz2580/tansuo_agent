@@ -35,6 +35,14 @@ def _fmt_eta(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
+def _fail_fields(e: TrialFailedError) -> dict:
+    """TRIAL_FAIL 事件字段；瞬时故障形态附带环境线索（无线索时不带该键）。"""
+    f = {"reason": e.reason, "hint": e.hint, "detail": e.detail}
+    if getattr(e, "env_clues", None):
+        f["env_clues"] = e.env_clues
+    return f
+
+
 class Orchestrator:
     def __init__(self, settings: Settings, space: SearchSpace, study,
                  runner: TrialRunner, journal: Journal, log=print):
@@ -126,8 +134,8 @@ class Orchestrator:
             return "pruned"
         except TrialFailedError as e:
             self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
-            self.journal.append(TRIAL_FAIL, trial=trial.number, reason=e.reason,
-                                hint=e.hint, detail=e.detail, source=source)
+            self.journal.append(TRIAL_FAIL, trial=trial.number, source=source,
+                                **_fail_fields(e))
             self._progress(trial, "FAILED ", e.reason, time.perf_counter() - t0)
             return "failed"
         except Exception as e:   # noqa: BLE001 —— 意外异常（如 python 模式用户函数错误）不炸掉整个搜索
@@ -185,8 +193,8 @@ class Orchestrator:
             return {"status": "pruned", "trial": trial.number}
         except TrialFailedError as e:
             self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
-            self.journal.append(TRIAL_FAIL, trial=trial.number, reason=e.reason,
-                                hint=e.hint, detail=e.detail, source="custom")
+            self.journal.append(TRIAL_FAIL, trial=trial.number, source="custom",
+                                **_fail_fields(e))
             self._progress(trial, "FAILED ", e.reason, time.perf_counter() - t0)
             return {"status": "failed", "trial": trial.number, "reason": e.full()}
 

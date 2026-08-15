@@ -4,10 +4,15 @@
 覆盖：
 - 重试：瞬时故障（非零退出码且 stderr 为空）自动重试后成功；重试耗尽仍失败
   时错误信息注明次数；stderr 有内容视为确定性失败不重试；journal 记 trial_retry
+- 环境线索：瞬时故障的 trial_retry / trial_fail 事件带 env_clues（磁盘余量等），
+  stderr 有内容的确定性失败不带
 - 并行：workers=2 时 run_batch 全部完结，且子进程运行区间存在真实重叠
 - 时间预算：极小 max_duration_h → finished_reason=time_budget_exhausted 且未跑满
 - ETA：完成试验后 eta_seconds 有值、进度行含 ETA≈；断点续跑可从 journal 预热
 - 兜底：python 模式用户函数抛异常 → 该试验 FAIL 但搜索不崩
+- 唤醒信号：连续同类失败触发系统警报（含疑似耗时维度）、收敛信号
+  （最近 window 次未刷新最优），强制注入 wake brief；无信号时渲染不变
+- Hyperband：配置校验、工厂、真实搜索冒烟；中途 widen 后 max_resource=auto 自适应
 - 配置校验：workers / retry_on_fail / max_duration_h 越界拒绝
 """
 from __future__ import annotations
@@ -64,9 +69,31 @@ print("##TANSUO## " + json.dumps({"type": "final", "value": 0.5}))
 CHILD_SLOW = "import json, time\ntime.sleep(0.7)\n" \
              'print(\'##TANSUO## {"type": "final", "value": 0.5}\')\n'
 
+# 按配置里的 epochs 逐轮上报（hyperband widen 测试用：步数随空间放宽而变长）
+CHILD_STEPS = """
+import json, os
+cfg = json.loads(os.environ.get("TANSUO_TRIAL_CONFIG", "{}"))
+epochs = int(cfg.get("epochs", 2))
+for ep in range(1, epochs + 1):
+    print("##TANSUO## " + json.dumps(
+        {"type": "epoch", "epoch": ep, "metrics": {"val_acc": round(0.05 * ep, 4)}}),
+        flush=True)
+print("##TANSUO## " + json.dumps({"type": "final", "value": round(0.05 * epochs, 4)}))
+"""
+
 SPACE_DICT = {"params": [
     {"name": "lr", "type": "float", "low": 0.01, "high": 0.1,
      "description": "学习率（测试用最小空间）"},
+]}
+
+# epochs 当前上界 8，envelope 上界 32（供 widen 放宽；模拟 setup 留有余量的空间）
+SPACE_WITH_EPOCHS = {"params": [
+    {"name": "lr", "type": "float", "low": 0.01, "high": 0.1,
+     "description": "学习率"},
+    {"name": "epochs", "type": "int", "low": 2, "high": 8,
+     "env_low": 2, "env_high": 32, "description": "训练轮数"},
+    {"name": "batch", "type": "int", "low": 16, "high": 64,
+     "description": "批大小"},
 ]}
 
 
@@ -79,7 +106,7 @@ def ok(name: str, cond: bool, detail: str = "") -> None:
 
 def make_settings(tmp: Path, child_code: str, name: str, *, retry: int = 0,
                   workers: int = 1, total: int = 5, mode: str = "subprocess",
-                  entry: str = ""):
+                  entry: str = "", pruner_yaml: str | None = None):
     """每个用例独立的 data_dir（journal/db 互不串扰）。"""
     script = tmp / f"{name}.py"
     script.write_text(child_code, encoding="utf-8")
@@ -100,7 +127,8 @@ def make_settings(tmp: Path, child_code: str, name: str, *, retry: int = 0,
         "adapter:\n" + adapter_yaml +
         f"budget: {{total_trials: {total}, wake_every: {min(5, total)}, seed: 1, "
         f"workers: {workers}}}\n"
-        "pruner: {type: median, n_startup_trials: 2, n_warmup_steps: 0}\n"
+        + (pruner_yaml or
+           "pruner: {type: median, n_startup_trials: 2, n_warmup_steps: 0}\n") +
         "agent: {enabled: false, model: none}\n"
         # 注：测试里统一传入内存 study（见 make_orch），不落 storage 文件，
         # 避免 sqlite 句柄/journal 符号链接锁导致 Windows 临时目录清理失败
@@ -111,15 +139,16 @@ def make_settings(tmp: Path, child_code: str, name: str, *, retry: int = 0,
     return load_settings(p)
 
 
-def make_runner(settings) -> TrialRunner:
-    space = SearchSpace.from_dict(SPACE_DICT)
+def make_runner(settings, space_dict: dict | None = None) -> TrialRunner:
+    space = SearchSpace.from_dict(space_dict or SPACE_DICT)
     journal = Journal(Path(settings.data_dir) / "journal.jsonl")
     return TrialRunner(settings, space, journal)
 
 
 def make_orch(settings, log_lines: list | None = None,
-              study: optuna.Study | None = None) -> Orchestrator:
-    space = SearchSpace.from_dict(SPACE_DICT)
+              study: optuna.Study | None = None,
+              space_dict: dict | None = None) -> Orchestrator:
+    space = SearchSpace.from_dict(space_dict or SPACE_DICT)
     journal = Journal(Path(settings.data_dir) / "journal.jsonl")
     study = study or fresh_study(settings)
     runner = TrialRunner(settings, space, journal)
@@ -469,6 +498,145 @@ def test_failure_awareness(tmp: Path) -> None:
     ok("无失败试验时 summary 不含 recent_failures", "recent_failures" not in out2)
 
 
+def test_wake_signals(tmp: Path) -> None:
+    print("== 唤醒信号（确定性护栏：失败警报 + 收敛信号） ==")
+    from optuna.distributions import FloatDistribution, IntDistribution
+    from optuna.trial import create_trial
+
+    from tansuo.analysis import (build_wake_signals, failure_alerts,  # noqa: E402
+                                 plateau_note, suspicious_dims)
+    from tansuo.agent.prompts import tuning_wake_brief                 # noqa: E402
+
+    # 1) 连续 3 次 exit_code 失败 → 系统警报
+    s = make_settings(tmp, CHILD_ALWAYS_FAIL, "wakesig_exit", retry=0, total=3)
+    orch = make_orch(s)
+    orch.run_batch(3)
+    alerts = failure_alerts(orch.study, orch.journal)
+    ok("连续 3 次 exit_code 失败触发系统警报",
+       len(alerts) == 1 and "系统警报" in alerts[0] and "非零退出码" in alerts[0]
+       and "trial#0" in alerts[0], str(alerts))
+    sigs = build_wake_signals(orch)
+    ok("build_wake_signals 汇总失败警报", len(sigs) == 1 and "系统警报" in sigs[0])
+    brief = tuning_wake_brief(1, s, orch)
+    ok("wake brief 强制注入警报（⚠ 前缀，agent 无法绕过）",
+       "⚠ 系统警报" in brief and brief.startswith("第 1 轮唤醒"), brief)
+    # 混入一条协议错误 → 类别混杂不触发（避免把偶发问题当系统性问题打扰）
+    orch.journal.append(TRIAL_FAIL, trial=99, reason="协议行 JSON 解析失败")
+    ok("失败类别混杂时不触发警报", failure_alerts(orch.study, orch.journal) == [])
+
+    # 2) 连续超时 → 警报点名疑似耗时维度（失败试验中取值显著偏高的数值参数）
+    s2 = make_settings(tmp, CHILD_SLOW, "wakesig_to", total=2)
+    orch2 = make_orch(s2, space_dict=SPACE_WITH_EPOCHS)
+    dists = {"lr": FloatDistribution(0.01, 0.1),
+             "epochs": IntDistribution(2, 32),
+             "batch": IntDistribution(16, 64)}
+    orch2.study.add_trial(create_trial(state=optuna.trial.TrialState.COMPLETE, value=0.9,
+                                       params={"lr": 0.05, "epochs": 3, "batch": 32},
+                                       distributions=dists))
+    orch2.study.add_trial(create_trial(state=optuna.trial.TrialState.COMPLETE, value=0.85,
+                                       params={"lr": 0.04, "epochs": 4, "batch": 32},
+                                       distributions=dists))
+    for n, ep in ((2, 12), (3, 16), (4, 14)):
+        orch2.study.add_trial(create_trial(state=optuna.trial.TrialState.FAIL,
+                                           params={"lr": 0.05, "epochs": ep, "batch": 32},
+                                           distributions=dists))
+        orch2.journal.append(TRIAL_FAIL, trial=n, reason="训练超时（>60s）")
+    alerts2 = failure_alerts(orch2.study, orch2.journal)
+    ok("连续超时触发警报并点名疑似耗时维度 epochs",
+       len(alerts2) == 1 and "全部超时" in alerts2[0]
+       and "疑似耗时维度：epochs" in alerts2[0], str(alerts2))
+    ok("suspicious_dims 纯函数：失败组均值显著偏高被点名",
+       suspicious_dims([{"epochs": 12}, {"epochs": 16}],
+                       [{"epochs": 3}, {"epochs": 4}]) == ["epochs"])
+    ok("suspicious_dims：无显著差异不点名",
+       suspicious_dims([{"epochs": 4}], [{"epochs": 4}]) == []
+       and suspicious_dims([], [{"epochs": 4}]) == [])
+
+    # 3) 收敛信号：最近 window 次未刷新最优 → 提示；仍在改进 → 空
+    study3 = fresh_study()
+    dists3 = {"lr": FloatDistribution(0.01, 0.1)}
+    for v in [0.5, 0.6, 0.9, 0.95, 0.93, 0.94, 0.92, 0.94]:
+        study3.add_trial(create_trial(state=optuna.trial.TrialState.COMPLETE, value=v,
+                                      params={"lr": 0.05}, distributions=dists3))
+    note = plateau_note(study3, s2, window=4)
+    ok("连续 4 次未刷新最优 → 确定性收敛信号（含最优试验号）",
+       "确定性收敛信号" in note and "trial#3" in note, note)
+    study4 = fresh_study()
+    for v in [0.5, 0.6, 0.7, 0.75, 0.8, 0.85]:
+        study4.add_trial(create_trial(state=optuna.trial.TrialState.COMPLETE, value=v,
+                                      params={"lr": 0.05}, distributions=dists3))
+    ok("仍在明显改进 → 不发收敛信号", plateau_note(study4, s2, window=4) == "")
+
+    # 4) 无信号场景：build_wake_signals 为空，简报渲染与旧版逐字一致
+    s5 = make_settings(tmp, CHILD_SLOW, "wakesig_none", total=1)
+    orch5 = make_orch(s5)
+    orch5.run_batch(1)
+    ok("无信号 → build_wake_signals 为空", build_wake_signals(orch5) == [])
+    brief5 = tuning_wake_brief(1, s5, orch5)
+    ok("无信号时简报不含 ⚠ 且正文不变",
+       "⚠" not in brief5 and brief5.endswith("再决定本轮动作。"), brief5)
+
+
+def test_env_clues(tmp: Path) -> None:
+    print("== 瞬时失败环境线索（根因诊断证据链） ==")
+    from tansuo.runner import collect_env_clues                          # noqa: E402
+
+    clues = collect_env_clues(tmp)
+    ok("线索含磁盘剩余（GB）", isinstance(clues.get("disk_free_gb"), (int, float)),
+       str(clues))
+
+    # 重试事件带线索（flaky 脚本：第一次瞬时失败 → 重试成功）
+    s = make_settings(tmp, CHILD_FLAKY % {"marker": str(tmp / "clue_marker")},
+                      "clues_retry", retry=1, total=1)
+    orch = make_orch(s)
+    orch.run_batch(1)
+    retries = [e for e in orch.journal.load_events() if e.get("kind") == TRIAL_RETRY]
+    ok("trial_retry 事件记录 env_clues",
+       len(retries) == 1 and "disk_free_gb" in (retries[0].get("env_clues") or {}),
+       str(retries))
+
+    # 瞬时形态最终失败（stderr 为空）→ trial_fail 也带线索
+    s2 = make_settings(tmp, CHILD_ALWAYS_FAIL, "clues_fail", retry=0, total=1)
+    orch2 = make_orch(s2)
+    orch2.run_batch(1)
+    fails = [e for e in orch2.journal.load_events() if e.get("kind") == TRIAL_FAIL]
+    ok("stderr 为空的 trial_fail 带 env_clues",
+       len(fails) == 1 and "disk_free_gb" in (fails[0].get("env_clues") or {}),
+       str(fails))
+
+    # stderr 有内容 = 确定性失败 → 不带线索（不产生噪音）
+    s3 = make_settings(tmp, CHILD_STDERR_FAIL, "clues_stderr", retry=0, total=1)
+    orch3 = make_orch(s3)
+    orch3.run_batch(1)
+    fails3 = [e for e in orch3.journal.load_events() if e.get("kind") == TRIAL_FAIL]
+    ok("stderr 有内容的 trial_fail 不带 env_clues",
+       len(fails3) == 1 and not fails3[0].get("env_clues"), str(fails3))
+
+
+def test_hyperband_widen(tmp: Path) -> None:
+    print("== Hyperband + 动态 widen（max_resource=auto 自适应） ==")
+    s = make_settings(tmp, CHILD_STEPS, "hb_widen", total=14,
+                      pruner_yaml="pruner: {type: hyperband, min_resource: 1, "
+                                  "max_resource: auto, reduction_factor: 2}\n")
+    orch = make_orch(s, space_dict=SPACE_WITH_EPOCHS)
+    orch.run_batch(6)
+    # 中途放宽：epochs 上界 8 → 32（envelope 内，模拟 agent 放宽搜索）
+    r = orch.space.apply_patch(
+        [{"op": "widen", "param": "epochs", "low": 2, "high": 32}],
+        "验收测试：放宽 epochs 上界")
+    ok("搜索中途 widen 成功", r.ok, str(r.errors))
+    orch.run_batch(8)
+    trials = orch.study.get_trials(deepcopy=False)
+    states = [t.state for t in trials]
+    ok("widen 后全部试验完结（COMPLETE/PRUNED，无 FAIL）",
+       len(trials) == 14
+       and all(st in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+               for st in states), str(states))
+    max_steps = max((len(t.user_attrs.get("curve", [])) for t in trials), default=0)
+    ok("widen 后有试验实际跑过旧上界 8 步（auto 推断跟随扩展）",
+       max_steps > 8, f"max_steps={max_steps}")
+
+
 def test_config_validation(tmp: Path) -> None:
     print("== 新字段配置校验 ==")
 
@@ -507,5 +675,8 @@ if __name__ == "__main__":
         test_agent_token_usage(tmp)
         test_hyperband_pruner(tmp)
         test_failure_awareness(tmp)
+        test_wake_signals(tmp)
+        test_env_clues(tmp)
+        test_hyperband_widen(tmp)
         test_config_validation(tmp)
     print(f"\n全部通过：{PASS} 项断言")

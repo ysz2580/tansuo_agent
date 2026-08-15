@@ -7,19 +7,22 @@
 三条提示词与其可用占位符：
 - tuning_system：{{experiment_name}} {{metrics_block}} {{space_describe}} {{total_trials}}
 - tuning_wake_brief：{{round_no}} {{max_wake_rounds}} {{finished_count}}
-                     {{total}} {{budget_left}} {{space_version}}
+                     {{total}} {{budget_left}} {{space_version}} {{wake_signals}}
+                     （wake_signals：确定性护栏的唤醒信号，无信号时为空串）
 - setup_system：{{train_script_path}} {{train_script_src}} {{existing_settings}}
 """
 from __future__ import annotations
 
 import re
 
+from ..analysis import build_wake_signals
+
 PROMPT_NAMES = ("tuning_system", "tuning_wake_brief", "setup_system")
 
 PROMPT_VARS: dict[str, list[str]] = {
     "tuning_system": ["experiment_name", "metrics_block", "space_describe", "total_trials"],
     "tuning_wake_brief": ["round_no", "max_wake_rounds", "finished_count",
-                          "total", "budget_left", "space_version"],
+                          "total", "budget_left", "space_version", "wake_signals"],
     "setup_system": ["train_script_path", "train_script_src", "existing_settings"],
 }
 
@@ -71,6 +74,7 @@ DEFAULT_PROMPTS: dict[str, str] = {
 - category=exit_code 偶发、reason 注明"已自动重试"：环境瞬时噪声，系统已兜底，无需特殊处理。
 - category=protocol：脚本协议行不符合约定，建议用户按协议补打印。
 - PRUNED 是正常早停剪枝，不是失败。
+- wake brief 里以「系统警报」或「确定性收敛信号」开头的条目是代码检测的确定性结果（护栏），优先级高于你自己的判断，必须优先处置或明确回应。
 
 # 纪律（硬性）
 - edit_search_space 前必须先 get_current_space；每次编辑必须写明 rationale。
@@ -84,7 +88,8 @@ DEFAULT_PROMPTS: dict[str, str] = {
     "tuning_wake_brief": ("第 {{round_no}} 轮唤醒（最多 {{max_wake_rounds}} 轮）。"
                           "已完成 {{finished_count}}/{{total}} 次试验，"
                           "剩余预算 {{budget_left}} 次，当前空间版本 v{{space_version}}。"
-                          "请先调用 get_study_summary 分析，再决定本轮动作。"),
+                          "请先调用 get_study_summary 分析，再决定本轮动作。"
+                          "{{wake_signals}}"),
 
     "setup_system": """你是 tansuo_agent 的**配置生成 agent**。任务：阅读用户的训练脚本，推断超参数搜索空间与指标评估方式，写出两份配置文件，并用探测试验自证可用。
 
@@ -162,6 +167,9 @@ def build_context_tuning_system(settings, space) -> dict:
 
 
 def build_context_tuning_wake(round_no: int, settings, orchestrator) -> dict:
+    # 确定性护栏信号（失败警报/收敛提示）：无信号时为空串，渲染结果与旧版一致
+    signals = build_wake_signals(orchestrator)
+    wake_signals = "".join(f"\n⚠ {s}" for s in signals)
     return {
         "round_no": round_no,
         "max_wake_rounds": settings.agent.max_wake_rounds,
@@ -169,6 +177,7 @@ def build_context_tuning_wake(round_no: int, settings, orchestrator) -> dict:
         "total": orchestrator.total,
         "budget_left": orchestrator.budget_left(),
         "space_version": orchestrator.space.version,
+        "wake_signals": wake_signals,
     }
 
 

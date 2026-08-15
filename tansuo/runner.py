@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 import optuna
 
@@ -19,13 +24,20 @@ from .space import SearchSpace
 
 
 class TrialFailedError(RuntimeError):
-    """试验失败（脚本出错 / 违反协议 / 超时）。reason 面向人类，hint 给修正建议。"""
+    """试验失败（脚本出错 / 违反协议 / 超时）。reason 面向人类，hint 给修正建议。
 
-    def __init__(self, reason: str, hint: str = "", detail: str = ""):
+    env_clues：瞬时故障（非零退出码且 stderr 为空）时采集的环境线索
+    （磁盘余量/安全软件进程等），随 TRIAL_FAIL 事件落 journal，
+    供 STAR #004 那类"单独复现正常"的疑难问题事后定位根因。
+    """
+
+    def __init__(self, reason: str, hint: str = "", detail: str = "",
+                 env_clues: dict | None = None):
         super().__init__(reason)
         self.reason = reason
         self.hint = hint
         self.detail = detail
+        self.env_clues = env_clues
 
     def full(self) -> str:
         parts = [self.reason]
@@ -67,6 +79,71 @@ def parse_metric_line(line: str) -> dict | None:
     if not isinstance(payload, dict):
         raise TrialFailedError("协议行 JSON 必须是对象", hint="最外层应为 {...}")
     return payload
+
+
+# ------------------------------------------------------------------
+# 瞬时故障环境线索（STAR #004 那类"退出码非零、stderr 为空、单独复现正常"
+# 的疑难问题，根因多与安全软件/磁盘等环境因素有关）。采集轻量、永不阻塞：
+# 任何一步失败就省略对应字段，绝不影响试验本身。
+# ------------------------------------------------------------------
+
+# 常见安全软件进程名（小写）。国内环境重点：360/火绒/腾讯电脑管家/金山；
+# 其余为国际常见产品。Defender（msmpeng.exe）在 Windows 上几乎必然在列，
+# 记录它用于排除"无第三方杀软"的场景。
+_KNOWN_SECURITY_PROCS = (
+    "360tray.exe", "360sd.exe", "zhudongfangyu.exe", "360rp.exe", "qhsafetray.exe",
+    "hipsdaemon.exe", "hipstray.exe",                       # 火绒
+    "qqpctray.exe", "qqpcrtp.exe", "qqprotect.exe",        # 腾讯电脑管家
+    "kxetray.exe", "ksafetray.exe",                        # 金山毒霸
+    "msmpeng.exe", "securityhealthsystray.exe",            # Windows Defender
+    "avp.exe", "klnagent.exe",                             # Kaspersky
+    "egui.exe", "ekrn.exe",                                # ESET
+    "avastsvc.exe", "avastui.exe", "aswidsagent.exe",      # Avast
+    "avgui.exe", "avgsvcx.exe",                            # AVG
+    "mbamservice.exe", "mbamtray.exe",                     # Malwarebytes
+)
+_SECURITY_CACHE: tuple[float, list[str]] | None = None
+_SECURITY_CACHE_TTL = 300.0   # 秒：安全软件清单短期内不变，避免每试验都跑 tasklist
+
+
+def _scan_security_procs(timeout: float = 5.0) -> list[str]:
+    """列出正在运行的已知安全软件进程（仅 Windows；带缓存；失败返回 []）。"""
+    global _SECURITY_CACHE
+    if sys.platform != "win32":
+        return []
+    now = time.monotonic()
+    if _SECURITY_CACHE is not None and now - _SECURITY_CACHE[0] < _SECURITY_CACHE_TTL:
+        return _SECURITY_CACHE[1]
+    found: list[str] = []
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
+                             capture_output=True, timeout=timeout)
+        # 字节模式解码：tasklist 输出是系统 ANSI 码页（简中为 GBK），
+        # text=True 在 UTF-8 模式 Python 下会解码失败；进程名都是 ASCII，
+        # errors=replace 不影响匹配。
+        low = out.stdout.decode("utf-8", errors="replace").lower()
+        found = sorted(n for n in _KNOWN_SECURITY_PROCS if n in low)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    _SECURITY_CACHE = (now, found)
+    return found
+
+
+def collect_env_clues(cwd: str | Path | None = None) -> dict:
+    """瞬时故障时的环境快照（写入 trial_retry / trial_fail 事件供事后诊断）。"""
+    clues: dict = {}
+    try:
+        du = shutil.disk_usage(str(cwd or Path.cwd()))
+        clues["disk_free_gb"] = round(du.free / 2**30, 2)
+    except OSError:
+        pass
+    try:
+        sec = _scan_security_procs()
+        if sec:
+            clues["security_procs"] = sec
+    except Exception:   # noqa: BLE001 —— 线索采集永不影响试验
+        pass
+    return clues
 
 
 class TrialRunner:
@@ -171,7 +248,8 @@ class TrialRunner:
                              and not (result.stderr_tail or "").strip())
                 if transient and attempt < attempts:
                     self.journal.append(TRIAL_RETRY, trial=trial.number, attempt=attempt,
-                                        reason=f"退出码 {result.exit_code} 且 stderr 为空，判定瞬时故障")
+                                        reason=f"退出码 {result.exit_code} 且 stderr 为空，判定瞬时故障",
+                                        env_clues=collect_env_clues())
                     curve.clear()
                     final_value["v"] = None
                     continue
@@ -183,13 +261,16 @@ class TrialRunner:
                          "也可在 settings.yaml 提高 adapter.timeout_s")
             if result.exit_code != 0:
                 retried = attempt - 1   # 实际发生的重试次数（确定性失败可能为 0）
+                # stderr 为空 = 瞬时故障形态：采环境线索落 journal 供根因诊断
+                transient_like = not (result.stderr_tail or "").strip()
                 raise TrialFailedError(
                     f"训练脚本退出码 {result.exit_code}"
                     + (f"（已自动重试 {retried} 次仍失败）" if retried else ""),
                     hint="查看下方 stderr/stdout 尾部定位脚本错误（若都为空，多为环境瞬时问题，"
                          "可在 settings.yaml 设置 adapter.retry_on_fail 自动重试）",
                     detail=(f"stderr: {result.stderr_tail or '(空)'} | "
-                            f"stdout 尾部: {result.stdout_tail[-3:] or '(空)'}"))
+                            f"stdout 尾部: {result.stdout_tail[-3:] or '(空)'}"),
+                    env_clues=collect_env_clues() if transient_like else None)
             if final_value["v"] is None:
                 raise TrialFailedError(
                     "训练结束但未收到 final 协议行",

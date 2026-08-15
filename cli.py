@@ -3,7 +3,7 @@
 子命令：
   run    跑超参数搜索（--no-agent 纯 Optuna 巡航；默认预算见 settings.yaml）
   runs   查看记录分区（记录永不删除；按三指纹自动分区；runs compare 跨分区对比）
-  space  查看当前搜索空间与补丁历史（space show）
+  space  查看当前搜索空间与补丁历史（space show）；手动编辑空间（space patch）
   check  探测 LLM 端点连通性（Phase 5 提供）
   init   生成离线配置模板兜底（Phase 6 提供）
   setup  配置 agent：自动起草 settings/搜索空间（Phase 6 提供）
@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -219,6 +220,43 @@ def cmd_space_show(args) -> int:
             print(f"  [{ev.get('ts')}] v{ev.get('version')} {desc} —— {ev.get('rationale')}")
     else:
         print("\n补丁历史：（无）")
+    return 0
+
+
+def cmd_space_patch(args) -> int:
+    """手动编辑搜索空间（人工权限通道：不依赖 LLM，widen 可扩展 envelope）。
+
+    与 agent 的 edit_search_space 走同一套 apply_patch 校验（narrow ⊆ 当前范围、
+    最少自由参数、int/log 合法性）；唯一区别是人工权限允许 widen 超出初始
+    envelope（extend_envelope 预扩展），因为人不受"只能聚焦或还原"的约束。
+    """
+    space_path = Path(args.space)
+    try:
+        space = SearchSpace.from_yaml(space_path)
+    except SpaceError as e:
+        print(f"配置错误：{e}", file=sys.stderr)
+        return 2
+    try:
+        ops = json.loads(args.ops)
+    except json.JSONDecodeError as e:
+        print(f"--ops 不是合法 JSON：{e}", file=sys.stderr)
+        return 2
+    if not isinstance(ops, list):
+        print("--ops 必须是 JSON 数组，如 [{\"op\": \"narrow\", ...}]", file=sys.stderr)
+        return 2
+    space.extend_envelope(ops)          # 人工权限：先扩 envelope，再统一校验
+    result = space.apply_patch(ops, args.rationale)
+    if not result.ok:
+        print("空间编辑被拒绝：", file=sys.stderr)
+        for er in result.errors:
+            print(f"  - {er}", file=sys.stderr)
+        if result.hint:
+            print(f"提示：{result.hint}", file=sys.stderr)
+        return 2
+    space_path.write_text(space.to_yaml(), encoding="utf-8")
+    print(f"搜索空间已更新 → v{result.new_version}（写入 {space_path}）")
+    print(space.describe())
+    print("注意：对之后新开的记录分区生效；已有分区的续跑仍使用该分区的空间快照。")
     return 0
 
 
@@ -597,10 +635,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     ps = sub.add_parser("space", parents=[common], help="搜索空间管理")
     ps_sub = ps.add_subparsers(dest="space_cmd", required=True)
-    ps_show = ps_sub.add_parser("show", help="查看当前空间与补丁历史")
+    ps_show = ps_sub.add_parser("show", parents=[common],
+                                help="查看当前空间与补丁历史")
     ps_show.add_argument("--cohort", default=None, metavar="ID",
                          help="查看指定分区的空间（默认最新分区）")
     ps_show.set_defaults(fn=cmd_space_show)
+    ps_patch = ps_sub.add_parser(
+        "patch", parents=[common],
+        help="手动编辑搜索空间（人工权限：widen 可扩展 envelope；"
+                      "其余校验与 agent 编辑一致）")
+    ps_patch.add_argument("--ops", required=True, metavar="JSON",
+                          help='op 数组 JSON，如 \'[{"op":"narrow","param":"lr",'
+                               '"low":1e-4,"high":0.01}]\'；op 取值 narrow/widen/'
+                               'freeze/release')
+    ps_patch.add_argument("--rationale", required=True, help="编辑理由（可审计硬性要求）")
+    ps_patch.set_defaults(fn=cmd_space_patch)
 
     pi = sub.add_parser("init", parents=[common], help="生成离线配置模板（无需 LLM 的兜底）")
     pi.add_argument("--force", action="store_true", help="覆盖已存在的配置文件")

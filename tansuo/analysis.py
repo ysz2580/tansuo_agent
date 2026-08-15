@@ -165,6 +165,117 @@ def recent_failures(journal, limit: int = 5) -> list[dict]:
     return out
 
 
+# ------------------------------------------------------------------
+# 唤醒信号（确定性护栏）：失败警报 + 收敛信号，注入 wake brief。
+# 提示词纪律依赖 agent 主动调工具查看；这里的信号由代码在唤醒前算好、
+# 强制进入开场消息——"是否看到"不再取决于 LLM（见 STAR #023）。
+# ------------------------------------------------------------------
+
+def suspicious_dims(failed_params: list[dict], done_params: list[dict]) -> list[str]:
+    """失败试验里均值显著偏高的数值维度 → 疑似耗时维度（供超时警报点名）。
+
+    判据：失败组均值 > 完结组均值，且差值超过完结组均值的 20%
+    （相对量纲，对 lr 这类小数值与 epochs 这类大数值同样适用）。
+    """
+    if not failed_params or not done_params:
+        return []
+    names = sorted({n for p in failed_params for n in p})
+    out: list[str] = []
+    for n in names:
+        fv = [p[n] for p in failed_params
+              if n in p and isinstance(p[n], (int, float)) and not isinstance(p[n], bool)]
+        dv = [p[n] for p in done_params
+              if n in p and isinstance(p[n], (int, float)) and not isinstance(p[n], bool)]
+        if not fv or not dv:
+            continue
+        fm, dm = sum(fv) / len(fv), sum(dv) / len(dv)
+        if fm > dm and (fm - dm) / max(abs(dm), 1e-9) > 0.2:
+            out.append(n)
+    return out
+
+
+def failure_alerts(study, journal, streak: int = 3) -> list[str]:
+    """确定性失败护栏：最近 streak 次失败同属一类 → 返回警报文本（否则 []）。
+
+    警报会注入 wake brief 开场消息，是硬性事实而非建议：
+    - 连续 timeout：点名疑似耗时维度（失败试验里取值显著偏高的数值参数）；
+    - 连续 exit_code：多为脚本确定性 bug，提示停止烧预算。
+    偶发/混杂类别不触发（瞬时噪声已有重试兜底，不打扰）。
+    """
+    fails = recent_failures(journal, limit=streak)
+    if len(fails) < streak:
+        return []
+    cats = {f["category"] for f in fails}
+    nums = "、".join(f"trial#{f['trial']}" for f in fails)
+    if cats == {"timeout"}:
+        failed_params, done_params = [], []
+        fail_set = {f["trial"] for f in fails}
+        for t in study.get_trials(deepcopy=False):
+            if t.number in fail_set and t.params:
+                failed_params.append(dict(t.params))
+            elif t.state == TrialState.COMPLETE and t.params:
+                done_params.append(dict(t.params))
+        dims = suspicious_dims(failed_params, done_params)
+        dim_txt = (f"。疑似耗时维度：{'、'.join(dims)}（在失败试验中取值显著偏高）"
+                   if dims else "")
+        return [f"系统警报（确定性检测）：最近 {streak} 次试验全部超时（{nums}）"
+                f"{dim_txt}。必须立即处置：用 narrow 压低耗时维度上界；若空间已收无可收，"
+                "在输出中建议用户提高 adapter.timeout_s 或调低 budget.data_fraction。"]
+    if cats == {"exit_code"}:
+        return [f"系统警报（确定性检测）：最近 {streak} 次试验全部以非零退出码失败"
+                f"（{nums}）。这不是搜索能修复的问题——停止烧预算，在输出中指出问题并"
+                "建议用户检查训练脚本（必要时调用 finish）。"]
+    return []
+
+
+def plateau_note(study, settings, window: int | None = None) -> str:
+    """确定性收敛信号：最近 window 次完成试验未刷新最优 → 返回提示（否则空串）。
+
+    window 默认 max(4, 2×wake_every)：比单次唤醒间隔更长，避免正常波动误报。
+    """
+    maximize = settings.metrics.primary.direction == "maximize"
+    window = window or max(4, 2 * int(settings.budget.wake_every))
+    done = [t for t in study.get_trials(deepcopy=False)
+            if t.state == TrialState.COMPLETE and t.value is not None]
+    if len(done) < window + 2:
+        return ""
+    recent, before = done[-window:], done[:-window]
+    best_recent = recent[0].value
+    for t in recent[1:]:
+        best_recent = _better(best_recent, t.value, maximize)
+    best_before, best_trial = before[0].value, before[0].number
+    for t in before[1:]:
+        if (t.value > best_before) if maximize else (t.value < best_before):
+            best_before, best_trial = t.value, t.number
+    imp = (best_recent - best_before) if maximize else (best_before - best_recent)
+    if imp > 0:
+        return ""
+    return (f"确定性收敛信号：最近 {window} 次完成试验均未超过此前最优 "
+            f"{best_before:.4f}（trial#{best_trial}）。搜索可能已收敛——"
+            "若 top 配置也趋同，考虑调用 finish；否则给出继续搜索的理由。")
+
+
+def build_wake_signals(orch) -> list[str]:
+    """汇总唤醒信号（失败警报 + 收敛信号）。任何异常返回 []——绝不打扰唤醒。
+
+    对 orchestrator 仅鸭子类型依赖（study/journal/settings），测试替身缺字段
+    时安静地返回空。
+    """
+    try:
+        study = getattr(orch, "study", None)
+        journal = getattr(orch, "journal", None)
+        settings = getattr(orch, "settings", None)
+        if study is None or journal is None or settings is None:
+            return []
+        signals = failure_alerts(study, journal)
+        note = plateau_note(study, settings)
+        if note:
+            signals.append(note)
+        return signals
+    except Exception:   # noqa: BLE001 —— 信号是增强项，计算失败不影响唤醒
+        return []
+
+
 def learning_curves(study, trial_ids: list[int] | None = None) -> list[dict]:
     """逐 epoch 曲线。默认：top-3 + 最近 2 次完成试验（agent 判断欠拟合/发散/还在涨）。"""
     done = completed_trials(study)

@@ -393,6 +393,32 @@ class SearchSpace:
         })
         return PatchResult(ok=True, new_version=self.version)
 
+    def extend_envelope(self, ops: list[dict]) -> None:
+        """人工权限编辑（CLI space patch）专用：为 widen op 预先扩展 envelope 边界。
+
+        agent 编辑不走这条路径——agent 只能聚焦或还原，不能发明新空间；
+        人拥有更高权限，可以扩展 envelope。扩展后仍走统一的 apply_patch 校验
+        （narrow ⊆ 当前范围、自由参数下限、int/log 合法性等），护栏不缺席。
+        非法字段一律跳过不扩展，留给 apply_patch 报错。
+        """
+        for op in ops if isinstance(ops, list) else []:
+            if not isinstance(op, dict) or str(op.get("op") or "").strip().lower() != "widen":
+                continue
+            p = self._by_name.get(str(op.get("param") or "").strip())
+            if p is None or p.kind not in ("float", "int"):
+                continue
+            low, high = _num(op.get("low")), _num(op.get("high"))
+            if low is None or high is None or not low < high:
+                continue
+            if p.kind == "int":
+                if not (float(low).is_integer() and float(high).is_integer()):
+                    continue
+                low, high = int(low), int(high)
+            if p.log and low <= 0:
+                continue
+            p.env_low = min(p.env_low, low)
+            p.env_high = max(p.env_high, high)
+
     # ================= 静态工具 =================
 
     @staticmethod

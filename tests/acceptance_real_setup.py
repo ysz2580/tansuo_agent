@@ -4,6 +4,7 @@
 ANTHROPIC_AUTH_TOKEN），会消耗 token 并真实跑训练，故不自动运行。用法：
 
   python tests/acceptance_real_setup.py --dir <项目目录> --train <训练脚本> [--trials 3]
+     [--pruner hyperband]   # 冒烟搜索前注入剪枝器类型（验收 hyperband 用）
 
 流程（全程走 Web API，与界面操作等价）：
 1. POST /api/projects   新建项目（自动脚手架 .tansuo/）并激活；
@@ -22,6 +23,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 PORT = 8125
@@ -52,6 +55,9 @@ def main() -> int:
     ap.add_argument("--dir", required=True, help="新项目目录（含训练代码/数据集）")
     ap.add_argument("--train", required=True, help="主训练脚本路径")
     ap.add_argument("--trials", type=int, default=3, help="冒烟搜索试验数")
+    ap.add_argument("--pruner", choices=["median", "hyperband"], default=None,
+                    help="冒烟搜索前把 settings 的 pruner 改成指定类型"
+                         "（验收剪枝器用；默认不改动 setup 起草的值）")
     args = ap.parse_args()
 
     proj_dir = Path(args.dir).resolve()
@@ -125,6 +131,18 @@ def main() -> int:
               f"search_space.yaml（{len(space_txt.splitlines())} 行）")
         if "data_dir" in settings_txt and ".tansuo" not in settings_txt.split("data_dir", 1)[1][:60]:
             print("  [warn] settings 的 data_dir 似乎不再指向 .tansuo/，隔离可能被破坏")
+
+        if args.pruner:
+            sp_path = proj_dir / ".tansuo" / "settings.yaml"
+            cfg = yaml.safe_load(settings_txt)
+            if args.pruner == "hyperband":
+                # max_resource=auto：验收 agent widen epochs 时剪枝器自适应的路径
+                cfg["pruner"] = {"type": "hyperband", "min_resource": 1,
+                                 "max_resource": "auto", "reduction_factor": 3}
+            else:
+                cfg.setdefault("pruner", {})["type"] = "median"
+            sp_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+            print(f"  [ok] 验收注入：pruner → {cfg['pruner']}")
 
         print(f"== 3. 冒烟搜索（trials={args.trials}，带调参 agent） ==")
         api("/api/run/start", {"trials": args.trials, "wake_every": 2})

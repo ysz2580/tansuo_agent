@@ -27,6 +27,10 @@ export function eventBody(e: AgentEvent): string {
           ? `配置会话完成${usage}`
           : `第 ${e.round} 轮结束${usage}${e.note ? `：${e.note}` : ""}`
       }
+      if (e.phase === "signals") {
+        const sigs = Array.isArray(e.signals) ? (e.signals as string[]).join("；") : ""
+        return `第 ${e.round} 轮护栏信号：${sigs}`
+      }
       return `第 ${e.round} 轮开始 ｜ 剩余预算 ${e.budget_left} ｜ 空间 v${e.space_version}`
     }
     case "agent_tool_call": {

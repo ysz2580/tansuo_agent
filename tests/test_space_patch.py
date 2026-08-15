@@ -225,6 +225,33 @@ def test_dynamic_tpe(tmp: Path) -> None:
     ok("数值边界漂移不崩", len(study2.trials) == 6)
 
 
+def test_extend_envelope() -> None:
+    print("== extend_envelope（人工权限：widen 可扩展 envelope） ==")
+    sp = SearchSpace.from_dict({"params": [
+        {"name": "lr", "type": "float", "low": 0.01, "high": 0.1, "description": "学习率"},
+        {"name": "epochs", "type": "int", "low": 5, "high": 50, "description": "训练轮数"},
+        {"name": "batch", "type": "int", "low": 16, "high": 256, "description": "批大小"},
+    ]})
+    # agent 路径（不 extend）：widen 超 envelope 依旧拒绝
+    r0 = sp.apply_patch([{"op": "widen", "param": "epochs", "low": 5, "high": 80}], "放宽")
+    ok("未经 extend_envelope 的 widen 超 envelope 仍被拒（agent 约束不变）", not r0.ok)
+    # 人工权限：先扩展 envelope，同一 op 通过
+    sp.extend_envelope([{"op": "widen", "param": "epochs", "low": 5, "high": 80}])
+    r1 = sp.apply_patch([{"op": "widen", "param": "epochs", "low": 5, "high": 80}],
+                        "人工放宽 epochs 上界")
+    ok("extend_envelope 后 widen 超原 envelope 通过", r1.ok and r1.new_version == 2,
+       str(r1.errors))
+    p = sp._by_name["epochs"]
+    ok("envelope 被扩展（env_high=80）且当前上界同步更新",
+       p.env_high == 80 and p.high == 80)
+    # 非法/无关 op 一律跳过：不崩、不误扩
+    sp.extend_envelope([{"op": "narrow", "param": "lr", "low": 0.02, "high": 0.08},
+                        {"op": "widen", "param": "nope", "low": 1, "high": 2},
+                        {"op": "widen", "param": "batch", "low": 999, "high": 1}])
+    ok("非 widen/未知参数/非法边界均被跳过不报错",
+       sp._by_name["lr"].env_high == 0.1 and sp._by_name["batch"].env_high == 256)
+
+
 if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -235,4 +262,5 @@ if __name__ == "__main__":
         test_validate_config(tmp)
         test_snapshot(tmp)
         test_dynamic_tpe(tmp)
+    test_extend_envelope()
     print(f"\n全部通过：{PASS} 项断言")

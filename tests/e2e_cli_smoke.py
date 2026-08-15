@@ -158,4 +158,39 @@ with tempfile.TemporaryDirectory() as td:
                   "--warm-start", "0")
     ok("--warm-start 0 关闭热启动", "[热启动]" not in r15.stdout)
 
+    print("== 10. space patch 手动编辑入口（人工权限） ==")
+    space3 = tmp / "space3.yaml"
+    space3.write_text(yaml.safe_dump({"params": [
+        {"name": "lr", "type": "float", "low": 0.01, "high": 0.1, "description": "学习率"},
+        {"name": "epochs", "type": "int", "low": 5, "high": 50, "description": "轮数"},
+        {"name": "batch", "type": "int", "low": 16, "high": 256, "description": "批大小"},
+    ]}, allow_unicode=True), encoding="utf-8")
+    S3 = ["--settings", str(settings_yaml), "--space", str(space3)]
+
+    r16 = run_cli(tmp, "space", "patch", *S3, "--rationale", "冒烟收窄",
+                  "--ops", '[{"op":"narrow","param":"lr","low":0.02,"high":0.08}]')
+    ok("narrow 通过并写回 v2", "搜索空间已更新 → v2" in r16.stdout)
+    d3 = yaml.safe_load(space3.read_text(encoding="utf-8"))
+    lr_p = next(p for p in d3["params"] if p["name"] == "lr")
+    ok("写回的边界生效", lr_p["low"] == 0.02 and lr_p["high"] == 0.08)
+    ok("提示分区生效语义", "新开的记录分区生效" in r16.stdout)
+
+    r17 = run_cli(tmp, "space", "patch", *S3, "--rationale", "人工放宽轮数",
+                  "--ops", '[{"op":"widen","param":"epochs","low":5,"high":80}]')
+    ok("人工 widen 超 envelope 通过 v3", "搜索空间已更新 → v3" in r17.stdout)
+    d3 = yaml.safe_load(space3.read_text(encoding="utf-8"))
+    ep_p = next(p for p in d3["params"] if p["name"] == "epochs")
+    ok("envelope 同步扩展（env_high=80）", ep_p["high"] == 80
+       and ep_p.get("env_high") == 80)
+
+    r18 = run_cli(tmp, "space", "patch", *S3, "--rationale", "未知参数",
+                  "--ops", '[{"op":"narrow","param":"nope","low":0,"high":1}]', expect=2)
+    ok("未知参数拒绝并给出错误", "未知参数" in r18.stderr and "空间编辑被拒绝" in r18.stderr)
+    r19 = run_cli(tmp, "space", "patch", *S3, "--rationale", "冻死",
+                  "--ops", '[{"op":"freeze","param":"lr","value":0.05}]', expect=2)
+    ok("冻结致自由参数不足被拒", "自由参数" in r19.stderr)
+    r20 = run_cli(tmp, "space", "patch", *S3, "--rationale", "坏 JSON",
+                  "--ops", "not-json", expect=2)
+    ok("非法 JSON 拒绝", "不是合法 JSON" in r20.stderr)
+
 print(f"\nCLI 冒烟全部通过：{PASS} 项")
