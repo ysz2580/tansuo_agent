@@ -64,6 +64,14 @@ DEFAULT_PROMPTS: dict[str, str] = {
    - 改完空间 → run_trials 跑几次验证方向，不要空转。
 4. 预算意识：总预算 {{total_trials}} 次试验。编辑空间（edit_search_space）与自定义试验都消耗稀缺资源，只做有证据支撑的改动。
 
+# 失败处置（硬性纪律）
+有失败试验时 get_study_summary 会返回 recent_failures（每条含 category 与 reason）。FAILED 不是"保持巡航"的理由，必须按类别应对：
+- category=timeout 成片出现：空间最重配置超过了 adapter.timeout_s 红线。用 narrow 压低耗时维度（epochs/width 等）上界；若空间已收无可收，在输出中明确建议用户提高 adapter.timeout_s 或调低 budget.data_fraction。绝不允许对成片超时视而不见。
+- category=exit_code 连续出现且非瞬时：训练脚本/配置有确定性 bug，搜索本身修不好。停止烧预算，在输出中指出问题并建议用户检查脚本（必要时 finish）。
+- category=exit_code 偶发、reason 注明"已自动重试"：环境瞬时噪声，系统已兜底，无需特殊处理。
+- category=protocol：脚本协议行不符合约定，建议用户按协议补打印。
+- PRUNED 是正常早停剪枝，不是失败。
+
 # 纪律（硬性）
 - edit_search_space 前必须先 get_current_space；每次编辑必须写明 rationale。
 - 护栏会拒绝越界编辑（超出初始 envelope、冻结过多参数等）；被拒时读错误信息修正，不要反复重试同样的非法编辑。
@@ -108,9 +116,10 @@ adapter.timeout_s 是单次试验的超时红线。搜索空间里**最重的配
 叠加更大 width/batch 等）必须能在 timeout_s 内跑完，否则正式搜索会成片超时失败。
 - 写 settings 时给出你估计的 timeout_s（参考脚本单步/单轮计算量）。
 - run_probe_trial 返回 duration_s（探针耗时）与 timeout_calibration：系统已按
-  「探针耗时 ×(空间最大 epochs÷探针 epochs)× 3 倍余量」自动折算并回写了
-  timeout_s，阅读该字段了解最终值；若其 warning 提示仍可能不够，在 finish
-  摘要里建议用户收窄 epochs 上界或调低 budget.data_fraction。
+  「探针耗时 ×(空间最大训练轮数÷探针训练轮数)× 3 倍余量」自动折算并回写了
+  timeout_s（训练轮数维度默认按 epochs/steps/iters 等自动识别，可用
+  adapter.iter_param 显式指定），阅读该字段了解最终值；若其 warning 提示仍可能
+  不够，在 finish 摘要里建议用户收窄轮数上界或调低 budget.data_fraction。
 - 探针耗时已接近 timeout_s 的 1/2 时，说明空间重配置大概率超时，务必确认
   校准结果已生效再 finish。
 

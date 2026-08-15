@@ -45,8 +45,10 @@ adapter:
   # entry: "mypkg.train:run_trial"
   config_via: env            # env=环境变量传 JSON | file=临时文件路径(TANSUO_CONFIG_FILE)
   timeout_s: 300             # 单次试验超时红线（秒）
-  # retry_on_fail: 1         # 瞬时故障自动重试次数（0-3）：仅"非零退出码且 stderr 为空"
+  retry_on_fail: 1           # 瞬时故障自动重试次数（0-3，默认 1）：仅"非零退出码且 stderr 为空"
                              # 判为瞬时故障；超时/协议错误/stderr 有内容是确定性失败，不重试
+  # iter_param: epochs       # 可选：训练轮数维度参数名（超时校准折算用）；省略则按
+                             # 名字含 epoch/step/iter/round 的数值参数自动识别
 
 # ---------- 预算 ----------
 budget:
@@ -60,9 +62,15 @@ budget:
 
 # ---------- 早停剪枝器 ----------
 pruner:
-  type: median               # 中位数剪枝：劣于已完成试验中位数的提前终止
+  type: median               # median=中位数早停（默认）| hyperband=逐层晋级（epochs 跨度大时更省）
+  # --- type=median 用（hyperband 时忽略）---
   n_startup_trials: 4        # 前 N 次试验不剪枝，先积累比较样本
   n_warmup_steps: 1          # 每个试验至少跑满 N 步才参与剪枝比较
+  # --- type=hyperband 用（median 时忽略）---
+  # min_resource: 1          # 最小训练步数（epoch）；跑满前不剪枝
+  # max_resource: auto       # 最大训练步数。auto=按已完结试验最大步数推断；
+  #                          # 空间 epochs 上界较大/会被放宽时建议显式给整数
+  # reduction_factor: 3      # 逐层晋级比例 η：每轮约 1/η 的试验晋级下一层
 
 # ---------- LLM agent（监督者） ----------
 agent:

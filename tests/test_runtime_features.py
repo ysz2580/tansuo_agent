@@ -22,6 +22,7 @@ sys.path.insert(0, str(TESTS_DIR))
 
 import optuna                                                  # noqa: E402
 
+from tansuo.analysis import failure_category, recent_failures  # noqa: E402
 from tansuo.config import ConfigError, load_settings           # noqa: E402
 from tansuo.journal import (AGENT_WAKEUP, FINISH, SESSION_START,  # noqa: E402
                             TRIAL_END, TRIAL_FAIL, TRIAL_RETRY, Journal)
@@ -361,6 +362,113 @@ def test_agent_token_usage(tmp: Path) -> None:
        and summ2["total_tokens"] == 450, str(summ2))
 
 
+def test_hyperband_pruner(tmp: Path) -> None:
+    print("== Hyperband 剪枝器 ==")
+    base = ("metrics:\n  primary: {name: val_acc, direction: maximize}\n"
+            "adapter:\n  mode: subprocess\n  command: [\"python\", \"x.py\"]\n")
+
+    def load(body: str, name: str):
+        p = tmp / f"{name}.yaml"
+        p.write_text(body, encoding="utf-8")
+        return load_settings(p)
+
+    s = load(base + "pruner: {type: hyperband, min_resource: 2, "
+                    "max_resource: 27, reduction_factor: 3}\n", "hb_ok")
+    ok("hyperband 配置通过校验（字段透出）",
+       s.pruner.type == "hyperband" and s.pruner.min_resource == 2
+       and s.pruner.max_resource == 27 and s.pruner.reduction_factor == 3)
+    ok("make_pruner(hyperband) → HyperbandPruner",
+       isinstance(make_pruner(s.pruner), optuna.pruners.HyperbandPruner))
+    ok("make_pruner(median) 仍是 MedianPruner",
+       isinstance(make_pruner(load(base, "md").pruner), optuna.pruners.MedianPruner))
+    s_auto = load(base + "pruner: {type: hyperband, max_resource: auto}\n", "hb_auto")
+    ok("hyperband max_resource=auto 合法", s_auto.pruner.max_resource == "auto")
+
+    def expect_error(name: str, body: str, *substr: str) -> None:
+        global PASS
+        safe = "".join(c if c.isalnum() else "_" for c in name)   # 文件名去 <> 空格
+        p = tmp / f"{safe}.yaml"
+        p.write_text(body, encoding="utf-8")
+        try:
+            load_settings(p)
+        except ConfigError as e:
+            missing = [x for x in substr if x not in str(e)]
+            assert not missing, f"FAIL: {name} 错误消息缺 {missing}，实际：{e}"
+            PASS += 1
+            print(f"  [ok] {name}（按预期拒绝）")
+            return
+        raise AssertionError(f"FAIL: {name} 本应报错但没有")
+
+    expect_error("hyperband min_resource<1 被拒",
+                 base + "pruner: {type: hyperband, min_resource: 0}\n", "min_resource")
+    expect_error("hyperband reduction_factor<2 被拒",
+                 base + "pruner: {type: hyperband, reduction_factor: 1}\n", "reduction_factor")
+    expect_error("hyperband max_resource 非法字符串被拒",
+                 base + "pruner: {type: hyperband, max_resource: bogus}\n", "max_resource")
+    expect_error("hyperband max_resource≤min_resource 被拒",
+                 base + "pruner: {type: hyperband, min_resource: 5, max_resource: 5}\n",
+                 "max_resource")
+    expect_error("未知 pruner.type 被拒", base + "pruner: {type: nope}\n",
+                 "median", "hyperband")
+
+    # 功能冒烟：真实跑一个 hyperband 搜索（每试验报告 10 个 step），不崩、全部完结
+    study = optuna.create_study(direction="maximize",
+                                sampler=make_sampler(seed=1, n_startup_trials=2),
+                                pruner=make_pruner(s.pruner))
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 1.0)
+        for step in range(1, 11):
+            trial.report(x * step, step)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+        return x
+
+    study.optimize(objective, n_trials=15)
+    states = [t.state for t in study.trials]
+    ok("hyperband 下 15 次试验全部完结（COMPLETE/PRUNED，无 FAIL）",
+       len(states) == 15
+       and all(st in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+               for st in states), str(states))
+    ok("hyperband 搜索给出最优值", study.best_value >= 0.0,
+       f"best={study.best_value:.4f}")
+
+
+def test_failure_awareness(tmp: Path) -> None:
+    print("== 失败原因感知（agent summary 注入 recent_failures） ==")
+    # 两次确定性失败（退出码 2）→ journal 记 trial_fail，recent_failures 能还原
+    s = make_settings(tmp, CHILD_ALWAYS_FAIL, "failaware", retry=0, total=2)
+    orch = make_orch(s)
+    orch.run_batch(2)
+    fails = recent_failures(orch.journal)
+    ok("recent_failures 返回 2 条失败", len(fails) == 2, str(fails))
+    ok("退出码失败归类 exit_code 且带 trial/reason/hint",
+       all(f["category"] == "exit_code" and f["trial"] is not None
+           and "退出码" in f["reason"] for f in fails), str(fails))
+
+    ok("failure_category 分类正确（timeout/protocol/unexpected/exit_code/other）",
+       failure_category("训练超时（>300s）") == "timeout"
+       and failure_category("协议行 JSON 解析失败") == "protocol"
+       and failure_category("未预期异常：ValueError: x") == "unexpected"
+       and failure_category("训练脚本退出码 1") == "exit_code"
+       and failure_category("其它原因") == "other")
+
+    # tune.get_study_summary 注入 recent_failures（失败可见 → agent 才能应对）
+    from tansuo.agent.skills.tune import TuneExecutor
+    ex = TuneExecutor(orch, log=lambda *_: None)
+    out = ex._tool_get_study_summary(top_k=3)
+    ok("get_study_summary 返回含 recent_failures", "recent_failures" in out)
+    ok("summary 的 recent_failures 透出 exit_code 类别与退出码原因",
+       "exit_code" in out and "退出码" in out)
+
+    # 无失败试验时不带 recent_failures 键（不打扰）
+    s2 = make_settings(tmp, CHILD_SLOW, "nofail", total=1)
+    orch2 = make_orch(s2)
+    orch2.run_batch(1)
+    out2 = TuneExecutor(orch2, log=lambda *_: None)._tool_get_study_summary(top_k=3)
+    ok("无失败试验时 summary 不含 recent_failures", "recent_failures" not in out2)
+
+
 def test_config_validation(tmp: Path) -> None:
     print("== 新字段配置校验 ==")
 
@@ -397,5 +505,7 @@ if __name__ == "__main__":
         test_time_budget_and_eta(tmp)
         test_exception_guard(tmp)
         test_agent_token_usage(tmp)
+        test_hyperband_pruner(tmp)
+        test_failure_awareness(tmp)
         test_config_validation(tmp)
     print(f"\n全部通过：{PASS} 项断言")

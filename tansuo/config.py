@@ -71,7 +71,8 @@ class AdapterCfg:
     entry: str = ""                   # mode=python: "module.path:fn"
     config_via: str = "env"           # env | file
     timeout_s: int = 300
-    retry_on_fail: int = 0            # 瞬时失败自动重试次数（仅"非零退出码且 stderr 为空"）
+    retry_on_fail: int = 1            # 瞬时失败自动重试次数（仅"非零退出码且 stderr 为空"）；默认 1 兜底环境噪声
+    iter_param: str = ""              # 训练轮数维度参数名（超时校准用）；空=按 epoch/step/iter/round 自动识别
 
 
 @dataclass
@@ -87,9 +88,14 @@ class BudgetCfg:
 
 @dataclass
 class PrunerCfg:
-    type: str = "median"
+    type: str = "median"              # median | hyperband
+    # median 用：
     n_startup_trials: int = 4
     n_warmup_steps: int = 1
+    # hyperband 用（median 时忽略）：
+    min_resource: int = 1             # 最小训练步数（epoch），达到前不剪枝
+    max_resource: int | str = "auto"  # 最大训练步数；"auto"=按已完结试验的最大步数推断
+    reduction_factor: int = 3         # 逐层晋级比例（η）：每轮约 1/η 试验晋级
 
 
 @dataclass
@@ -193,7 +199,8 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         entry=str(a.get("entry") or "").strip(),
         config_via=str(a.get("config_via", "env")).strip().lower(),
         timeout_s=int(a.get("timeout_s", 300)),
-        retry_on_fail=int(a.get("retry_on_fail", 0)),
+        retry_on_fail=int(a.get("retry_on_fail", 1)),
+        iter_param=str(a.get("iter_param") or "").strip(),
     )
     _require(adapter.mode in ("subprocess", "python"),
              f"adapter.mode 非法：'{adapter.mode}'，必须是 subprocess 或 python")
@@ -236,14 +243,32 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
 
     # ---- pruner ----
     p = raw.get("pruner") or {}
+    max_resource = p.get("max_resource", "auto")
     pruner = PrunerCfg(
         type=str(p.get("type", "median")).strip().lower(),
         n_startup_trials=int(p.get("n_startup_trials", 4)),
         n_warmup_steps=int(p.get("n_warmup_steps", 1)),
+        min_resource=int(p.get("min_resource", 1)),
+        reduction_factor=int(p.get("reduction_factor", 3)),
     )
-    _require(pruner.type == "median", f"pruner.type 目前仅支持 median，实际：'{pruner.type}'")
+    _require(pruner.type in ("median", "hyperband"),
+             f"pruner.type 必须是 median 或 hyperband，实际：'{pruner.type}'")
     _require(pruner.n_startup_trials >= 0 and pruner.n_warmup_steps >= 0,
              "pruner.n_startup_trials / n_warmup_steps 不能为负")
+    if pruner.type == "hyperband":
+        _require(pruner.min_resource >= 1,
+                 f"pruner.min_resource 必须 ≥ 1，实际 {pruner.min_resource}")
+        _require(pruner.reduction_factor >= 2,
+                 f"pruner.reduction_factor 必须 ≥ 2（每轮晋级比例 η），实际 {pruner.reduction_factor}")
+        if isinstance(max_resource, str):
+            _require(max_resource.strip().lower() == "auto",
+                     f"pruner.max_resource 必须是正整数或 'auto'，实际：'{max_resource}'")
+            pruner.max_resource = "auto"
+        else:
+            mr = int(max_resource)
+            _require(mr > pruner.min_resource,
+                     f"pruner.max_resource 必须大于 min_resource={pruner.min_resource}，实际 {mr}")
+            pruner.max_resource = mr
 
     # ---- agent ----
     g = raw.get("agent") or {}

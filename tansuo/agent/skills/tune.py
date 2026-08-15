@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 
-from ...analysis import learning_curves, summarize
+from ...analysis import learning_curves, recent_failures, summarize
 from ...journal import SPACE_PATCH
 from ..prompt_store import load_overrides
 from ..prompts import (build_context_tuning_system, build_context_tuning_wake,
@@ -24,7 +24,8 @@ TUNING_TOOLS = [
         "name": "get_study_summary",
         "description": ("获取研究汇总：试验计数、当前最优、top-k 配置、"
                         "top25%/bottom25% 参数分布对比、参数重要度（哪些维度影响最大）、"
-                        "收敛信号、剩余预算。"
+                        "收敛信号、剩余预算；若有失败试验，还返回 recent_failures"
+                        "（最近失败的原因与类别 timeout/exit_code/protocol 等）。"
                         "每轮唤醒必须第一个调用。"),
         "input_schema": {
             "type": "object",
@@ -179,6 +180,9 @@ class TuneExecutor:
                        "left": self.orch.budget_left()},
             **s,
         }
+        fails = recent_failures(self.journal)
+        if fails:
+            out["recent_failures"] = fails
         return _json(out)
 
     def _tool_get_current_space(self) -> str:

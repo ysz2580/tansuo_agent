@@ -35,6 +35,28 @@ _PRESERVE_FIELDS = (
 # 超限时返回 warning 让 agent 在 finish 摘要里建议收窄空间。
 _TIMEOUT_CAP_S = 7200
 
+# 训练轮数维度参数的名字线索（校准按此折算"最重配置"耗时）。epoch 最常见优先；
+# 脚本用 step/iter/round 命名也能命中。settings 可用 adapter.iter_param 显式指定覆盖。
+_ITER_KEYWORDS = ("epoch", "step", "iter", "round")
+
+
+def _find_iter_param(space, explicit: str | None = None):
+    """定位训练轮数维度参数（数值型、有上界 high）。
+
+    优先 settings 显式指定的 adapter.iter_param；否则按名字含
+    epoch/step/iter/round 自动识别（按关键词优先级取第一个命中）。
+    返回 SpaceParam 或 None。
+    """
+    if explicit:
+        for p in space.params:
+            if p.name == explicit and p.kind in ("int", "float") and p.high:
+                return p
+    for kw in _ITER_KEYWORDS:
+        for p in space.params:
+            if kw in p.name.lower() and p.kind in ("int", "float") and p.high:
+                return p
+    return None
+
 
 def _deep_get(d: dict, path: tuple):
     cur = d
@@ -324,16 +346,15 @@ class SetupExecutor:
         if not isinstance(raw, dict):
             return None
 
-        # 定位「训练轮数」参数（名含 epoch 的数值参数），取其 envelope 上界
-        ep = next((p for p in space.params
-                   if "epoch" in p.name.lower() and p.kind in ("int", "float")
-                   and p.high), None)
+        # 定位「训练轮数」维度参数：优先 adapter.iter_param 显式指定，
+        # 否则按名字含 epoch/step/iter/round 自动识别；取其 envelope 上界折算
+        adapter = raw.get("adapter") if isinstance(raw.get("adapter"), dict) else {}
+        ep = _find_iter_param(space, adapter.get("iter_param"))
         probe_ep = probe_params.get(ep.name) if ep else None
         try:
             ratio = (float(ep.high) / float(probe_ep)) if (ep and probe_ep) else 1.0
         except (TypeError, ValueError, ZeroDivisionError):
             ratio = 1.0
-        adapter = raw.get("adapter") if isinstance(raw.get("adapter"), dict) else {}
         try:
             current = int(adapter.get("timeout_s", 300))
         except (TypeError, ValueError):
@@ -345,8 +366,9 @@ class SetupExecutor:
 
         info = {
             "probe_duration_s": duration_s,
-            "probe_epochs": probe_ep,
-            "space_max_epochs": float(ep.high) if ep else None,
+            "iter_param": ep.name if ep else None,
+            "probe_iter": probe_ep,
+            "space_max_iter": float(ep.high) if ep else None,
             "old_timeout_s": current,
             "recommended_timeout_s": recommended,
             "capped": capped,

@@ -69,7 +69,19 @@ def make_sampler(seed: int = 42, n_startup_trials: int = 5) -> DynamicTPESampler
     return DynamicTPESampler(seed=seed, n_startup_trials=n_startup_trials)
 
 
-def make_pruner(pruner_cfg) -> optuna.pruners.MedianPruner:
+def make_pruner(pruner_cfg) -> optuna.pruners.BasePruner:
+    """剪枝器工厂：median（默认）或 hyperband。
+
+    hyperband 的 max_resource="auto" 时，Optuna 用「已完结试验的最大步数 +1」推断
+    总资源；冷启动（无完结试验）不剪枝，安全。搜索空间 epochs 上界若会被 agent
+    大幅 widen，建议显式给 max_resource，避免早期推断值偏小。
+    """
+    if pruner_cfg.type == "hyperband":
+        return optuna.pruners.HyperbandPruner(
+            min_resource=pruner_cfg.min_resource,
+            max_resource=pruner_cfg.max_resource,
+            reduction_factor=pruner_cfg.reduction_factor,
+        )
     return optuna.pruners.MedianPruner(
         n_startup_trials=pruner_cfg.n_startup_trials,
         n_warmup_steps=pruner_cfg.n_warmup_steps,

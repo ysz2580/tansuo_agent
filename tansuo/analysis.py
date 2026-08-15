@@ -9,6 +9,8 @@ import statistics
 import optuna
 from optuna.trial import TrialState
 
+from .journal import TRIAL_FAIL
+
 
 def completed_trials(study) -> list:
     return [t for t in study.get_trials(deepcopy=False)
@@ -125,6 +127,42 @@ def summarize(study, settings, top_k: int = 5) -> dict:
         "importances": param_importances(study),
         "convergence": convergence_hint(study, settings),
     }
+
+
+def failure_category(reason: str) -> str:
+    """把失败原因归成 agent 可直接决策的类别。"""
+    if "超时" in reason:
+        return "timeout"
+    if "退出码" in reason:
+        return "exit_code"
+    if "协议" in reason or "JSON" in reason:
+        return "protocol"
+    if "未预期异常" in reason:
+        return "unexpected"
+    return "other"
+
+
+def recent_failures(journal, limit: int = 5) -> list[dict]:
+    """最近 limit 次失败试验的原因（供 agent 区分瞬时噪声与系统性问题）。
+
+    失败原因只存在于 journal（Optuna study 不记录），无失败返回 []。
+    每条含 trial/category/reason/hint：category 供 agent 按类别采取不同应对。
+    """
+    try:
+        events = journal.load_events()
+    except OSError:
+        return []
+    fails = [e for e in events if e.get("kind") == TRIAL_FAIL]
+    out = []
+    for e in fails[-limit:]:
+        reason = str(e.get("reason") or "")
+        out.append({
+            "trial": e.get("trial"),
+            "category": failure_category(reason),
+            "reason": reason,
+            "hint": e.get("hint") or "",
+        })
+    return out
 
 
 def learning_curves(study, trial_ids: list[int] | None = None) -> list[dict]:

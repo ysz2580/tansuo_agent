@@ -30,6 +30,7 @@ from test_cohort import ok                                        # noqa: E402
 
 
 def _mk_executor(tmp: Path) -> SetupExecutor:
+    tmp.mkdir(parents=True, exist_ok=True)
     sp = tmp / ".tansuo" / "settings.yaml"
     space = tmp / ".tansuo" / "search_space.yaml"
     train = tmp / "train.py"
@@ -115,6 +116,15 @@ def _space_with_epochs(high: int) -> SearchSpace:
     ]})
 
 
+def _space_with_iter(name: str, high: int) -> SearchSpace:
+    return SearchSpace.from_dict({"params": [
+        {"name": "lr", "type": "float", "low": 1e-4, "high": 0.1, "log": True,
+         "description": "学习率"},
+        {"name": name, "type": "int", "low": 5, "high": high,
+         "description": "训练轮数"},
+    ]})
+
+
 def test_calibrate_timeout(tmp: Path):
     print("== 探针超时校准 ==")
     ex = _mk_executor(tmp)
@@ -145,6 +155,53 @@ def test_calibrate_timeout(tmp: Path):
        and info3["capped"] and "warning" in info3, str(info3))
 
 
+def test_calibrate_iter_param(tmp: Path):
+    print("== 超时校准泛化（step/iter 自动识别 + iter_param 显式指定） ==")
+    # 1) step 命名自动识别（不局限于 epoch）
+    ex = _mk_executor(tmp / "p1")
+    sp = Path(ex.settings_path)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(yaml.safe_dump(_valid_settings(), allow_unicode=True), encoding="utf-8")
+    info = ex._calibrate_timeout(_space_with_iter("steps", 50), {"steps": 10}, 184.5)
+    ok("step 命名的轮数维度自动识别并折算（184.5×5×3→2770）",
+       info is not None and info["iter_param"] == "steps"
+       and info["recommended_timeout_s"] == 2770, str(info))
+
+    # 2) iter 命名自动识别
+    ex2 = _mk_executor(tmp / "p2")
+    sp2 = Path(ex2.settings_path)
+    sp2.parent.mkdir(parents=True, exist_ok=True)
+    sp2.write_text(yaml.safe_dump(_valid_settings(), allow_unicode=True), encoding="utf-8")
+    info2 = ex2._calibrate_timeout(_space_with_iter("n_iters", 50), {"n_iters": 10}, 184.5)
+    ok("iter 命名的轮数维度自动识别",
+       info2 is not None and info2["iter_param"] == "n_iters", str(info2))
+
+    # 3) adapter.iter_param 显式指定优先（参数名无任何线索也能命中）
+    ex3 = _mk_executor(tmp / "p3")
+    sp3 = Path(ex3.settings_path)
+    sp3.parent.mkdir(parents=True, exist_ok=True)
+    cfg = _valid_settings()
+    cfg["adapter"]["iter_param"] = "passes"
+    sp3.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    info3 = ex3._calibrate_timeout(_space_with_iter("passes", 50), {"passes": 10}, 184.5)
+    ok("显式 iter_param 优先（名字无线索也折算 2770）",
+       info3 is not None and info3["iter_param"] == "passes"
+       and info3["recommended_timeout_s"] == 2770, str(info3))
+
+    # 4) 无任何轮数维度 → ratio=1 按探针耗时校准（不报错）
+    ex4 = _mk_executor(tmp / "p4")
+    sp4 = Path(ex4.settings_path)
+    sp4.parent.mkdir(parents=True, exist_ok=True)
+    sp4.write_text(yaml.safe_dump(_valid_settings(), allow_unicode=True), encoding="utf-8")
+    lr_only = SearchSpace.from_dict({"params": [
+        {"name": "lr", "type": "float", "low": 1e-4, "high": 0.1, "log": True,
+         "description": "学习率"}]})
+    info4 = ex4._calibrate_timeout(lr_only, {"lr": 0.01}, 100.0)
+    ok("无轮数维度时 ratio=1 校准不报错",
+       info4 is not None and info4["iter_param"] is None
+       and info4["recommended_timeout_s"] == 300, str(info4))
+
+
 def test_setup_context_existing(tmp: Path):
     print("== setup 提示词注入现有配置 ==")
     from tansuo.agent.prompts import build_context_setup, setup_system_prompt
@@ -164,6 +221,7 @@ def main() -> int:
         test_merge_env_fields(tmp)
         test_timeout_ratchet(tmp)
         test_calibrate_timeout(tmp)
+        test_calibrate_iter_param(tmp)
         test_setup_context_existing(tmp)
     print(f"\n全部通过：{test_cohort.PASS} 项断言")
     return 0
