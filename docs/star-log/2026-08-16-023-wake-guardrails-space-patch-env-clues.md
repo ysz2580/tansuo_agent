@@ -57,6 +57,9 @@ module: tansuo/analysis.py + agent/prompts.py + agent/loop.py + space.py + runne
 | `space patch` 复用 `space` 顶层 parser 的 `--settings/--space` | 失败 | `parents=[common]` 的参数挂在 `ps` 层，写在子命令之后报 `unrecognized arguments`；给 `ps_show`/`ps_patch` 补 `parents=[common]`（对齐 `runs show/compare` 的既有风格） |
 | 首次 Edit 插入 `extend_envelope` | 失败重做 | old/new 锚点几乎相同导致代码未插入，且别处出现行合并损坏（`latest_snapshot` 的 def 签名与函数体首行被并到一行，全包 `IndentationError`）；以更长的真实内容锚点重做，并以 `ast.parse` 编译检查后才继续 |
 | 合成试验数据里失败/完结组的 batch 随意取值 | 测试失败 | batch 失败组均值 32 vs 完结组均值 24，相对差 33% > 20% 阈值被 `suspicious_dims` 一并点名——非目标维度未控制的测试数据会污染断言；把完结组 batch 统一为 32 后只点名 epochs |
+| widen 只校验 ⊆ envelope（初版） | 复查发现并修复 | `widen [60,80]`（当前 [5,50]）会静默丢弃现有搜索区间——名为放宽实为平移；补「widen 必须包含当前范围」校验，错误消息指引「先 narrow 再 widen」 |
+| 护栏信号只靠模板里的 `{{wake_signals}}`（初版） | 复查发现并修复 | 用户覆盖 wake brief 模板但没写该占位符时，确定性信号被静默丢弃，「agent 绕不过去」失效；`TuneSkill.opening_message` 渲染后检测缺失即强制追加到末尾 |
+| Web 预览上下文漏 wake_signals 键（初版） | 复查发现并修复 | 默认简报预览渲染出未填充的 `{{wake_signals}}` 字面量且 `missing_vars` 非空；`_preview_context` 补带说明的预览样例值 |
 
 ### 最终方案
 
@@ -94,10 +97,11 @@ module: tansuo/analysis.py + agent/prompts.py + agent/loop.py + space.py + runne
 ## R · 实际效果（Result）
 
 - **验证方式**：新增/扩展测试 + 全量回归 + 真实验收。
-  - `test_runtime_features.py` 46 → **64**（`test_wake_signals` 11 项：exit_code 警报/类别混杂静默/超时点名 epochs/`suspicious_dims` 正反例/收敛信号触发与静默/`build_wake_signals` 汇总/wake brief 强制注入 ⚠/无信号逐字兼容；`test_env_clues` 4 项：磁盘余量/`trial_retry` 带线索/瞬时形态 `trial_fail` 带线索/stderr 有内容不带；`test_hyperband_widen` 3 项：中途 widen 成功/全完结/有试验越过旧上界 8 步）。
-  - `test_space_patch.py` 34 → **38**（`test_extend_envelope`：agent 路径不 extend 时 widen 超 envelope 仍被拒、extend 后通过且 envelope 同步扩展、非法 op 跳过不误扩）。
+  - `test_runtime_features.py` 46 → **65**（`test_wake_signals` 12 项：exit_code 警报/类别混杂静默/超时点名 epochs/`suspicious_dims` 正反例/收敛信号触发与静默/`build_wake_signals` 汇总/wake brief 强制注入 ⚠/覆盖模板缺占位符时护栏兜底追加/无信号逐字兼容；`test_env_clues` 4 项：磁盘余量/`trial_retry` 带线索/瞬时形态 `trial_fail` 带线索/stderr 有内容不带；`test_hyperband_widen` 3 项：中途 widen 成功/全完结/有试验越过旧上界 8 步）。
+  - `test_space_patch.py` 34 → **39**（`test_extend_envelope` 4 项：agent 路径不 extend 时 widen 超 envelope 仍被拒、extend 后通过且 envelope 同步扩展、非法 op 跳过不误扩；另补「widen 必须包含当前范围（只放宽不平移）」拒绝断言）。
   - `tests/e2e_cli_smoke.py` 31 → **39**（第 10 节：narrow 写回 v2 边界生效/人工 widen 超 envelope 且 env_high=80/未知参数 rc2/冻结致自由参数不足 rc2/非法 JSON rc2/分区生效语义提示）。
-  - 全量回归：12 单测套件 **421 项断言**全绿（cohort 116 / runtime 64 / space_patch 38 / notify 32 / conditional_space 30 / compare 28 / prompts 28 / guardrails 21 / setup_guard 20 / project_store 16 / warmstart 16 / protocol 12），CLI 冒烟 39 项、Web 冒烟 82 项全绿；`npm run build`（tsc + vite）通过（agentEvents.ts 类型正确）。
+  - `tests/e2e_web_smoke.py` 82 → **83**（提示词预览新增「默认简报预览含护栏信号样例且无未填充占位符」断言）。
+  - 全量回归：12 单测套件 **423 项断言**全绿（cohort 116 / runtime 65 / space_patch 39 / notify 32 / conditional_space 30 / compare 28 / prompts 28 / guardrails 21 / setup_guard 20 / project_store 16 / warmstart 16 / protocol 12），CLI 冒烟 39 项、Web 冒烟 83 项全绿；`npm run build`（tsc + vite）通过（agentEvents.ts 类型正确）。
   - Hyperband 真实验收（`python tests/acceptance_real_setup.py --dir <scratch> --train <scratch>\train_mnist.py --trials 5 --pruner hyperband`，真实 LLM 端点 + MNIST CPU）：新建项目脚手架 → setup agent 起草配置（耗时 1035s、65443 tokens，推断 epochs 3-15，探针 43.9s 校准 timeout 600s）→ 注入 `pruner: {type: hyperband, min_resource: 1, max_resource: auto, reduction_factor: 3}` 成功 → 冒烟搜索 5 次试验（301s）：**完结 4、剪枝 1（Hyperband 真实剪掉一次中途试验）、失败 0**，最优 val_acc=0.984（trial#0，adamw）；调参 agent 唤醒 2 轮（11773 tokens），退出码 0，全链路通过。
 - **前后对比**：
   - 唤醒护栏：成片失败/长期停滞从「提示词建议、LLM 自觉」→「代码检测、⚠ 强制注入 wake brief、提示词规定优先级高于 agent 自身判断」；journal 增 `agent_wakeup phase="signals"` 审计事件，前端 Agent 页渲染「第 N 轮护栏信号」。
@@ -113,3 +117,4 @@ module: tansuo/analysis.py + agent/prompts.py + agent/loop.py + space.py + runne
   4. **Windows 系统命令输出是系统码页（简中=GBK）**：UTF-8 模式 Python 用 `text=True` 读 `tasklist` 会解码失败且错误发生在 reader 线程、表现隐蔽（功能静默降级为空清单）；读系统命令输出一律用字节模式 + `errors="replace"`。
   5. **argparse 加子-子命令先抄邻居**：`runs show/compare` 已带 `parents=[common]`，`space show/patch` 漏了就是 `unrecognized arguments`；CLI 的一致性靠对照既有结构而不是凭记忆。
   6. Edit 失败后重做要换**更长的真实内容锚点**，并在继续前跑 `ast.parse` 编译检查——本次行合并损坏（def 签名并入函数体）是在全包 import 失败时才暴露的。
+  7. **测试全绿 ≠ 没有语义漏洞**：提交后复查又挖出三个真实缺陷——widen 只校验 ⊆ envelope 不校验 ⊇ 当前范围（可静默平移区间）、护栏信号依赖模板占位符（覆盖模板可绕过）、预览上下文漏键。护栏类功能要专门反问一句「这条保护能被什么合法操作绕过」，比单纯补测试更能暴露这类问题。

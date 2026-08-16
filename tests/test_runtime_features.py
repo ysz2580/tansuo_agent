@@ -520,6 +520,14 @@ def test_wake_signals(tmp: Path) -> None:
     brief = tuning_wake_brief(1, s, orch)
     ok("wake brief 强制注入警报（⚠ 前缀，agent 无法绕过）",
        "⚠ 系统警报" in brief and brief.startswith("第 1 轮唤醒"), brief)
+    # 用户覆盖模板故意不带 {{wake_signals}} → 护栏兜底追加，模板编辑绕不过去
+    from tansuo.agent.prompt_store import save_override           # noqa: E402
+    from tansuo.agent.skills.tune import TuneSkill                # noqa: E402
+    save_override(s, "tuning_wake_brief", "自定义简报（不带信号占位符）", "测试覆盖")
+    msg = TuneSkill(s, orch, 1).opening_message()
+    ok("覆盖模板缺 {{wake_signals}} 时护栏兜底追加",
+       msg.startswith("自定义简报") and "⚠ 系统警报" in msg, msg)
+    save_override(s, "tuning_wake_brief", "", "还原出厂")
     # 混入一条协议错误 → 类别混杂不触发（避免把偶发问题当系统性问题打扰）
     orch.journal.append(TRIAL_FAIL, trial=99, reason="协议行 JSON 解析失败")
     ok("失败类别混杂时不触发警报", failure_alerts(orch.study, orch.journal) == [])

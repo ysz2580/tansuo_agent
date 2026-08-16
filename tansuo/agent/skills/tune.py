@@ -286,9 +286,14 @@ class TuneSkill(Skill):
                              self._prompts)
 
     def opening_message(self) -> str:
-        return render_prompt("tuning_wake_brief",
-                             build_context_tuning_wake(self.round_no, self.settings, self.orch),
-                             self._prompts)
+        ctx = build_context_tuning_wake(self.round_no, self.settings, self.orch)
+        text = render_prompt("tuning_wake_brief", ctx, self._prompts)
+        # 护栏兜底：用户覆盖的模板若未带 {{wake_signals}}，确定性信号会被静默
+        # 丢掉——护栏不允许被模板编辑绕过，缺了就强制追加到末尾。
+        signals = ctx.get("wake_signals") or ""
+        if signals and signals not in text:
+            text += signals
+        return text
 
     def limits(self) -> SkillLimits:
         cfg = self.settings.agent

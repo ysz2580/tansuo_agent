@@ -114,6 +114,11 @@ def test_patch(tmp: Path) -> None:
                        "还原到 envelope")
     ok("widen 还原 envelope 通过", r.ok and sp._by_name["lr"].high == 0.3)
 
+    r = sp.apply_patch([{"op": "widen", "param": "lr", "low": 0.1, "high": 0.3}],
+                       "试图平移区间")
+    ok("widen 不包含当前范围被拒（只放宽不平移）",
+       not r.ok and "包含当前范围" in str(r.errors))
+
     r = sp.apply_patch([{"op": "set_choices", "param": "scheduler",
                          "choices": ["none", "cosine"]}], "裁剪取值集")
     ok("set_choices 被拒并给 freeze 指引", not r.ok and "freeze" in str(r.errors))

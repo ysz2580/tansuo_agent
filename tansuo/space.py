@@ -500,6 +500,10 @@ def _apply_one_op(ws: SearchSpace, op: dict, idx: int) -> list[str]:
         p.low = int(low) if p.kind == "int" else low
         p.high = int(high) if p.kind == "int" else high
     else:  # widen
+        if low > p.low + _EPS or high < p.high - _EPS:
+            return [f"{ctx} widen 必须包含当前范围 [{p.low}, {p.high}]，"
+                    f"收到 [{low}, {high}]——widen 只放宽不平移，"
+                    "想换区间请先 narrow 再 widen"]
         if low < p.env_low - _EPS or high > p.env_high + _EPS:
             return [f"{ctx} widen 不得超过初始 envelope [{p.env_low}, {p.env_high}]，"
                     f"收到 [{low}, {high}]——agent 只能聚焦或还原，不能发明新空间"]

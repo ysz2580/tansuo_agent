@@ -733,7 +733,10 @@ def _preview_context(which: str) -> dict:
         total = settings.budget.total_trials   # 运行时量用样例值（第 1 轮、未开始）
         return {"round_no": 1, "max_wake_rounds": settings.agent.max_wake_rounds,
                 "finished_count": 0, "total": total, "budget_left": total,
-                "space_version": space.version}
+                "space_version": space.version,
+                # 护栏信号预览样例：运行时由代码按试验状态生成，无信号时为空串
+                "wake_signals": "\n⚠ （示例信号）系统警报：连续 3 次试验全部超时。"
+                                "实际运行时此项由代码自动填充，无信号时为空。"}
     return {}   # setup_system：Web 侧无训练脚本上下文，占位符原样保留
 
 

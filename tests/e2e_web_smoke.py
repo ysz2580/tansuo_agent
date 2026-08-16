@@ -262,6 +262,10 @@ with tempfile.TemporaryDirectory() as td:
         pv2 = api("/api/config/prompts/preview",
                   {"which": "tuning_wake_brief", "text": "轮 {{round_no}} / 余 {{budget_left}}"})
         ok("预览自定义简报按样例上下文渲染", pv2["rendered"] == "轮 1 / 余 4")
+        pv3 = api("/api/config/prompts/preview",
+                  {"which": "tuning_wake_brief", "text": ""})
+        ok("默认简报预览含护栏信号样例且无未填充占位符",
+           pv3["missing_vars"] == [] and "⚠" in pv3["rendered"])
         sv = api("/api/config/prompts/save",
                  {"which": "tuning_system", "text": "自定义：预算 {{total_trials}}",
                   "rationale": "冒烟覆盖"})
