@@ -47,8 +47,55 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 PROJECTS = ProjectStore(PROJECT_ROOT,
                         store_path=os.environ.get("TANSUO_PROJECT_STORE"))
 PROJECTS.bootstrap_from_env(_ENV_SETTINGS, _ENV_SPACE)
-RUN = RunManager(PROJECT_ROOT)
-SETUP = SetupManager(PROJECT_ROOT)
+
+# 运行/配置槽按项目隔离：不同项目可并行搜索；同项目内 run 与 setup 仍硬互斥。
+# （旧版全局单槽：项目 A 在搜索时项目 B 只能干等。）
+import threading                                    # noqa: E402
+
+_RUN_MGRS: dict[str, RunManager] = {}
+_SETUP_MGRS: dict[str, SetupManager] = {}
+_MGR_LOCK = threading.Lock()
+
+
+def _active_project_id() -> str:
+    p = PROJECTS.get_active()
+    return p["id"] if p else "env"   # 无注册表项时的环境变量兜底项目
+
+
+def _run_mgr(project_id: str) -> RunManager:
+    with _MGR_LOCK:
+        m = _RUN_MGRS.get(project_id)
+        if m is None:
+            m = RunManager(PROJECT_ROOT)
+            _RUN_MGRS[project_id] = m
+        return m
+
+
+def _setup_mgr(project_id: str) -> SetupManager:
+    with _MGR_LOCK:
+        m = _SETUP_MGRS.get(project_id)
+        if m is None:
+            m = SetupManager(PROJECT_ROOT)
+            _SETUP_MGRS[project_id] = m
+        return m
+
+
+def _current_run_mgr() -> RunManager:
+    """status/log/stop 的目标：有正在跑的槽就用它（切换项目后仍可观察/停止），
+    否则用激活项目的槽。"""
+    with _MGR_LOCK:
+        running = [m for m in _RUN_MGRS.values() if m.running]
+    if running:
+        return running[0]
+    return _run_mgr(_active_project_id())
+
+
+def _current_setup_mgr() -> SetupManager:
+    with _MGR_LOCK:
+        running = [m for m in _SETUP_MGRS.values() if m.running]
+    if running:
+        return running[0]
+    return _setup_mgr(_active_project_id())
 
 
 def _active_paths() -> tuple[str, str, Path]:
@@ -165,13 +212,20 @@ def summary(cohort: str | None = Query(default=None)):
         deepcopy=False,
         states=(TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL)))
     budget_left = max(0, settings.budget.total_trials - finished)
-    ends = [e for e in journal.load_events()
+    events = journal.load_events()
+    ends = [e for e in events
             if e.get("kind") == TRIAL_END
             and isinstance(e.get("duration_s"), (int, float))]
     recent = [float(e["duration_s"]) for e in ends[-10:]]
     s["eta_s"] = (round(sum(recent) / len(recent) * budget_left
                   / max(1, settings.budget.workers))
                   if recent and budget_left > 0 else None)
+    # 累计算力：Σ(完结试验耗时) × slots ÷ 3600（slots=最近会话 GPU 数，无则 1）
+    from ..journal import compute_cost
+    cost = compute_cost(events)
+    s["compute"] = {**cost,
+                    "budget": settings.budget.max_gpu_hours,
+                    "unit": "GPU·小时" if cost["gpus"] else "机时"}
     return s
 
 
@@ -265,6 +319,84 @@ def report_generate(cohort: str | None = Query(default=None)):
     except Exception as e:   # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"报告生成失败：{e}")
     return {"report": str(report_path), "best": str(best_path)}
+
+
+@app.post("/api/graduate")
+def graduate_start():
+    """最优配置毕业赛：与本项目搜索/配置互斥，复用运行槽（日志走 /api/run/log）。"""
+    project_id = _active_project_id()
+    busy = _busy_reason_for(project_id)
+    if busy:
+        raise HTTPException(status_code=409, detail=busy)
+    mgr = _run_mgr(project_id)
+    settings_path, space_path, project_dir = _active_paths()
+    try:
+        settings0 = load_settings(settings_path)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    try:
+        return mgr.start(abs_data_dir(settings0, project_dir),
+                         settings_path=settings_path, space_path=space_path,
+                         project_dir=project_dir, subcmd="graduate")
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.get("/api/graduate")
+def graduate_result(cohort: str | None = Query(default=None)):
+    """毕业赛结果（reports/graduation.yaml）；从未跑过 → exists=false。"""
+    settings, space, study, journal, coh = _safe_load(cohort)
+    from ..graduate import graduation_path, load_graduation
+    result = load_graduation(settings)
+    resp = {"exists": result is not None, "result": result}
+    if result is not None:
+        resp["updated"] = time_iso(graduation_path(settings).stat().st_mtime)
+    return resp
+
+
+class ExportBody(BaseModel):
+    target: str = Field(..., description="目标配置文件：绝对路径或相对项目目录，"
+                                         "仅支持 .yaml/.yml/.json")
+
+
+def _resolve_export_target(target: str) -> Path:
+    """目标路径解析 + 安全校验：必须落在项目目录内（拒绝 ../ 逃逸）。"""
+    _, _, project_dir = _active_paths()
+    root = Path(project_dir).resolve()
+    p = Path(target.strip())
+    if not str(p):
+        raise HTTPException(status_code=400, detail="目标路径为空")
+    cand = (p if p.is_absolute() else root / p).resolve()
+    try:
+        cand.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400,
+                            detail=f"目标文件必须位于项目目录内（{root}）")
+    return cand
+
+
+@app.post("/api/export/preview")
+def export_preview(body: ExportBody):
+    """回写预演：best 参数合并进目标文件的变更清单与全文预览（不落盘）。"""
+    target = _resolve_export_target(body.target)
+    _, _, study, _, _ = _safe_load(None)
+    from ..export_config import ExportError, preview
+    try:
+        return preview(target, study)
+    except ExportError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/export/apply")
+def export_apply(body: ExportBody):
+    """正式回写：先备份 <目标>.bak，再写入合并结果。"""
+    target = _resolve_export_target(body.target)
+    _, _, study, _, _ = _safe_load(None)
+    from ..export_config import ExportError, export
+    try:
+        return export(target, study)
+    except ExportError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def time_iso(ts: float) -> str:
@@ -364,24 +496,40 @@ class RunStartBody(BaseModel):
                                 description="并行试验数（缺省取 settings budget.workers）")
     max_duration_h: float | None = Field(default=None, gt=0,
                                          description="时间预算（小时），到点优雅收尾")
+    gpus: list[int] | None = Field(default=None,
+                                   description="训练可见的 GPU 卡号（如 [0,1]）；"
+                                               "注入 CUDA_VISIBLE_DEVICES 并按卡数折算成本")
 
 
 @app.get("/api/run/status")
 def run_status():
-    return RUN.status()
+    return _current_run_mgr().status()
 
 
 @app.get("/api/run/log")
 def run_log(tail: int = Query(default=200, ge=1, le=5000)):
-    st = RUN.status()
-    st["text"] = RUN.log_tail(tail)
+    mgr = _current_run_mgr()
+    st = mgr.status()
+    st["text"] = mgr.log_tail(tail)
     return st
 
 
-def _orphan_cleanup_for(cohort, project_dir: Path) -> list[int]:
-    """清理指定分区的孤儿 RUNNING 试验；cohort=None → 扁平布局根目录。"""
+@app.get("/api/gpus")
+def gpus_list(refresh: bool = Query(default=False)):
+    """本机 NVIDIA GPU 清单（nvidia-smi；无 GPU/驱动异常 → 空列表，前端隐藏选卡）。"""
+    from ..gpu import query_gpus
+    return {"gpus": query_gpus(refresh=refresh)}
+
+
+def _orphan_cleanup_for(cohort, project_dir: Path,
+                        settings_path: str | None = None) -> list[int]:
+    """清理指定分区的孤儿 RUNNING 试验；cohort=None → 扁平布局根目录。
+
+    settings_path 显式给出时用之（跨项目停止：被停项目的 settings 可能与
+    当前激活项目不同）；缺省按激活项目解析。
+    """
     try:
-        s = load_settings(_active_paths()[0])
+        s = load_settings(settings_path or _active_paths()[0])
         if cohort is not None:
             apply_cohort(s, cohort)
         journal = Journal(Path(s.data_dir) / "journal.jsonl")
@@ -394,9 +542,12 @@ def _orphan_cleanup_for(cohort, project_dir: Path) -> list[int]:
 def run_start(body: RunStartBody):
     # 顺序：先解析目标分区 → 清理目标分区（及上次运行分区）的孤儿试验 →
     # 在**目标分区内**统计已完结数做「本次新增 N → 总预算」换算 → 显式 --cohort 启动 CLI。
-    busy = _busy_reason()
+    # 忙检查只针对本项目：其他项目的搜索不阻塞本项目（跨项目并行）。
+    project_id = _active_project_id()
+    busy = _busy_reason_for(project_id)
     if busy:
         raise HTTPException(status_code=409, detail=busy)
+    mgr = _run_mgr(project_id)
     settings_path, space_path, project_dir = _active_paths()
     try:
         settings0 = load_settings(settings_path)
@@ -410,14 +561,14 @@ def run_start(body: RunStartBody):
     except CohortError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    if RUN.last_cohort and RUN.last_cohort != target.id:
+    if mgr.last_cohort and mgr.last_cohort != target.id:
         try:
-            prev = load_cohort(root, RUN.last_cohort, settings=settings0)
+            prev = load_cohort(root, mgr.last_cohort, settings=settings0)
             if not prev.virtual:
                 _orphan_cleanup_for(prev, project_dir)
         except CohortError:
             pass
-    elif RUN.last_cohort is None:
+    elif mgr.last_cohort is None:
         _orphan_cleanup_for(None, project_dir)   # 升级前的扁平布局可能有历史孤儿
     _orphan_cleanup_for(target, project_dir)
 
@@ -444,38 +595,47 @@ def run_start(body: RunStartBody):
                 if study_t is not None:
                     dispose_study(study_t)
         trials_arg = finished + trials_arg
+    # GPU 列表基础校验（CLI 侧 parse_gpu_ids 只处理字符串形式）
+    gpus = None
+    if body.gpus:
+        if any(g < 0 for g in body.gpus):
+            raise HTTPException(status_code=400, detail="GPU 序号不能为负")
+        gpus = sorted(set(body.gpus))
     try:
-        return RUN.start(target.path, settings_path=settings_path,
+        return mgr.start(target.path, settings_path=settings_path,
                          space_path=space_path, project_dir=project_dir,
                          trials=trials_arg,
                          wake_every=body.wake_every, no_agent=body.no_agent,
                          workers=body.workers, max_duration_h=body.max_duration_h,
-                         cohort=target.id, note=body.note)
+                         cohort=target.id, note=body.note, gpus=gpus)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
 
 @app.post("/api/run/stop")
 def run_stop():
+    mgr = _current_run_mgr()
     try:
-        st = RUN.stop()
+        st = mgr.stop()
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     # 杀进程树不会触发 orchestrator 的 FINISH 逻辑，进行中的试验会永远停在 RUNNING。
     # 把它如实标记为 FAIL（reason 写进 journal），避免仪表盘"进行中"计数永久失真。
-    # 清理对象是本次运行所在的分区（RUN.last_cohort），而不是"最新分区"。
-    _, _, project_dir = _active_paths()
+    # 清理对象是本次运行所在的分区（mgr.last_cohort），而不是"最新分区"；
+    # settings/project_dir 用槽启动时绑定的（跨项目停止时不能拿激活项目的路径）。
+    project_dir = mgr.project_dir or _active_paths()[2]
+    settings_path = mgr.settings_path or _active_paths()[0]
     marked: list[int] = []
-    if RUN.last_cohort:
+    if mgr.last_cohort:
         try:
-            s0 = load_settings(_active_paths()[0])
-            c = load_cohort(abs_data_dir(s0, project_dir), RUN.last_cohort,
+            s0 = load_settings(settings_path)
+            c = load_cohort(abs_data_dir(s0, project_dir), mgr.last_cohort,
                             settings=s0)
-            marked = _orphan_cleanup_for(c, project_dir)
+            marked = _orphan_cleanup_for(c, project_dir, settings_path)
         except (ConfigError, CohortError):
             pass
     else:
-        marked = _orphan_cleanup_for(None, project_dir)
+        marked = _orphan_cleanup_for(None, project_dir, settings_path)
     if marked:
         st["marked_failed"] = marked
     return st
@@ -806,15 +966,36 @@ _EXCLUDE_DIRS = {"Windows", "Program Files", "Program Files (x86)", "ProgramData
                  "MSOCache", "Intel", "AMD"}
 
 
-def _busy_reason() -> str | None:
-    """有任务在跑时返回原因（切换项目 / 启动搜索 / 启动 setup 前调用）；空闲返回 None。
+def _busy_reason_for(project_id: str) -> str | None:
+    """指定项目有任务在跑时返回原因；空闲返回 None。
 
-    setup 与 run 硬互斥：两者都会写 settings/空间/分区状态，并发会互相踩踏。
+    同项目内 setup 与 run 硬互斥（两者都会写 settings/空间/分区状态，
+    并发会互相踩踏）；**不同项目之间互不阻塞**（跨项目并行）。
     """
-    if RUN.running:
-        return f"有搜索正在运行（pid={RUN.pid}），请先停止"
-    if SETUP.running:
-        return f"配置 agent 正在运行（pid={SETUP.pid}），请等待结束或先停止"
+    run = _RUN_MGRS.get(project_id)
+    if run is not None and run.running:
+        return f"本项目有搜索正在运行（pid={run.pid}），请先停止"
+    setup = _SETUP_MGRS.get(project_id)
+    if setup is not None and setup.running:
+        return f"本项目配置 agent 正在运行（pid={setup.pid}），请等待结束或先停止"
+    return None
+
+
+def _detect_venv_python(dir_path: Path) -> str | None:
+    """探测项目目录里的虚拟环境解释器（.venv/venv/env），找到返回绝对路径。
+
+    用户仓库通常自带依赖环境，而 tansuo 的解释器里没有它的 torch 等依赖——
+    新建项目时探测并写进 adapter.python，试验子进程直接用项目的解释器。
+    """
+    for name in (".venv", "venv", "env"):
+        d = dir_path / name
+        if not d.is_dir():
+            continue
+        candidates = ([d / "Scripts" / "python.exe"] if sys.platform == "win32"
+                      else [d / "bin" / "python", d / "bin" / "python3"])
+        for c in candidates:
+            if c.is_file():
+                return str(c.resolve())
     return None
 
 
@@ -823,6 +1004,7 @@ def _scaffold_project(dir_path: Path, train_script: str | None) -> None:
 
     相对路径（data_dir / storage.url / adapter.command）一律相对**项目目录**解析，
     与 `_active_paths()` 返回的 project_dir（= base_dir = 子进程 cwd）一致。
+    探测到项目自带 venv 时写入 adapter.python（试验用项目自己的解释器跑）。
     """
     from ..wizard import SETTINGS_TEMPLATE, SPACE_TEMPLATE
     tansuo_dir = dir_path / ".tansuo"
@@ -838,6 +1020,13 @@ def _scaffold_project(dir_path: Path, train_script: str | None) -> None:
             rel = Path(Path(train_script).name)   # 不在项目内 → 退化为文件名
         text = text.replace('command: ["python", "path/to/your_train.py"]',
                             f'command: ["python", "{rel.as_posix()}"]')
+    venv_py = _detect_venv_python(dir_path)
+    if venv_py:
+        # 正斜杠写入：YAML 双引号串里 Windows 反斜杠是非法转义序列，
+        # 而 Path 在 Windows 上认正斜杠（config 校验 is_file 同样通过）
+        text = text.replace('command: ["python",',
+                            f'python: "{venv_py.replace(chr(92), "/")}"\n'
+                            '  command: ["python",', 1)
     (tansuo_dir / "settings.yaml").write_text(text, encoding="utf-8")
     (tansuo_dir / "search_space.yaml").write_text(SPACE_TEMPLATE, encoding="utf-8")
 
@@ -907,7 +1096,14 @@ def fs_files(path: str = Query(...), ext: str = Query(default=".py")):
 @app.get("/api/projects")
 def projects_list():
     act = PROJECTS.get_active()
-    return {"projects": PROJECTS.list_projects(),
+    projects = []
+    for p in PROJECTS.list_projects():
+        run = _RUN_MGRS.get(p["id"])
+        setup = _SETUP_MGRS.get(p["id"])
+        projects.append({**p,
+                         "run_running": bool(run and run.running),
+                         "setup_running": bool(setup and setup.running)})
+    return {"projects": projects,
             "active_id": act["id"] if act else None}
 
 
@@ -945,9 +1141,8 @@ def project_create(body: ProjectCreateBody):
 
 @app.post("/api/projects/{project_id}/activate")
 def project_activate(project_id: str):
-    busy = _busy_reason()
-    if busy:
-        raise HTTPException(status_code=409, detail=busy)
+    # 跨项目并行后不再全局阻塞：运行中的槽绑定各自项目（启动时已固化路径），
+    # 切换激活项目只是换"当前视角"，不影响其它项目正在跑的任务。
     try:
         return PROJECTS.activate(project_id)
     except KeyError as e:
@@ -956,6 +1151,14 @@ def project_activate(project_id: str):
 
 @app.delete("/api/projects/{project_id}")
 def project_delete(project_id: str):
+    run = _RUN_MGRS.get(project_id)
+    if run is not None and run.running:
+        raise HTTPException(status_code=409,
+                            detail="该项目有搜索正在运行，请先停止再移除")
+    setup = _SETUP_MGRS.get(project_id)
+    if setup is not None and setup.running:
+        raise HTTPException(status_code=409,
+                            detail="该项目配置 agent 正在运行，请先停止再移除")
     PROJECTS.remove(project_id)   # 仅移除注册，不删文件（数据安全优先）
     return {"ok": True}
 
@@ -969,8 +1172,9 @@ def project_setup(project_id: str):
     """对指定项目跑配置 agent：读训练脚本 → LLM 起草 settings + search_space。
 
     不要求该项目处于激活态（路径全部显式传给子进程），但要求登记了训练脚本。
+    忙检查只针对本项目：其他项目的任务不阻塞（跨项目并行）。
     """
-    busy = _busy_reason()
+    busy = _busy_reason_for(project_id)
     if busy:
         raise HTTPException(status_code=409, detail=busy)
     entry = next((p for p in PROJECTS.list_projects() if p["id"] == project_id), None)
@@ -989,8 +1193,8 @@ def project_setup(project_id: str):
         raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
     data_dir = abs_data_dir(settings, project_dir)
     try:
-        return SETUP.start(entry["train_script"], settings_path, space_path,
-                           project_dir, data_dir)
+        return _setup_mgr(project_id).start(entry["train_script"], settings_path,
+                                            space_path, project_dir, data_dir)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -998,20 +1202,21 @@ def project_setup(project_id: str):
 @app.post("/api/setup/stop")
 def setup_stop():
     try:
-        return SETUP.stop()
+        return _current_setup_mgr().stop()
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
 
 @app.get("/api/setup/status")
 def setup_status():
-    return SETUP.status()
+    return _current_setup_mgr().status()
 
 
 @app.get("/api/setup/log")
 def setup_log(tail: int = Query(default=200, ge=1, le=5000)):
-    st = SETUP.status()
-    st["text"] = SETUP.log_tail(tail)
+    mgr = _current_setup_mgr()
+    st = mgr.status()
+    st["text"] = mgr.log_tail(tail)
     return st
 
 
@@ -1019,11 +1224,12 @@ def _setup_journal_path() -> Path | None:
     """setup_journal.jsonl 定位：优先本次会话启动时绑定的 data_dir（= journal
     实际写入位置，cmd_setup 开头按启动时的 settings 解析）；不能用 setup 结束后
     的 settings 重新解析——setup agent 会覆写 settings.yaml，data_dir 可能变化。
-    服务重启后 SETUP 无绑定，回退按当前激活项目的 settings/project_dir 解析。"""
-    if SETUP.data_dir is not None:
-        return Path(SETUP.data_dir) / "setup_journal.jsonl"
-    settings_path = SETUP.settings_path or _active_paths()[0]
-    project_dir = SETUP.project_dir or _active_paths()[2]
+    服务重启后无绑定，回退按当前激活项目的 settings/project_dir 解析。"""
+    mgr = _current_setup_mgr()
+    if mgr.data_dir is not None:
+        return Path(mgr.data_dir) / "setup_journal.jsonl"
+    settings_path = mgr.settings_path or _active_paths()[0]
+    project_dir = mgr.project_dir or _active_paths()[2]
     try:
         settings = load_settings(settings_path)
     except ConfigError:

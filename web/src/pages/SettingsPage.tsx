@@ -1,12 +1,16 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { toast } from "sonner"
 import {
   api,
   type AgentConfig,
+  type ExportPreviewResp,
+  type GraduationResp,
+  type GpuInfo,
   type NotifyConfig,
   type ProbeResult,
   type ReportResp,
   type RunLogResp,
+  type RunStatus,
 } from "@/lib/api"
 import { useCohort } from "@/lib/cohort"
 import { usePolling } from "@/lib/usePolling"
@@ -29,6 +33,7 @@ export default function SettingsPage() {
   return (
     <div className="space-y-4">
       <RunPanel />
+      <DeliveryPanel />
       <ApiConfigPanel />
       <NotifyPanel />
       <ReportPanel />
@@ -49,6 +54,18 @@ function RunPanel() {
   const [newCohort, setNewCohort] = useState(false)
   const [note, setNote] = useState("")
   const [busy, setBusy] = useState(false)
+  const [gpuList, setGpuList] = useState<GpuInfo[] | null>(null)
+  const [selGpus, setSelGpus] = useState<number[]>([])
+
+  // 本机 GPU 清单：无 GPU（nvidia-smi 缺失/驱动异常）→ 空数组，选卡区整体隐藏
+  useEffect(() => {
+    api.gpusList().then((r) => setGpuList(r.gpus)).catch(() => setGpuList([]))
+  }, [])
+
+  const toggleGpu = (idx: number) => {
+    setSelGpus((cur) => cur.includes(idx)
+      ? cur.filter((g) => g !== idx) : [...cur, idx].sort((a, b) => a - b))
+  }
 
   const { data: log, error } = usePolling<RunLogResp>(
     () => api.runLog(300),
@@ -71,6 +88,7 @@ function RunPanel() {
         no_agent: noAgent,
         new_cohort: newCohort,
         note: note.trim() || undefined,
+        gpus: selGpus.length > 0 ? selGpus : undefined,
       })
       toast.success("搜索已启动")
     } catch (e) {
@@ -161,6 +179,39 @@ function RunPanel() {
           </div>
         </div>
 
+        {(gpuList?.length ?? 0) > 0 && (
+          <div className="space-y-1.5">
+            <Label>
+              GPU 选择（注入 CUDA_VISIBLE_DEVICES，成本按所选卡数折算 GPU·小时）
+            </Label>
+            <div className="flex flex-wrap gap-2">
+              {gpuList!.map((g) => {
+                const active = selGpus.includes(g.index)
+                const freeMb = g.memory_total_mb - g.memory_used_mb
+                return (
+                  <button key={g.index} type="button" onClick={() => toggleGpu(g.index)}
+                          className={`rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors ${
+                            active
+                              ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40"
+                              : "hover:bg-muted/60"
+                          }`}>
+                    <div className="font-medium">
+                      {active ? "✓ " : ""}GPU {g.index} · {g.name}
+                    </div>
+                    <div className="text-muted-foreground mt-0.5">
+                      显存 {Math.round(freeMb / 1024 * 10) / 10}/{Math.round(g.memory_total_mb / 1024 * 10) / 10} GB 空闲
+                      · 利用率 {g.utilization}%
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+            <p className="text-muted-foreground text-xs">
+              不选 = 不限制（训练脚本按自身默认用卡）；选中后成本统计按卡数折算。
+            </p>
+          </div>
+        )}
+
         {error && <div className="text-red-600 text-sm">状态加载失败：{error}</div>}
 
         <div>
@@ -179,8 +230,171 @@ function RunPanel() {
 }
 
 // ------------------------------------------------------------------
-// API 配置切换
+// 成果交付：毕业赛（best 全量复验）+ 配置回写（best 合并进用户配置文件）
 // ------------------------------------------------------------------
+
+function DeliveryPanel() {
+  const cohort = useCohort()
+  const { data: runStatus } = usePolling<RunStatus>(api.runStatus, 3000)
+  const { data: grad } = usePolling<GraduationResp>(() => api.graduateResult(cohort), 5000)
+  const [starting, setStarting] = useState(false)
+  const running = runStatus?.running ?? false
+
+  const startGraduation = async () => {
+    setStarting(true)
+    try {
+      await api.graduateStart()
+      toast.success("毕业赛已开始：best 配置全量数据 + 满轮数复验（进度看下方实时日志）")
+    } catch (e) {
+      toast.error(`启动失败：${e instanceof Error ? e.message : e}`)
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const g = grad?.result
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">成果交付</CardTitle>
+        <CardDescription>
+          搜索结束后的两步收尾：①「毕业赛」把最优配置在全量数据、满训练轮数下复验一次
+          （隔离运行，不污染搜索记录）；②「配置回写」把最优超参数合并进你自己的配置文件。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        <div className="space-y-2">
+          <div className="flex items-center gap-3">
+            <span className="font-medium text-sm">① 最优配置毕业赛</span>
+            {g?.status === "ok" && (
+              <Badge className={g.verdict === "pass"
+                ? "bg-emerald-600/15 text-emerald-700 dark:text-emerald-400"
+                : "bg-amber-600/15 text-amber-700 dark:text-amber-400"}>
+                {g.verdict === "pass" ? "✔ 全量复验通过" : "✘ 全量下回落"}
+              </Badge>
+            )}
+            {g?.status === "failed" && <Badge variant="destructive">复验失败</Badge>}
+            <Button size="sm" variant="outline" onClick={startGraduation}
+                    disabled={running || starting}>
+              {running ? "运行槽被占用" : starting ? "启动中…" : "举办毕业赛"}
+            </Button>
+            {grad?.updated && (
+              <span className="text-muted-foreground text-xs">上次：{grad.updated}</span>
+            )}
+          </div>
+          {g && (
+            <div className="text-muted-foreground space-y-1 rounded-md border p-3 text-sm">
+              {g.status === "ok" ? (
+                <>
+                  <div>
+                    trial#{g.best_trial} 的 best 配置：
+                    <span className="text-foreground font-mono"> {g.primary} </span>
+                    搜索期 <span className="text-foreground font-mono">{Number(g.best_value.toPrecision(6))}</span>
+                    → 全量复验 <span className="text-foreground font-mono">{Number((g.value ?? 0).toPrecision(6))}</span>
+                    （Δ={Number((g.delta ?? 0).toPrecision(4))}，耗时 {g.duration_s}s）
+                  </div>
+                  {g.iter_param && (
+                    <div className="text-xs">
+                      训练轮数已拉满：{g.iter_param.name} {String(g.iter_param.before)} → {String(g.iter_param.after)}；
+                      数据比例强制 100%
+                    </div>
+                  )}
+                  {g.verdict === "regressed" && (
+                    <div className="text-amber-600 text-xs">
+                      全量数据下明显回落——搜索期结果可能受益于抽样数据，建议检查数据分布或以此配置继续微调。
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div>
+                  {g.reason || g.status}
+                  {g.hint && <span className="text-xs"> ｜ 建议：{g.hint}</span>}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <ExportSection />
+      </CardContent>
+    </Card>
+  )
+}
+
+function ExportSection() {
+  const [target, setTarget] = useState("")
+  const [preview, setPreview] = useState<ExportPreviewResp | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const doPreview = async () => {
+    if (!target.trim()) {
+      toast.error("请先填写目标配置文件路径")
+      return
+    }
+    setBusy(true)
+    try {
+      setPreview(await api.exportPreview(target.trim()))
+    } catch (e) {
+      setPreview(null)
+      toast.error(`预览失败：${e instanceof Error ? e.message : e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const doApply = async () => {
+    setBusy(true)
+    try {
+      const r = await api.exportApply(target.trim())
+      toast.success(r.summary)
+      setPreview(null)
+    } catch (e) {
+      toast.error(`回写失败：${e instanceof Error ? e.message : e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const n = preview ? preview.changed.length + preview.appended.length : 0
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <span className="font-medium text-sm">② 配置回写</span>
+        <Input className="max-w-md" placeholder="目标配置文件（相对项目目录或绝对路径，.yaml/.json）"
+               value={target} onChange={(e) => { setTarget(e.target.value); setPreview(null) }} />
+        <Button size="sm" variant="outline" onClick={doPreview} disabled={busy}>预览变更</Button>
+        {preview && (
+          <Button size="sm" onClick={doApply} disabled={busy}>
+            确认写入（自动备份 .bak）
+          </Button>
+        )}
+      </div>
+      <p className="text-muted-foreground text-xs">
+        把当前最优超参数合并进你的训练配置文件：顶层同名键覆盖、异名键追加；写入前原文件备份为
+        &lt;文件名&gt;.bak。先「预览变更」确认无误再写入。
+      </p>
+      {preview && (
+        <div className="space-y-1 rounded-md border p-3 text-sm">
+          <div className="font-medium">
+            trial#{preview.best_trial}（{Number(preview.best_value.toPrecision(6))}）→ {preview.target}
+            ：共 {n} 项变更
+          </div>
+          {preview.changed.map((c) => (
+            <div key={c.key} className="text-muted-foreground font-mono text-xs">
+              ~ {c.key}: {JSON.stringify(c.old)} → <span className="text-foreground">{JSON.stringify(c.new)}</span>
+            </div>
+          ))}
+          {preview.appended.map((a) => (
+            <div key={a.key} className="text-muted-foreground font-mono text-xs">
+              + {a.key}: <span className="text-foreground">{JSON.stringify(a.new)}</span>
+            </div>
+          ))}
+          {n === 0 && <div className="text-muted-foreground text-xs">最优配置与目标文件已一致，无需写入。</div>}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function ApiConfigPanel() {
   const { data: current, error, } = usePolling<AgentConfig>(api.agentConfig, 15000)

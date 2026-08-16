@@ -29,5 +29,6 @@
 | 2026-08-15 | 021 | [真实 LLM 全流程验收暴露 setup 三重缺陷：搜索空间未校准超时致全试验超时、settings 重写丢 .tansuo 隔离路径、setup 花费不可见](2026-08-15-021-setup-acceptance-timeout-calibration.md) | `setup-agent` `项目管理` `超时校准` `配置重写` `token审计` `真实验收` | ✅ 已解决 |
 | 2026-08-15 | 022 | [真实验收暴露的四块 robustness 短板补齐：调参 agent 失败原因感知、超时校准泛化、瞬时重试默认开启、Hyperband 剪枝](2026-08-15-022-robustness-failure-awareness-calibration-retry-hyperband.md) | `agent-robustness` `失败感知` `超时校准` `失败重试` `hyperband` `剪枝` `设计决策` | ✅ 已解决 |
 | 2026-08-16 | 023 | [补齐 #022 三项遗留并开通人工空间编辑入口：唤醒时确定性失败/收敛护栏强制注入、CLI space patch 可扩展 envelope、瞬时失败环境线索、Hyperband widen 真实验收](2026-08-16-023-wake-guardrails-space-patch-env-clues.md) | `确定性护栏` `wake-brief` `space-patch` `环境线索` `hyperband` `设计决策` | ✅ 已解决 |
+| 2026-08-17 | 024 | [GPU 算力记账被两处舍入抹零（TRIAL_END round(1)、FINISH round(3)抹掉快试验），及毕业赛隔离复验与配置回写防逃逸的设计取舍](2026-08-17-024-gpu-cost-rounding-graduation-export.md) | `算力记账` `舍入精度` `毕业赛` `配置回写` `gpu` `设计决策` | ✅ 已解决 |
 
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中

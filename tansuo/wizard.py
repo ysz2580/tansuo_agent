@@ -39,6 +39,9 @@ metrics:
 # ---------- 训练驱动方式 ----------
 adapter:
   mode: subprocess           # subprocess=子进程跑脚本(推荐) | python=同进程调函数
+  # python: .venv/Scripts/python.exe  # 可选：项目专用解释器（venv/conda 的 python 可执行文件）。
+  #                          # 设置后替换 command 里的 python；省略则按 command 原样启动。
+  #                          # Web 新建项目时会自动探测 .venv/venv/env 并填入。
   # mode=subprocess：启动命令；脚本从 env TANSUO_TRIAL_CONFIG 读 JSON 配置
   command: ["python", "path/to/your_train.py"]
   # mode=python：入口 "module.path:函数名"，函数签名 (config, report)->float

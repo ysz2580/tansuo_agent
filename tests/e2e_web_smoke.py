@@ -1,6 +1,7 @@
-"""Web 后端冒烟：起真实 uvicorn，验证 /api/runs、?cohort=、run_start 分区换算。
+"""Web 后端冒烟：起真实 uvicorn，验证 /api/runs、?cohort=、run_start 分区换算、
+项目管理、setup 互斥、GPU 清单/选卡记账、毕业赛、配置回写。
 
-独立脚本直跑：python tests/e2e_web_smoke.py（约 2-4 分钟，占用端口 8123）。
+独立脚本直跑：python tests/e2e_web_smoke.py（约 3-5 分钟，占用端口 8123）。
 """
 import json
 import os
@@ -402,21 +403,44 @@ with tempfile.TemporaryDirectory() as td:
         ok("新项目 summary 有 1 次完结",
            api("/api/summary")["counts"]["completed"] == 1)
 
-        # 运行中切换项目 → 409
-        api("/api/run/start", {"trials": 2, "no_agent": True})
+        # 跨项目并行：projC 搜索运行中，允许切走、允许别的项目也开搜索
+        api("/api/run/start", {"trials": 3, "no_agent": True})
         t0 = time.time()
         while time.time() - t0 < 10 and not api("/api/run/status")["running"]:
             time.sleep(0.1)
-        ok("新项目搜索已启动", api("/api/run/status")["running"])
+        ok("projC 搜索已启动", api("/api/run/status")["running"])
         demo_id = next(p["id"] for p in api("/api/projects")["projects"]
                        if "内置示例" in p["name"])
-        try:
-            api(f"/api/projects/{demo_id}/activate", method="POST")
-            raise AssertionError("FAIL: 运行中切换项目应被拒")
-        except _ue.HTTPError as e:
-            ok("运行中切换项目被拒（409）", e.code == 409)
-        api("/api/run/stop", method="POST")
-        wait_idle()
+        api(f"/api/projects/{demo_id}/activate", method="POST")
+        ok("运行中切换项目被允许（跨项目并行）",
+           api("/api/projects/active")["id"] == demo_id)
+        ok("切换后 status 仍指向运行中的槽", api("/api/run/status")["running"])
+        api("/api/run/start", {"trials": 1, "no_agent": True})
+        t0 = time.time()
+        both = False
+        while time.time() - t0 < 15:
+            projs = {p["id"]: p for p in api("/api/projects")["projects"]}
+            if projs[cr["id"]]["run_running"] and projs[demo_id]["run_running"]:
+                both = True
+                break
+            time.sleep(0.2)
+        ok("两个项目并行搜索（各自 run_running=true）", both, str(projs))
+        # 清理：反复 stop 运行中的槽，直到没有项目在跑
+        t0 = time.time()
+        while time.time() - t0 < 90:
+            running = [p for p in api("/api/projects")["projects"]
+                       if p["run_running"]]
+            if not running:
+                break
+            try:
+                api("/api/run/stop", method="POST")
+            except _ue.HTTPError:
+                pass
+            time.sleep(0.5)
+        else:
+            raise AssertionError("FAIL: 并行搜索 90s 内未清理完毕")
+        ok("并行槽清理后无项目在运行",
+           not any(p["run_running"] for p in api("/api/projects")["projects"]))
 
         # 切回 env 项目 → 历史分区仍在（前面已积累 >=5 个）
         env_entry = next(p for p in api("/api/projects")["projects"]
@@ -441,7 +465,7 @@ with tempfile.TemporaryDirectory() as td:
         except _ue.HTTPError as e:
             ok("未登记训练脚本 setup 被拒（400）", e.code == 400)
 
-        # 搜索运行中启动 setup → 409（反向互斥同理由 _busy_reason 统一裁决）
+        # 同项目内搜索运行中启动 setup → 409（项目内硬互斥；跨项目则互不阻塞）
         api(f"/api/projects/{cr['id']}/activate", method="POST")
         api("/api/run/start", {"trials": 2, "no_agent": True})
         t0 = time.time()
@@ -476,6 +500,96 @@ with tempfile.TemporaryDirectory() as td:
         ev = api("/api/setup/events")
         ok("setup 事件端点可查（probe 失败未写 journal → 空列表）",
            isinstance(ev["events"], list) and ev["events"] == [], str(ev))
+
+        print("== 16. GPU 清单与选卡记账 ==")
+        g = api("/api/gpus")
+        ok("/api/gpus 返回列表结构（无 GPU 时为空列表）",
+           isinstance(g["gpus"], list), str(g))
+        if g["gpus"]:
+            ok("GPU 条目字段齐全",
+               all({"index", "name", "memory_used_mb", "memory_total_mb",
+                    "utilization"} <= set(x) for x in g["gpus"]), str(g["gpus"]))
+        try:
+            api("/api/run/start", {"trials": 1, "no_agent": True, "gpus": [-1]})
+            raise AssertionError("FAIL: 负数 GPU 序号应被拒")
+        except _ue.HTTPError as e:
+            ok("负数 GPU 序号被拒（400）", e.code == 400)
+        # projC 选卡再跑两次：成本按卡数折算（无卡机器注入照样成立）
+        api(f"/api/projects/{cr['id']}/activate", method="POST")
+        api("/api/run/start", {"trials": 2, "no_agent": True, "gpus": [0]})
+        stg = wait_idle()
+        ok("选卡运行正常退出", stg["exit_code"] == 0, str(stg))
+        cmp_ = api("/api/summary").get("compute")
+        ok("summary 含算力记账块", isinstance(cmp_, dict), str(cmp_))
+        ok("选卡入记账且按卡数折算（单位=GPU·小时）",
+           cmp_["gpus"] == [0] and cmp_["slots"] == 1
+           and cmp_["unit"] == "GPU·小时", str(cmp_))
+        ok("算力量非负", cmp_["compute_hours"] >= 0, str(cmp_))
+
+        print("== 17. 毕业赛：best 配置全量复验 ==")
+        gr0 = api("/api/graduate")
+        ok("未举办过毕业赛（exists=false）", gr0["exists"] is False, str(gr0))
+        # 搜索运行中启动毕业赛 → 409（同项目互斥，复用运行槽）
+        api("/api/run/start", {"trials": 3, "no_agent": True})
+        t0 = time.time()
+        while time.time() - t0 < 10 and not api("/api/run/status")["running"]:
+            time.sleep(0.1)
+        try:
+            api("/api/graduate", method="POST")
+            raise AssertionError("FAIL: 搜索运行中启动毕业赛应被拒")
+        except _ue.HTTPError as e:
+            ok("搜索运行中启动毕业赛被拒（409）", e.code == 409)
+        api("/api/run/stop", method="POST")
+        wait_idle()
+        # 启动毕业赛（慢脚本约 3s）→ 随即再启动：运行槽被占 → 409
+        api("/api/graduate", method="POST")
+        t0 = time.time()
+        conflict = None
+        while time.time() - t0 < 5:
+            try:
+                api("/api/graduate", method="POST")
+            except _ue.HTTPError as e:
+                conflict = e.code
+                break
+            time.sleep(0.2)
+        ok("毕业赛运行中重复启动被拒（409）", conflict == 409, str(conflict))
+        stg2 = wait_idle()
+        ok("毕业赛正常退出", stg2["exit_code"] == 0, str(stg2))
+        gr = api("/api/graduate")
+        ok("结果落盘且 status=ok",
+           gr["exists"] and gr["result"]["status"] == "ok", str(gr))
+        ok("全量复验 verdict=pass（脚本恒定 0.7）",
+           gr["result"]["verdict"] == "pass", str(gr["result"]))
+        ok("结果含 best 溯源与复验参数",
+           isinstance(gr["result"]["params"], dict)
+           and isinstance(gr["result"]["best_trial"], int),
+           str(sorted(gr["result"].keys())))
+
+        print("== 18. 配置回写：preview 不落盘、apply 备份后写入 ==")
+        cfg_target = projc / "user_cfg.yaml"
+        cfg_target.write_text("lr: 0.5\nmomentum: 0.9\n", encoding="utf-8")
+        pv = api("/api/export/preview", {"target": str(cfg_target)})
+        ok("preview：同名键 lr 进 changed（旧值保留）",
+           any(c_["key"] == "lr" and c_["old"] == 0.5 for c_ in pv["changed"]),
+           str(pv["changed"]))
+        ok("preview 不落盘",
+           cfg_target.read_text(encoding="utf-8") == "lr: 0.5\nmomentum: 0.9\n")
+        ap = api("/api/export/apply", {"target": str(cfg_target)})
+        ok("apply：备份后写入",
+           ap["applied"] and ap["backup"].endswith(".bak"), str(ap))
+        ok("备份内容 = 写入前原文",
+           (projc / "user_cfg.yaml.bak").read_text(encoding="utf-8")
+           == "lr: 0.5\nmomentum: 0.9\n")
+        new = yaml.safe_load(cfg_target.read_text(encoding="utf-8"))
+        ok("回写后 lr=best 值、无关键保留",
+           abs(new["lr"] - pv["params"]["lr"]) < 1e-12 and new["momentum"] == 0.9,
+           str(new))
+        try:
+            # settings_yaml 在 tmp 根上、projC 项目目录之外 → 路径逃逸被拒
+            api("/api/export/preview", {"target": str(settings_yaml)})
+            raise AssertionError("FAIL: 项目目录外的路径应被拒")
+        except _ue.HTTPError as e:
+            ok("项目目录外的路径被拒（400）", e.code == 400)
 
         print("\nWeb 冒烟全部通过")
     finally:

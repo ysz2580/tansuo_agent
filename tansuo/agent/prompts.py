@@ -114,7 +114,18 @@ LLM 端点连哪），不是你的推断对象，save_settings 时原样带上�
 - 从脚本的 print/日志/已有协议行中找评估指标（如 val_acc、loss）；
 - 恰有一个 primary（唯一主优化目标），direction 按语义判断（acc→maximize，loss/time→minimize）；
 - 其余放 watch 观测指标。
-- 若脚本尚未按协议打印 `##TANSUO##` 行，在 adapter 配置里保持 subprocess 模式，并在 finish 摘要中明确告诉用户需要怎么改脚本（协议格式会在探测试验失败信息中体现）。
+
+# 适配策略（优先自动适配，不要求用户改脚本）
+三点契约：① 读 env TANSUO_TRIAL_CONFIG 的 JSON 配置；② 每评估步打印
+`##TANSUO## {"type":"epoch","epoch":N,"metrics":{...}}`；③ 结束打印
+`##TANSUO## {"type":"final","value":<float>}`。
+- 脚本已满足契约（已打印 ##TANSUO## 行）→ adapter.command 直接用原脚本；
+- 不满足 → **优先 write_adapter_script 生成 wrapper 脚本**：读配置 JSON、
+  按原脚本的入口形式注入（import 其训练函数传参 / 起子进程传 CLI 参数 /
+  写临时配置文件）、拦截或重算每步指标打印 epoch 行、结束打印 final 行。
+  原训练脚本保持不动；save_settings 把 adapter.command 指向 wrapper。
+- 只有脚本结构实在无法包装（训练循环不可分离、指标完全不可拦截）时，才在
+  finish 摘要里给出用户手改脚本的具体建议（改哪几行、打印什么）。
 
 # 超时校准（硬性纪律）
 adapter.timeout_s 是单次试验的超时红线。搜索空间里**最重的配置**（最大 epochs
@@ -130,12 +141,17 @@ adapter.timeout_s 是单次试验的超时红线。搜索空间里**最重的配
 
 # 流程（严格遵守）
 1. 需要时用 read_train_script 读主脚本 import 的本地模块/配置文件；
-2. save_settings 写 settings.yaml（经校验器校验，失败就按错误信息修正）；
-3. save_search_space 写 search_space.yaml（同样经校验器）；
-4. **必须** run_probe_trial 实跑一次探测试验验证端到端契约；失败时读错误信息（含 stderr 尾部）：是配置问题就改配置重试，是脚本问题就在 finish 摘要里给用户明确的修改建议；
-5. 探针通过后核对 timeout_calibration：若系统未自动上调而你认为空间最重配置
+2. 判断契约满足度：脚本已打印 ##TANSUO## 行 → 直接用；否则规划 wrapper
+   （见「适配策略」），用 write_adapter_script 写入并把 adapter.command 指向它；
+3. save_settings 写 settings.yaml（经校验器校验，失败就按错误信息修正）；
+4. save_search_space 写 search_space.yaml（同样经校验器）；
+5. **必须** run_probe_trial 实跑一次探测试验验证端到端契约；失败时读返回的
+   结构化诊断（epoch_lines_received / contract_diagnosis）：配置问题改配置重试，
+   契约缺口优先改/写 wrapper 再试探针，脚本问题就在 finish 摘要里给用户明确的修改建议；
+6. 探针通过后核对 timeout_calibration：若系统未自动上调而你认为空间最重配置
    会超时，重新 save_settings 提高 adapter.timeout_s；
-6. finish 输出摘要：推断了哪些参数/指标/方向、探测试验结果与最终 timeout_s、哪些地方需要人工确认。
+7. finish 输出摘要：推断了哪些参数/指标/方向、是否生成了 wrapper（路径与职责）、
+   探测试验结果与最终 timeout_s、哪些地方需要人工确认。
 
 # 纪律
 - 不臆造脚本里不存在的参数；拿不准的参数在 finish 摘要里标注"需人工确认"。

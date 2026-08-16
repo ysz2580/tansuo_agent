@@ -10,8 +10,8 @@ import { NewProjectDialog } from "@/components/NewProjectDialog"
 
 /** 项目切换器。层级语义：项目 → 分区（cohort）——切换项目会重置分区视图。
  *
- *  激活/新建都可能被后端拒绝（搜索或配置会话运行中 → 409），失败时 toast 提示
- *  并刷新列表回显真实激活项。新建成功后后端已自动激活新项目。 */
+ *  跨项目并行：切换项目不再被运行中的任务阻塞（各项目的搜索/配置槽相互独立），
+ *  下拉项上用徽标提示哪个项目在跑。新建成功后后端已自动激活新项目。 */
 export function ProjectSelector({ resp, onRefresh, onSwitched }: {
   resp: ProjectsResp | null
   onRefresh: () => void
@@ -53,6 +53,14 @@ export function ProjectSelector({ resp, onRefresh, onSwitched }: {
           {projects.map((p) => (
             <SelectItem key={p.id} value={p.id}>
               <span>{p.name}</span>
+              {p.run_running && (
+                <span className="ml-1.5 text-[10px] text-emerald-600 dark:text-emerald-400"
+                      title="该项目有搜索正在运行">▶ 搜索中</span>
+              )}
+              {p.setup_running && (
+                <span className="ml-1.5 text-[10px] text-sky-600 dark:text-sky-400"
+                      title="该项目配置 agent 正在运行">◆ 配置中</span>
+              )}
               <span className="text-muted-foreground ml-1.5 font-mono text-[10px]">
                 {p.dir}
               </span>

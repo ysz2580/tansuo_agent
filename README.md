@@ -27,6 +27,9 @@ E:\tansuo_agent\
 │   ├── space.py            # 搜索空间：envelope 护栏 + patch 引擎 + 快照
 │   ├── orchestrator.py     # 主循环：预算中枢、唤醒策略、断点续跑
 │   ├── runner.py/adapter.py# 试验执行 + 子进程/函数适配器（协议见下）
+│   ├── gpu.py              # GPU 探测（nvidia-smi）+ --gpus 列表解析
+│   ├── graduate.py         # 毕业赛：best 配置全量数据+满轮数隔离复验
+│   ├── export_config.py    # 配置回写：best 参数合并进用户配置文件（预览+.bak）
 │   └── analysis/report.py  # 汇总分析（含参数重要度）+ Markdown 报告 + best.yaml
 ├── tansuo\web\             # Web 后端：FastAPI（只读查询 + 运行驱动 + API 配置切换）
 ├── web\                    # Web 前端：Vite + React + TS + Tailwind + shadcn/ui
@@ -34,8 +37,8 @@ E:\tansuo_agent\
 │   ├── configs\            # settings.yaml + search_space.yaml + prompts.yaml（带详尽注释）
 │   ├── train_mnist.py      # 演示训练脚本（遵守子进程协议）
 │   └── my_adapter_template.py  # 你自己的训练任务接入模板
-└── tests\                  # 分区 116 / 通知 32 / 空间护栏 34 / 条件空间 30 / 运行时 29 / 提示词 28 / 权限降级 21 / 对比 28 / 热启动 16 / 协议 12 断言
-                            # + e2e_cli_smoke / e2e_web_smoke 端到端冒烟（真实子进程）
+└── tests\                  # 15 个单测套件（分区 116 / 运行时 65 / 空间护栏 39 / GPU 成本 24 /
+                            # 毕业赛回写 24 / …）+ e2e_cli_smoke 39 + e2e_web_smoke 105 断言（真实子进程）
 ```
 
 ## 快速上手（跑演示）
@@ -61,10 +64,11 @@ python cli.py run                    # ④ 正式跑：30 次试验，agent 每 
 
 | 命令 | 作用 |
 |---|---|
-| `run` | 跑搜索。`--trials N --wake-every K --workers W --hours H --warm-start K --no-agent --resume --new --note --cohort ID --seed --model` |
+| `run` | 跑搜索。`--trials N --wake-every K --workers W --hours H --warm-start K --no-agent --resume --new --note --cohort ID --seed --model --gpus IDS` |
 | `runs` | 列出所有记录分区（时间/备注/三指纹/试验数/最优值/与当前指纹可比性）；`runs show ID` 看详情；`runs compare [ID...]` 跨分区对比 |
 | `space show` | 查看搜索空间（含每个参数的语义说明）与补丁历史（默认最新分区，`--cohort ID` 看历史分区） |
 | `report` | 重新生成分析报告与 best.yaml（默认最新分区，`--cohort ID` 为历史分区生成） |
+| `graduate` | 毕业赛：最优配置全量数据 + 满轮数隔离复验（`--cohort ID` 指定分区，默认最新） |
 | `api` | 大模型 API 自配置：盘点凭据→候选模型探测→写回 settings |
 | `check` | 两级探测端点（ping + tool-use），验证模型名是否可用 |
 | `setup --train 你的脚本` | 配置 agent：读训练脚本自动起草两份配置并跑探测试验自证 |
@@ -81,6 +85,11 @@ python cli.py run                    # ④ 正式跑：30 次试验，agent 每 
   批边界。python 函数模式下并行要求你的函数**线程安全**。
 - **时间预算**：`--hours H`（默认取 `budget.max_duration_h`）。到点后不再派发新试验，
   在途试验跑完即以 `time_budget_exhausted` 优雅收尾——适合"我有一晚上 GPU"的用法。
+- **GPU 与算力预算**：`--gpus 0,1`（Web 界面可点选）把卡号注入训练子进程的
+  `CUDA_VISIBLE_DEVICES`，成本按所选卡数折算——`算力 = Σ试验耗时 × 卡数`，
+  单位 GPU·小时（无卡时为机时）。`budget.max_gpu_hours` 设上限，到点以
+  `compute_budget_exhausted` 收尾；仪表盘预算卡与 FINISH 事件都带累计算力
+  （断点续跑时从 journal 预热），剪枝/失败试验同样计费。
 - **失败重试**：`adapter.retry_on_fail`（0-3，默认 0）。非零退出码**且 stderr 为空**
   判定为瞬时故障自动重试（journal 记 `trial_retry` 事件）；超时/协议错误/stderr
   有内容是确定性失败，不重试。仅子进程模式生效。
@@ -198,8 +207,15 @@ cd web && npm run dev            # 前端 :5173，/api 自动代理到 :8000
   `cli.py web --settings X` 启动的项目会自动注册并激活（既有用法零破坏）。
 - **运行控制**：界面上「开始搜索」等价于 `python cli.py run`（子进程驱动，完整复用
   agent 降级与断点续跑），可设本次试验数、唤醒间隔、**并发数**与**时长上限（小时）**；
+  有 GPU 时启动区出现**选卡区**（nvidia-smi 清单：显存空闲/利用率，选中即注入
+  `CUDA_VISIBLE_DEVICES`），成本按所选卡数折算 GPU·小时；
   「新开分区」强制新建记录分区并可写备注（历史记录不受影响）；
-  「停止」杀整棵进程树，进行中的试验会如实标记为失败。仪表盘预算卡片展示 ETA 估算。
+  「停止」杀整棵进程树，进行中的试验会如实标记为失败。仪表盘预算卡片展示 ETA 估算
+  与累计算力（`算力 X.XX / 上限 GPU·小时（N 卡）`，未设上限只显示已用）。
+- **成果交付**：设置页「成果交付」面板承载搜索结束后的两步收尾——**毕业赛**
+  （一键启动，进度看实时日志，结果卡展示全量复验值与 verdict 徽标）与**配置回写**
+  （填目标配置文件路径 → 预览变更清单 → 确认写入，自动备份 `.bak`），详见
+  「成果交付」一节。
 - **API 切换**：设置页改 model / base_url / auth_token，保存前先做两级探测
   （ping + tool-use），失败不落盘。token 留空 = 保持现有 `${ENV:...}` 环境变量引用；
   填明文 = 写入 settings.yaml（界面会警告密钥入库风险）。
@@ -223,6 +239,26 @@ cd web && npm run dev            # 前端 :5173，/api 自动代理到 :8000
 - **等价 CLI**：`python cli.py api`（自动探测候选模型并写回）与
   `python cli.py check`（仅探测）在终端完成同样的事。
 
+## 成果交付：毕业赛与配置回写
+
+调参的终点不是 `best.yaml`（那是 tansuo 的工作产物），而是你生产环境真正读取的
+那份配置。搜索结束后两步收尾：
+
+1. **毕业赛**（`python cli.py graduate`，或 Web「成果交付 → 举办毕业赛」）：
+   搜索期为省算力通常按 `data_fraction` 抽样训练，毕业赛把最优配置在**全量数据
+   （强制 `TANSUO_DATA_FRACTION=1.0`）+ 训练轮数拉满**下复验一次——轮数维度自动
+   识别（epoch/step/iter/round 关键词），也可用 `adapter.iter_param` 显式指定。
+   复验在隔离的内存 study 中进行，**不给主搜索记录增加任何试验**；判定规则：
+   maximize 时全量值 ≥ 搜索期 best × 0.95 记 pass（minimize 对称 ×1.05），
+   否则记 regressed 并提示结果可能受益于抽样数据。结果落
+   `reports/graduation.yaml` + journal `graduation` 事件，失败同样落盘
+   （带 reason 与建议），与搜索/配置会话互斥（复用运行槽，日志走同一入口）。
+2. **配置回写**（Web「成果交付 → 配置回写」）：把最优超参数合并进你指定的训练
+   配置文件（.yaml/.yml/.json）——顶层同名键覆盖、异名键追加（不做深度递归合并，
+   嵌套结构整体替换，语义简单可预期）。「预览变更」先给出逐项清单（覆盖的旧值→新值、
+   新增的键）与合并后全文，**绝不落盘**；确认后写入，覆盖前原文件自动备份为
+   `<文件名>.bak`。目标文件必须位于项目目录内（路径逃逸直接拒绝）。
+
 ## 配置即文档
 
 **settings.yaml** 声明"结果怎么评估、训练怎么驱动、预算多少、agent 怎么连"：
@@ -237,12 +273,15 @@ adapter:
   command: ["python", "demo/train_mnist.py"]
   timeout_s: 300
   retry_on_fail: 1        # 瞬时故障（非零退出码且 stderr 为空）自动重试次数
+  # python: .venv\Scripts\python.exe  # 项目自己的解释器（新建项目时自动探测 venv）
+  # iter_param: epochs    # 训练轮数维度（毕业赛拉满轮数、超时校准折算用；不声明按关键词猜）
 budget:
   total_trials: 30
   wake_every: 5
   data_fraction: 0.5
   workers: 1              # 并行试验数（1=串行，上限 32）
   # max_duration_h: 8     # 可选时间预算（小时）：到点在途试验跑完后优雅收尾
+  # max_gpu_hours: 24     # 可选算力预算：GPU·小时（无 GPU 时为机时），到点收尾
 agent:
   model: qwen3-max
   permissions: {default: allow}    # 权限 hook：allow/confirm/deny，可按工具配置
@@ -311,6 +350,12 @@ agent 页「配置 agent（setup）」点**开始配置**，配置 agent 起草�
   上界、提高 `adapter.timeout_s` 前先评估单次耗时；多核/多卡机器用
   `budget.workers`（或 `--workers`）并行跑试验，ETA 会按并发数折算。
   机器不稳定常偶发退出码 1？设 `adapter.retry_on_fail: 1` 自动重试瞬时故障。
+- **调参一共花了多少算力？** 仪表盘预算卡与 FINISH 事件带累计算力（Σ完结试验耗时
+  × 卡数，选卡时单位 GPU·小时，否则机时；剪枝/失败试验同样计费，续跑自动预热累计）。
+  想封顶就设 `budget.max_gpu_hours`，到点自动收尾（`compute_budget_exhausted`）。
+- **best 配置有多可信？** 搜索期常用抽样数据省算力，最优值可能偏高——举办**毕业赛**
+  （`cli.py graduate` 或 Web「成果交付」）在全量数据 + 满轮数下复验一次，
+  保持 95% 以上记 pass，明显回落会如实标 regressed。
 - **为什么不能改分类参数的候选集？** Optuna storage 拒绝动态
   CategoricalDistribution（实测）。聚焦分类参数用 `freeze` 固定到某个取值。
 - **改了模型/代码，之前的调参结果会混进来吗？** 不会。代码指纹变化会自动新开

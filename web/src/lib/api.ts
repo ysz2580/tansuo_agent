@@ -42,6 +42,67 @@ export interface Summary {
   watch: { name: string; direction: string }[]
   cohort: string | null
   fingerprint_changed: boolean
+  compute?: ComputeCost
+}
+
+// 累计算力成本（Σ完结试验耗时 × slots ÷ 3600；slots=最近会话 GPU 数，无则 1）
+export interface ComputeCost {
+  compute_hours: number
+  slots: number
+  gpus: number[]
+  budget: number | null       // settings budget.max_gpu_hours（null=未设上限）
+  unit: string                // "GPU·小时" | "机时"
+}
+
+// 本机 GPU 清单（nvidia-smi；无 GPU → 空数组）
+export interface GpuInfo {
+  index: number
+  name: string
+  memory_used_mb: number
+  memory_total_mb: number
+  utilization: number
+}
+
+// 毕业赛结果（reports/graduation.yaml）
+export interface GraduationResult {
+  ts: string
+  status: "ok" | "failed" | "pruned"
+  best_trial: number
+  best_value: number
+  value: number | null
+  delta?: number
+  verdict?: "pass" | "regressed"
+  reason?: string
+  hint?: string
+  duration_s: number
+  params: Record<string, unknown>
+  iter_param: { name: string; before: unknown; after: unknown } | null
+  primary: string
+  direction: string
+}
+
+export interface GraduationResp {
+  exists: boolean
+  result: GraduationResult | null
+  updated?: string
+}
+
+// 配置回写（best 参数合并进用户配置文件）
+export interface ExportPreviewResp {
+  target: string
+  format: "yaml" | "json"
+  best_trial: number
+  best_value: number
+  params: Record<string, unknown>
+  changed: { key: string; old: unknown; new: unknown }[]
+  appended: { key: string; new: unknown }[]
+  merged_text: string
+}
+
+export interface ExportApplyResp extends ExportPreviewResp {
+  applied: boolean
+  backup: string
+  summary: string
 }
 
 export interface Trial {
@@ -328,6 +389,8 @@ export interface ProjectInfo {
   train_script: string        // 可空：未登记则不能跑 setup agent
   created_at: string
   last_used: string
+  run_running?: boolean       // 该项目有搜索在跑（跨项目并行：互不阻塞）
+  setup_running?: boolean     // 该项目有配置会话在跑
 }
 
 export interface ProjectsResp {
@@ -408,9 +471,21 @@ export const api = {
       ? `?cohorts=${encodeURIComponent(cohorts.join(","))}` : ""}`),
   runStatus: () => http<RunStatus>("/run/status"),
   runLog: (tail = 300) => http<RunLogResp>(`/run/log?tail=${tail}`),
-  runStart: (body: { trials?: number; wake_every?: number; no_agent?: boolean; fresh?: boolean; new_cohort?: boolean; note?: string; workers?: number; max_duration_h?: number }) =>
+  runStart: (body: { trials?: number; wake_every?: number; no_agent?: boolean; fresh?: boolean; new_cohort?: boolean; note?: string; workers?: number; max_duration_h?: number; gpus?: number[] }) =>
     http<RunStatus>("/run/start", { method: "POST", body: JSON.stringify(body) }),
   runStop: () => http<RunStatus & { marked_failed?: number[] }>("/run/stop", { method: "POST", body: "{}" }),
+  // 本机 GPU 清单（选卡用；无 GPU → 空数组，前端隐藏选卡区）
+  gpusList: (refresh = false) =>
+    http<{ gpus: GpuInfo[] }>(`/gpus${refresh ? "?refresh=true" : ""}`),
+  // 毕业赛：POST 启动（复用运行槽，日志走 runLog）；GET 读结果
+  graduateStart: () => http<RunStatus>("/graduate", { method: "POST", body: "{}" }),
+  graduateResult: (cohort?: string | null) =>
+    http<GraduationResp>(`/graduate${qs(cohort)}`),
+  // 配置回写：preview 只预演不落盘；apply 备份 .bak 后写入
+  exportPreview: (target: string) =>
+    http<ExportPreviewResp>("/export/preview", { method: "POST", body: JSON.stringify({ target }) }),
+  exportApply: (target: string) =>
+    http<ExportApplyResp>("/export/apply", { method: "POST", body: JSON.stringify({ target }) }),
   agentConfig: () => http<AgentConfig>("/config/agent"),
   probe: (body: AgentConfigBody) =>
     http<ProbeResult>("/config/agent/probe", { method: "POST", body: JSON.stringify(body) }),

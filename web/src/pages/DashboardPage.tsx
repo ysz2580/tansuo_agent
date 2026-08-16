@@ -8,7 +8,8 @@ import { CurvesChart, ProgressChart } from "@/components/CurvesChart"
 import { ImportanceChart } from "@/components/ImportanceChart"
 import { ParamRelationChart } from "@/components/ParamRelationChart"
 
-function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
+function StatCard({ title, value, sub, sub2 }:
+                  { title: string; value: string; sub?: string; sub2?: string | null }) {
   return (
     <Card>
       <CardHeader className="pb-2">
@@ -17,6 +18,7 @@ function StatCard({ title, value, sub }: { title: string; value: string; sub?: s
       <CardContent>
         <div className="text-2xl font-semibold">{value}</div>
         {sub && <div className="text-muted-foreground mt-1 text-xs">{sub}</div>}
+        {sub2 && <div className="text-muted-foreground mt-0.5 text-xs">{sub2}</div>}
       </CardContent>
     </Card>
   )
@@ -48,6 +50,13 @@ export default function DashboardPage() {
   const c = summary.counts
   const finished = c.completed + c.pruned + c.failed
   const maximize = summary.direction === "maximize"
+  // 算力成本：Σ完结试验耗时 × 并行槽位；有上限时显示 已用/上限
+  const cmp = summary.compute
+  const computeTxt = cmp
+    ? `算力 ${cmp.compute_hours.toFixed(cmp.compute_hours >= 1 ? 1 : 2)} / `
+      + `${cmp.budget !== null ? `${cmp.budget} ` : ""}${cmp.unit}`
+      + (cmp.gpus.length > 0 ? `（${cmp.slots} 卡）` : "")
+    : null
 
   return (
     <div className="space-y-4">
@@ -66,7 +75,8 @@ export default function DashboardPage() {
         <StatCard title="预算" value={`${finished} / ${summary.budget_total}`}
                   sub={`剩余 ${Math.max(0, summary.budget_total - finished)} 次`
                     + (summary.eta_s !== null ? ` · ETA≈${fmtEta(summary.eta_s)}` : "")
-                    + (summary.workers > 1 ? ` · ${summary.workers} 并发` : "")} />
+                    + (summary.workers > 1 ? ` · ${summary.workers} 并发` : "")}
+                  sub2={computeTxt} />
         <StatCard title="搜索空间" value={`v${summary.space_version}`}
                   sub={summary.convergence.length > 24 ? undefined : summary.convergence} />
       </div>

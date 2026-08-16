@@ -80,3 +80,26 @@ class Journal:
         to = sum(int(e.get("output_tokens") or 0) for e in ends)
         return {"rounds": len(ends), "input_tokens": ti, "output_tokens": to,
                 "total_tokens": ti + to}
+
+
+def compute_cost(events: list[dict]) -> dict:
+    """累计算力成本：Σ(完结试验耗时) × slots ÷ 3600。
+
+    slots = 最近一次会话声明的 GPU 数（SESSION_START.gpus），无 GPU 时为 1
+    （此时单位语义为"机时"）。注意这是近似口径：历史会话若用过不同卡数，
+    统一按最近会话的 slots 折算——精确到会话的归属需要逐事件分段，成本
+    统计只做量级参考，不做计费级精度。
+    返回 {compute_hours, slots, gpus}。
+    """
+    gpus: list = []
+    for e in events:
+        if e.get("kind") == SESSION_START:
+            g = e.get("gpus")
+            gpus = list(g) if isinstance(g, list) else []
+    slots = len(gpus) if gpus else 1
+    total_s = 0.0
+    for e in events:
+        if e.get("kind") == TRIAL_END and isinstance(e.get("duration_s"), (int, float)):
+            total_s += float(e["duration_s"])
+    return {"compute_hours": round(total_s * slots / 3600.0, 4),
+            "slots": slots, "gpus": gpus}

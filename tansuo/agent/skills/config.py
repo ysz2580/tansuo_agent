@@ -1,19 +1,26 @@
 """配置生成技能（setup）：读训练脚本 → 写两份配置（经校验器）→ 探测试验自证可用。
 
-工具集 5 个：read_train_script / save_settings / save_search_space /
-run_probe_trial / finish。
+工具集 6 个：read_train_script / write_adapter_script / save_settings /
+save_search_space / run_probe_trial / finish。
 
-两处确定性护栏（不依赖 LLM 自觉）：
+write_adapter_script：用户脚本不满足三点契约时的自动适配通道——生成独立
+wrapper 脚本做配置注入与协议行转接，原脚本不动（把"用户必须手改脚本"
+的人工断点降为"极少数无法包装的脚本才需要手改"）。
+
+三处确定性护栏（不依赖 LLM 自觉）：
 1. save_settings 整体覆写时自动保留既有配置里的「环境字段」（data_dir、
    storage.url、agent 端点等部署事实）——否则 LLM 重写会丢脚手架的
    .tansuo 隔离路径，运行数据会逃出项目工作目录；
 2. run_probe_trial 成功后按「探针耗时 × 空间最重配置折算 × 安全余量」
-   自动校准 adapter.timeout_s——否则轻探针 + 重空间会让正式搜索成片超时。
+   自动校准 adapter.timeout_s——否则轻探针 + 重空间会让正式搜索成片超时；
+3. run_probe_trial 失败时返回结构化契约诊断（收到几条 epoch 行、缺哪条
+   契约、下一步该改配置还是写 wrapper）——不让模型对着一段 stderr 猜。
 """
 from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 
 from ..prompt_store import load_overrides
@@ -30,6 +37,7 @@ _PRESERVE_FIELDS = (
     ("agent", "model"),
     ("agent", "base_url"),
     ("agent", "auth_token"),
+    ("adapter", "python"),   # 项目专用解释器是部署事实（新建项目时探测写入）
 )
 # timeout 校准上限（秒）：再重也不把单次试验红线抬到 2 小时以上，
 # 超限时返回 warning 让 agent 在 finish 摘要里建议收窄空间。
@@ -38,6 +46,10 @@ _TIMEOUT_CAP_S = 7200
 # 训练轮数维度参数的名字线索（校准按此折算"最重配置"耗时）。epoch 最常见优先；
 # 脚本用 step/iter/round 命名也能命中。settings 可用 adapter.iter_param 显式指定覆盖。
 _ITER_KEYWORDS = ("epoch", "step", "iter", "round")
+
+# wrapper 脚本文件名白名单：纯文件名（无路径分隔符），防 LLM 写出 ../ 越界路径。
+# wrapper 一律落在 settings.yaml 同目录（新建项目即 <项目>/.tansuo/）。
+_ADAPTER_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+\.py$")
 
 
 def _find_iter_param(space, explicit: str | None = None):
@@ -86,6 +98,26 @@ SETUP_TOOLS = [
             "type": "object",
             "properties": {"path": {"type": "string", "description": "文件相对路径"}},
             "required": ["path"],
+        },
+    },
+    {
+        "name": "write_adapter_script",
+        "description": ("写一个适配脚本（wrapper）：当用户训练脚本不满足三点契约"
+                        "（读 env TANSUO_TRIAL_CONFIG / 每评估步打印 ##TANSUO## epoch 行 / "
+                        "结束打印 final 行）时，生成一个独立 Python 脚本做转接——读配置 JSON、"
+                        "调用原脚本的训练入口（import 或子进程）、把指标转成协议行打印。"
+                        "原训练脚本保持不动。写入后记得 save_settings 把 adapter.command "
+                        "指向它，再 run_probe_trial 验证。"),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string",
+                             "description": "纯文件名（如 adapter_wrapper.py），只允许字母/数字/"
+                                            "下划线/连字符 + .py，不能含路径"},
+                "content": {"type": "string",
+                            "description": "完整 Python 源码（含读配置、调用原脚本、打印协议行）"},
+            },
+            "required": ["filename", "content"],
         },
     },
     {
@@ -203,6 +235,30 @@ class SetupExecutor:
             text = text[:limit] + f"\n……（文件过长，截断到 {limit} 字符）"
         return f"===== {path} =====\n{text}"
 
+    # ---------------- 写适配脚本（wrapper：契约转接，原脚本不动） ----------------
+    def _tool_write_adapter_script(self, filename: str, content: str) -> str:
+        name = str(filename or "").strip()
+        if not _ADAPTER_NAME_RE.match(name):
+            return (f"文件名 '{filename}' 非法：只允许字母/数字/下划线/连字符 + .py 的纯文件名，"
+                    "不能含路径分隔符（适配脚本固定写在 settings.yaml 所在目录）")
+        content = str(content or "")
+        if not content.strip():
+            return "content 不能为空"
+        try:
+            compile(content, name, "exec")   # 语法检查：不落盘 __pycache__
+        except SyntaxError as e:
+            return (f"适配脚本有语法错误（未写入）：第 {e.lineno} 行 {e.msg}。"
+                    "修正后重新调用本工具。")
+        target = Path(self.settings_path).parent / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.write_text(content, encoding="utf-8")
+        except OSError as e:
+            return f"写入失败：{e}"
+        return (f"适配脚本已写入 {target}。下一步：save_settings 把 adapter.command 指向它"
+                f"（如 [\"python\", \"{name}\"]，路径约定与现有 settings 里 adapter.command "
+                "相同——相对项目工作目录），然后 run_probe_trial 验证。")
+
     # ---------------- 写（经校验器） ----------------
     def _load_existing_settings(self) -> dict:
         """读目标位置现有 settings.yaml（供保留环境字段/timeout 棘轮）；无则 {}。"""
@@ -286,6 +342,45 @@ class SetupExecutor:
                 f"（{len(space.params)} 个参数，校验通过）\n{space.describe()}")
 
     # ---------------- 探测试验 ----------------
+    def _probe_diagnosis(self, e, epoch_lines: int) -> dict:
+        """探针失败的结构化契约诊断：三点契约逐条核对，给出确定性下一步。
+
+        三点契约：① 读到配置（env TANSUO_TRIAL_CONFIG）② 每评估步打印 epoch 行
+        ③ 结束打印 final 行。epoch_lines 是实际收到的 epoch 行数——它把
+        「①② 已通、只缺 ③」与「一行协议行都没有」区分开，前者修 wrapper 尾部
+        即可，后者需要整体包装；不给模型对 stderr 猜的机会。
+        """
+        reason = getattr(e, "reason", str(e))
+        diag: dict = {
+            "status": "failed",
+            "reason": reason,
+            "hint": getattr(e, "hint", ""),
+            "detail": getattr(e, "detail", ""),
+            "epoch_lines_received": epoch_lines,
+        }
+        if "超时" in reason:
+            diag["contract_diagnosis"] = (
+                "契约本身可能是通的，只是脚本跑得太慢。先看是否已收到 epoch 行："
+                + ("已收到，说明配置注入与协议都通了，按超时提示压缩空间/提高 timeout_s。"
+                   if epoch_lines else
+                   "一行都没收到，先解决契约问题（见 write_adapter_script）再谈超时。"))
+        elif "主指标" in reason:
+            diag["contract_diagnosis"] = (
+                "协议行已收到，但 metrics 键名对不上 settings.metrics.primary.name。"
+                "改 settings 的主指标名与脚本实际打印的键一致，或在 wrapper 里做键名映射。")
+        elif epoch_lines > 0 and "final" in reason:
+            diag["contract_diagnosis"] = (
+                f"①配置注入 ②epoch 行都已通（收到 {epoch_lines} 条），只缺 ③final 行。"
+                "若原脚本不受你控制，用 write_adapter_script 在 wrapper 尾部补打 final 行"
+                "（取最后一个 epoch 的主指标即可），再把 adapter.command 指向 wrapper。")
+        elif epoch_lines == 0 and ("final" in reason or "协议" in reason):
+            diag["contract_diagnosis"] = (
+                "一条 epoch 协议行都没收到：脚本要么没读到 TANSUO_TRIAL_CONFIG，"
+                "要么根本没打印 ##TANSUO## 行。优先 write_adapter_script 生成 wrapper "
+                "转接（原脚本不动），save_settings 把 adapter.command 指向 wrapper 后重试探针；"
+                "确实无法包装时才在 finish 摘要里给用户手改建议。")
+        return diag
+
     def _tool_run_probe_trial(self, params: dict | None = None) -> str:
         import time
         import optuna
@@ -309,7 +404,8 @@ class SetupExecutor:
             return ("探测试验被剪枝（主指标出现 NaN/Inf，疑似发散）。"
                     "契约本身是通的；检查默认超参数是否过大（如 lr）。")
         except TrialFailedError as e:
-            return f"探测试验失败：{e.full()}"
+            curve = trial.user_attrs.get("curve") or []
+            return _json(self._probe_diagnosis(e, len(curve)))
         curve = trial.user_attrs.get("curve") or []
         duration = round(time.perf_counter() - t0, 1)
         result = {

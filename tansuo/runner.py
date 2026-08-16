@@ -147,15 +147,18 @@ def collect_env_clues(cwd: str | Path | None = None) -> dict:
 
 
 class TrialRunner:
-    def __init__(self, settings: Settings, space: SearchSpace, journal: Journal):
+    def __init__(self, settings: Settings, space: SearchSpace, journal: Journal,
+                 extra_env: dict | None = None):
         self.settings = settings
         self.space = space
         self.journal = journal
-        extra_env: dict[str, str] = {}
+        env: dict[str, str] = {}
         if settings.budget.data_fraction < 1.0:
-            extra_env["TANSUO_DATA_FRACTION"] = str(settings.budget.data_fraction)
+            env["TANSUO_DATA_FRACTION"] = str(settings.budget.data_fraction)
+        if extra_env:   # 调用方覆盖优先（毕业赛强制全量数据、GPU 选择等）
+            env.update({k: str(v) for k, v in extra_env.items()})
         # adapter 按试验创建（并行时每个线程持有独立实例；构造廉价，进程 run() 时才 spawn）
-        self._extra_env = extra_env
+        self._extra_env = env
         self.primary = settings.metrics.primary.name
         self.direction = settings.metrics.primary.direction
 

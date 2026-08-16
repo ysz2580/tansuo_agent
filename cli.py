@@ -25,6 +25,7 @@ from tansuo.cohort import (CohortError, abs_data_dir, apply_cohort, code_fingerp
                            resolve_for_run, update_cohort_env)
 from tansuo.compare import compare_cohorts
 from tansuo.config import ConfigError, load_settings
+from tansuo.gpu import parse_gpu_ids
 from tansuo.journal import Journal
 from tansuo.orchestrator import Orchestrator
 from tansuo.runner import TrialRunner
@@ -58,7 +59,7 @@ def load_space_with_snapshots(space_yaml: Path, data_dir: Path) -> SearchSpace:
     return SearchSpace.from_yaml(space_yaml)
 
 
-def _make_runtime(args, settings=None):
+def _make_runtime(args, settings=None, extra_env: dict | None = None):
     if settings is None:
         settings = load_settings(args.settings)
     if args.seed is not None:
@@ -71,7 +72,7 @@ def _make_runtime(args, settings=None):
     space = load_space_with_snapshots(Path(args.space), data_dir)
     study = create_or_load_study(settings)
     journal = Journal(journal_path(settings))
-    runner = TrialRunner(settings, space, journal)
+    runner = TrialRunner(settings, space, journal, extra_env=extra_env)
     orch = Orchestrator(settings, space, study, runner, journal)
     return settings, orch
 
@@ -121,7 +122,17 @@ def cmd_run(args) -> int:
         update_cohort_env(cohort)   # 续跑留痕：依赖/机器可能已与创建时不同
 
     try:
-        settings, orch = _make_runtime(args, settings=settings)
+        gpu_ids = parse_gpu_ids(args.gpus) if args.gpus else []
+    except ValueError as e:
+        print(f"参数错误：{e}", file=sys.stderr)
+        return 2
+
+    try:
+        # GPU 选择经 extra_env 注入训练子进程（CUDA_VISIBLE_DEVICES）；
+        # 成本折算（GPU·小时）在 orchestrator 记账
+        extra_env = {"CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in gpu_ids)} \
+            if gpu_ids else None
+        settings, orch = _make_runtime(args, settings=settings, extra_env=extra_env)
     except (ConfigError, SpaceError) as e:
         print(f"配置错误：{e}", file=sys.stderr)
         return 2
@@ -166,16 +177,20 @@ def cmd_run(args) -> int:
         print("[agent] 已禁用（--no-agent / settings agent.enabled=false），纯 Optuna 巡航。")
 
     workers = args.workers or settings.budget.workers
+    gpu_limit = settings.budget.max_gpu_hours
     print(f"实验：{settings.experiment_name} | 主指标：{settings.metrics.primary.name}"
           f"（{settings.metrics.primary.better}）| 预算：{total} 次试验 | 每 {wake} 次唤醒"
           + (f" | 并行 {workers} worker" if workers > 1 else "")
           + (f" | 时间上限 {args.hours:g}h" if args.hours else
              (f" | 时间上限 {settings.budget.max_duration_h:g}h"
-              if settings.budget.max_duration_h else "")))
+              if settings.budget.max_duration_h else ""))
+          + (f" | GPU {','.join(str(g) for g in gpu_ids)}" if gpu_ids else "")
+          + (f" | 算力上限 {gpu_limit:g} "
+             f"{'GPU·小时' if gpu_ids else '机时'}" if gpu_limit else ""))
     orch.run(total_trials=total, wake_every=wake, supervisor=supervisor,
              workers=args.workers, max_duration_h=args.hours,
              cohort=cohort.id, cohort_fp=cohort.meta.get("code_hash"),
-             fp_match=fp_match)
+             fp_match=fp_match, gpus=gpu_ids)
     try:
         from tansuo.report import generate_report
         report_path, best_path = generate_report(
@@ -303,6 +318,54 @@ def cmd_report(args) -> int:
     print(f"报告已生成：{report_path}")
     print(f"最优配置导出：{best_path}")
     return 0
+
+
+def cmd_graduate(args) -> int:
+    """最优配置毕业赛：全量数据 + 满训练轮数复验 best（隔离 study，不污染主记录）。"""
+    try:
+        settings = load_settings(args.settings)
+        cohort = _pick_read_cohort(settings, getattr(args, "cohort", None))
+        if cohort is not None:
+            apply_cohort(settings, cohort)
+            print(f"[记录] 为分区 {cohort.id} 举办毕业赛")
+        space = load_space_with_snapshots(Path(args.space), Path(settings.data_dir))
+    except (ConfigError, SpaceError, CohortError) as e:
+        print(f"配置错误：{e}", file=sys.stderr)
+        return 2
+
+    # 存储文件不存在 → 该分区从未跑过：明确提示而不是凭空创建空库
+    url = settings.storage.url
+    for scheme in ("sqlite:///", "journal://"):
+        if url.startswith(scheme):
+            store_file = Path(url[len(scheme):])
+            if not store_file.exists():
+                print("该分区尚无试验记录（存储文件不存在），无 best 配置可毕业。",
+                      file=sys.stderr)
+                return 1
+            break
+    from tansuo.graduate import GraduationError, graduate, graduation_path
+    from tansuo.study import STUDY_NAME, make_storage
+    try:
+        study = optuna.load_study(storage=make_storage(url), study_name=STUDY_NAME)
+    except KeyError:
+        print("该分区尚无试验记录，无 best 配置可毕业。", file=sys.stderr)
+        return 1
+    except Exception as e:   # noqa: BLE001 —— sqlite 被占用等（搜索可能正在跑）
+        print(f"无法打开试验数据库（可能被其他进程占用）：{e}", file=sys.stderr)
+        return 1
+    journal = Journal(journal_path(settings))
+    try:
+        result = graduate(settings, space, study, journal)
+    except GraduationError as e:
+        print(f"毕业赛未能举办：{e}", file=sys.stderr)
+        return 1
+    finally:
+        from tansuo.study import dispose_study
+        dispose_study(study)
+    print(f"结果已写入：{graduation_path(settings)}")
+    if result.get("status") == "ok":
+        return 0
+    return 1   # 复验失败/被剪枝：进程退出码如实反映，便于 Web 端提示
 
 
 def cmd_runs(args) -> int:
@@ -609,6 +672,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="并行试验数（默认取 settings budget.workers，1=串行）")
     pr.add_argument("--hours", type=float, default=None,
                     help="会话时间预算（小时）：到点在途试验跑完后优雅收尾")
+    pr.add_argument("--gpus", default=None, metavar="IDS",
+                    help="训练可见的 GPU 卡号（逗号分隔，如 0,1）：注入 "
+                         "CUDA_VISIBLE_DEVICES，成本按 GPU·小时折算")
     pr.add_argument("--warm-start", type=int, default=None,
                     help="新分区热启动种子数（默认取 settings budget.warm_start=3，0=关闭）")
     pr.add_argument("--new", action="store_true",
@@ -664,6 +730,12 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--cohort", default=None, metavar="ID",
                       help="为指定分区生成报告（默认最新分区）")
     prep.set_defaults(fn=cmd_report)
+
+    pg = sub.add_parser("graduate", parents=[common],
+                        help="最优配置毕业赛：全量数据 + 满轮数复验 best（隔离 study）")
+    pg.add_argument("--cohort", default=None, metavar="ID",
+                    help="复验指定分区的 best（默认最新分区）")
+    pg.set_defaults(fn=cmd_graduate)
 
     pc = sub.add_parser("check", parents=[common], help="两级探测 LLM 端点（ping + tool-use）")
     pc.add_argument("--model", default=None, help="覆盖 settings 中的模型名")

@@ -33,6 +33,22 @@ class AdapterError(RuntimeError):
     """适配器层错误（配置无法传入、入口加载失败等）。"""
 
 
+def resolve_command(cfg: AdapterCfg) -> list[str]:
+    """实际启动命令：adapter.python 设置时替换 command 里的 python 解释器。
+
+    只替换"看起来是 python"的首元素（basename 以 python 开头，如 python /
+    python3 / C:\\...\\python.exe）；torchrun 之类的启动器不动。
+    cfg.python 为空时逐字返回原命令（与历史行为一致）。
+    """
+    cmd = list(cfg.command)
+    py = (cfg.python or "").strip()
+    if py and cmd:
+        head = Path(cmd[0]).name.lower()
+        if head.startswith("python"):
+            cmd[0] = py
+    return cmd
+
+
 @dataclass
 class RunResult:
     """子进程运行结果。stdout 已通过 on_line 实时回调，这里保留尾部诊断信息。"""
@@ -75,7 +91,7 @@ class SubprocessAdapter:
             env = self._build_env(params, config_file)
             t0 = time.perf_counter()
             self._proc = subprocess.Popen(
-                list(self.cfg.command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                resolve_command(self.cfg), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 env=env, shell=False, text=True, encoding="utf-8", errors="replace")
             timed_out = {"v": False}
 

@@ -9,6 +9,7 @@ ask/tell（study.optimize(n_jobs=) 即此模式）；每个试验在 TrialRunner
 """
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 import optuna
 
 from .config import Settings
-from .journal import (FINISH, SESSION_START, TRIAL_END, TRIAL_FAIL, Journal)
+from .journal import (FINISH, SESSION_START, TRIAL_END, TRIAL_FAIL, Journal,
+                      compute_cost)
 from .runner import TrialFailedError, TrialRunner
 from .space import SearchSpace
 
@@ -58,7 +60,11 @@ class Orchestrator:
         self.agent_fail_streak = 0
         self.deadline: float | None = None           # 时间预算（monotonic 秒）
         self.cohort_id: str | None = None            # 本次会话的记录分区（run() 注入）
+        self.gpus: list[int] = []                    # 本次会话使用的 GPU 卡号（run() 注入）
         self._durations: deque = deque(maxlen=20)    # 最近完结试验耗时（ETA 用）
+        # 算力成本：Σ(试验耗时 × slots)，秒。多线程试验下持锁累加。
+        self._compute_seconds: float = 0.0
+        self._compute_lock = threading.Lock()
 
     # ---------------- 预算 ----------------
     def finished_count(self) -> int:
@@ -66,6 +72,23 @@ class Orchestrator:
 
     def budget_left(self) -> int:
         return max(0, self.total - self.finished_count())
+
+    @property
+    def slots(self) -> int:
+        """资源槽位数：有 GPU 时 = 卡数（成本折算 GPU·小时），否则 1（机时）。"""
+        return len(self.gpus) if self.gpus else 1
+
+    def compute_hours(self) -> float:
+        return self._compute_seconds / 3600.0
+
+    def _charge(self, dt: float) -> None:
+        """一试验消耗 dt 秒 × slots 槽位；剪枝/失败同样消耗算力，一并计入。"""
+        with self._compute_lock:
+            self._compute_seconds += dt * self.slots
+
+    def _compute_exceeded(self) -> bool:
+        limit = self.settings.budget.max_gpu_hours
+        return limit is not None and self.compute_hours() >= limit
 
     def _time_exceeded(self) -> bool:
         return self.deadline is not None and time.monotonic() >= self.deadline
@@ -115,6 +138,14 @@ class Orchestrator:
 
     # ---------------- 试验推进 ----------------
     def _run_one(self, trial, source: str) -> str:
+        """执行一次已 ask 的试验并上报（外层统一计算力：剪枝/失败同样消耗资源）。"""
+        t0 = time.perf_counter()
+        try:
+            return self._run_one_impl(trial, source)
+        finally:
+            self._charge(time.perf_counter() - t0)
+
+    def _run_one_impl(self, trial, source: str) -> str:
         """执行一次已 ask 的试验并上报。返回 completed/pruned/failed。"""
         t0 = time.perf_counter()
         try:
@@ -124,7 +155,7 @@ class Orchestrator:
             self._durations.append(dt)
             self.journal.append(TRIAL_END, trial=trial.number, value=value,
                                 params=dict(trial.params), source=source,
-                                duration_s=round(dt, 1))
+                                duration_s=round(dt, 2))
             self._progress(trial, "COMPLETE",
                            f"{self.settings.metrics.primary.name}={value:.4f}", dt)
             return "completed"
@@ -178,11 +209,17 @@ class Orchestrator:
         trial = self.study.ask()
         t0 = time.perf_counter()
         try:
+            return self._run_custom_impl(trial, params, note, t0)
+        finally:
+            self._charge(time.perf_counter() - t0)
+
+    def _run_custom_impl(self, trial, params: dict, note: str | None, t0: float) -> dict:
+        try:
             value = self.runner.run_trial(trial, cfg_override=params, note=note)
             self.study.tell(trial, value)
             self.journal.append(TRIAL_END, trial=trial.number, value=value,
                                 params=dict(trial.params), source="custom",
-                                note=note, duration_s=round(time.perf_counter() - t0, 1))
+                                note=note, duration_s=round(time.perf_counter() - t0, 2))
             self._progress(trial, "COMPLETE",
                            f"{self.settings.metrics.primary.name}={value:.4f}",
                            time.perf_counter() - t0)
@@ -214,40 +251,55 @@ class Orchestrator:
             supervisor=None, workers: int | None = None,
             max_duration_h: float | None = None,
             cohort: str | None = None, cohort_fp: str | None = None,
-            fp_match: bool | None = None) -> None:
-        """跑到预算耗尽 / 时间预算耗尽 / agent finish / Ctrl+C。supervisor 可为 None。
+            fp_match: bool | None = None, gpus: list[int] | None = None) -> None:
+        """跑到预算耗尽 / 时间预算耗尽 / 算力预算耗尽 / agent finish / Ctrl+C。
+        supervisor 可为 None。
 
         cohort/cohort_fp/fp_match：分区管理审计字段（见 tansuo/cohort.py），
         仅写入 SESSION_START 事件，缺省 None 时行为与旧版完全一致。
+        gpus：本次会话使用的 GPU 卡号——影响成本折算（GPU·小时）；
+        CUDA_VISIBLE_DEVICES 的注入在 TrialRunner（extra_env），此处只做记账。
         """
         if total_trials is not None:
             self.total = total_trials
         if workers is not None:
             self.workers = workers
         self.cohort_id = cohort
+        self.gpus = list(gpus or [])
         wake_every = wake_every or self.settings.budget.wake_every
         hours = max_duration_h if max_duration_h is not None else self.settings.budget.max_duration_h
         if hours:
             self.deadline = time.monotonic() + hours * 3600
         self._seed_durations()
+        self._seed_compute()
         already = self.finished_count()
         if already:
             self.log(f"断点续跑：study 中已有 {already} 次完结试验，本会话预算剩余 "
                      f"{self.budget_left()}（总预算 {self.total}）")
         if hours:
             self.log(f"时间预算：{hours:g} 小时（到点后在途试验跑完即收尾）")
+        gpu_limit = self.settings.budget.max_gpu_hours
+        if gpu_limit:
+            unit = "GPU·小时" if self.gpus else "机时"
+            self.log(f"算力预算：{gpu_limit:g} {unit}（当前已累计 "
+                     f"{self.compute_hours():.3f}，到点优雅收尾）")
+        if self.gpus:
+            self.log(f"GPU：{','.join(str(g) for g in self.gpus)}"
+                     f"（成本按 {self.slots} 槽折算）")
         if self.workers > 1:
             self.log(f"并行试验：{self.workers} 个 worker（唤醒发生在批边界）")
         self.journal.append(SESSION_START, total=self.total, wake_every=wake_every,
                             resume=already > 0, space_version=self.space.version,
                             study_trials=already, workers=self.workers,
                             max_duration_h=hours, cohort=cohort,
-                            cohort_fp=cohort_fp, fp_match=fp_match)
+                            cohort_fp=cohort_fp, fp_match=fp_match,
+                            gpus=self.gpus or None)
         self.space.snapshot(self.settings.data_dir)
 
         if self.budget_left() <= 0:
             self.log("预算内的试验已全部完结，无需再跑。")
-            self.journal.append(FINISH, reason="budget_exhausted")
+            self.journal.append(FINISH, reason="budget_exhausted",
+                                compute_hours=round(self.compute_hours(), 6))
             self._notify_finish("budget_exhausted")
             return
 
@@ -256,6 +308,9 @@ class Orchestrator:
                 if self._time_exceeded():
                     self.finished_reason = "time_budget_exhausted"
                     break
+                if self._compute_exceeded():
+                    self.finished_reason = "compute_budget_exhausted"
+                    break
                 batch = min(wake_every, self.budget_left())
                 self.run_batch(batch)
                 if self.finished_reason or self.budget_left() <= 0:
@@ -263,22 +318,43 @@ class Orchestrator:
                 if self._time_exceeded():
                     self.finished_reason = "time_budget_exhausted"
                     break
+                if self._compute_exceeded():
+                    self.finished_reason = "compute_budget_exhausted"
+                    break
                 if supervisor is not None:
                     supervisor = self._wake(supervisor)   # 返回 None 表示已降级禁用
         except KeyboardInterrupt:
-            self.journal.append(FINISH, reason="interrupted", done=self.finished_count())
+            self.journal.append(FINISH, reason="interrupted", done=self.finished_count(),
+                                compute_hours=round(self.compute_hours(), 6))
             self._notify_finish("interrupted")
             self.log("\n已中断。运行 `python cli.py run --resume` 可从断点续跑。")
             return
 
         reason = self.finished_reason or "budget_exhausted"
-        self.journal.append(FINISH, reason=reason, done=self.finished_count())
+        self.journal.append(FINISH, reason=reason, done=self.finished_count(),
+                            compute_hours=round(self.compute_hours(), 6))
         self._notify_finish(reason)
+        unit = "GPU·小时" if self.gpus else "机时"
+        cost_txt = f" | 算力 {self.compute_hours():.3f} {unit}"
         try:
             self.log(f"\n结束（{reason}）：最优 trial#{self.study.best_trial.number} "
-                     f"{self.settings.metrics.primary.name}={self.study.best_value:.4f}")
+                     f"{self.settings.metrics.primary.name}={self.study.best_value:.4f}"
+                     f"{cost_txt}")
         except ValueError:
-            self.log(f"\n结束（{reason}）：本次会话没有完成的试验（全部剪枝/失败）")
+            self.log(f"\n结束（{reason}）：本次会话没有完成的试验（全部剪枝/失败）"
+                     f"{cost_txt}")
+
+    def _seed_compute(self) -> None:
+        """断点续跑：用 journal 里已有试验耗时预热算力累计（按本次 slots 折算）。"""
+        try:
+            events = self.journal.load_events()
+        except OSError:
+            return
+        ends = [e for e in events if e.get("kind") == TRIAL_END
+                and isinstance(e.get("duration_s"), (int, float))]
+        total_s = sum(float(e["duration_s"]) for e in ends)
+        with self._compute_lock:
+            self._compute_seconds = total_s * self.slots
 
     def _seed_durations(self) -> None:
         """断点续跑时用 journal 里最近的试验耗时预热 ETA。"""

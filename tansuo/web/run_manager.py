@@ -28,6 +28,7 @@ class RunManager:
         self.stopped: bool = False
         self.last_cohort: str | None = None   # 本次运行所在的记录分区（stop 清理用）
         self.project_dir: Path | None = None  # 本次运行的项目目录（cwd/相对路径基准）
+        self.settings_path: str | None = None  # 本次运行的 settings（stop 后孤儿清理用）
         self._log_f = None
 
     @property
@@ -62,7 +63,8 @@ class RunManager:
               project_dir: str | Path, trials: int | None = None,
               wake_every: int | None = None, no_agent: bool = False,
               workers: int | None = None, max_duration_h: float | None = None,
-              cohort: str | None = None, note: str | None = None) -> dict:
+              cohort: str | None = None, note: str | None = None,
+              gpus: list[int] | None = None, subcmd: str = "run") -> dict:
         if self.running:
             raise RuntimeError(f"已有搜索在运行（pid={self.pid}），请先停止再启动新任务")
         data_dir = Path(data_dir)
@@ -70,7 +72,7 @@ class RunManager:
         ts = time.strftime("%Y%m%d-%H%M%S")
         self.log_path = data_dir / f"web_run_{ts}.log"
         # -u：stdout 重定向到文件后默认块缓冲，前端要实时看日志必须无缓冲
-        cmd = [sys.executable, "-u", str(self.project_root / "cli.py"), "run",
+        cmd = [sys.executable, "-u", str(self.project_root / "cli.py"), subcmd,
                "--settings", settings_path, "--space", space_path]
         if trials:
             cmd += ["--trials", str(trials)]
@@ -88,6 +90,8 @@ class RunManager:
             cmd += ["--workers", str(workers)]
         if max_duration_h and max_duration_h > 0:
             cmd += ["--hours", str(max_duration_h)]
+        if gpus:
+            cmd += ["--gpus", ",".join(str(g) for g in gpus)]
         kwargs: dict = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -102,6 +106,7 @@ class RunManager:
         self.stopped = False
         self.last_cohort = cohort
         self.project_dir = Path(project_dir)
+        self.settings_path = settings_path
         return self.status()
 
     def stop(self) -> dict:
