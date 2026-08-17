@@ -193,4 +193,24 @@ with tempfile.TemporaryDirectory() as td:
                   "--ops", "not-json", expect=2)
     ok("非法 JSON 拒绝", "不是合法 JSON" in r20.stderr)
 
+    print("== 11. 人工试验插队（try / custom，journal source=human） ==")
+    # try：合法参数 → 排队并立即执行（空闲时 consume_inbox 直接跑掉）
+    r21 = run_cli(tmp, "try", *S, "--params", '{"lr": 0.05}', "--note", "人工冒烟")
+    ok("try 排队并落分区队列", "已排队" in r21.stdout and "分区" in r21.stdout,
+       r21.stdout)
+    ok("try 空闲时立即执行（source=human 审计）",
+       ("已立即执行" in r21.stdout or "已执行" in r21.stdout
+        or "保留在队列" in r21.stdout), r21.stdout)
+    # try：非法参数（超出定义域）→ 退出码 2，且不落队列
+    r22 = run_cli(tmp, "try", *S, "--params", '{"lr": 9.9}', expect=2)
+    ok("try 超定义域参数被拒（退出码 2）",
+       "搜索空间校验" in r22.stderr or "超出" in r22.stderr, r22.stderr)
+    r23 = run_cli(tmp, "try", *S, "--params", 'not-json', expect=2)
+    ok("try 非法 JSON 被拒", "不是合法 JSON" in r23.stderr, r23.stderr)
+    r24 = run_cli(tmp, "try", *S, "--params", '{}', expect=2)
+    ok("try 空参数组被拒", "非空 JSON 对象" in r24.stderr, r24.stderr)
+    # custom：无排队条目 → 退出码 1 提示
+    r25 = run_cli(tmp, "custom", *S, expect=1)
+    ok("custom 无排队条目提示", "没有可消费的人工试验" in r25.stdout, r25.stdout)
+
 print(f"\nCLI 冒烟全部通过：{PASS} 项")

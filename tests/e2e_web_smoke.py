@@ -591,6 +591,80 @@ with tempfile.TemporaryDirectory() as td:
         except _ue.HTTPError as e:
             ok("项目目录外的路径被拒（400）", e.code == 400)
 
+        print("== 19. P0：预算预估 / 人工试验插队 / 试验日志下钻 ==")
+        # 1) 预算预估：projC 已有完结试验 → history 口径；多槽位按 GPU·小时折算
+        est = api("/api/estimate?trials=5&slots=1")
+        ok("estimate 走分区历史口径（basis=history 且样本数 ≥1）",
+           est["basis"] == "history" and est.get("sample", 0) >= 1
+           and est["per_trial_s"] > 0, str(est))
+        ok("estimate 给出估算与含余量建议值",
+           est["est_hours"] > 0 and est["unit"] == "机时"
+           and est["recommended_max"] > est["est_hours"], str(est))
+        est2 = api("/api/estimate?trials=5&slots=2")
+        ok("多槽位按 GPU·小时折算（耗时 ×2，容许 4 位小数舍入）",
+           est2["unit"] == "GPU·小时"
+           and abs(est2["est_hours"] - est["est_hours"] * 2) < 5e-4, str(est2))
+        # 2) 一键采纳 → budget.max_gpu_hours 写回 projC 的 settings（块形态插入）
+        ad = api("/api/estimate/adopt", {"max_gpu_hours": est["recommended_max"]})
+        ok("adopt 写回成功",
+           ad["write_back"]["ok"] and ad["write_back"]["changed"] == ["max_gpu_hours"],
+           str(ad))
+        cfgw = yaml.safe_load((projc / ".tansuo" / "settings.yaml")
+                              .read_text(encoding="utf-8"))
+        ok("budget.max_gpu_hours 落盘且模板其余字段完好",
+           abs(cfgw["budget"]["max_gpu_hours"] - est["recommended_max"]) < 1e-9
+           and cfgw["budget"]["total_trials"] == 30, str(cfgw.get("budget")))
+        try:
+            api("/api/estimate/adopt", {"max_gpu_hours": -1})
+            raise AssertionError("FAIL: 非正算力上限应被拒")
+        except _ue.HTTPError as e:
+            ok("非正算力上限被拒（422/400）", e.code in (400, 422))
+
+        # 3) 人工试验插队：非法参数当场拒；合法参数空闲即时执行
+        try:
+            api("/api/custom", {"params": {}})
+            raise AssertionError("FAIL: 空 params 应被拒")
+        except _ue.HTTPError as e:
+            ok("空 params 被拒（400）", e.code == 400)
+        try:
+            api("/api/custom", {"params": {"optimizer": "adam", "lr": 9.9,
+                                           "batch_size": 32}})
+            raise AssertionError("FAIL: 超定义域参数应被拒")
+        except _ue.HTTPError as e:
+            ok("超定义域参数被拒（400 且说明校验原因）",
+               e.code == 400 and "校验" in e.read().decode("utf-8", "replace"))
+        try:
+            api("/api/custom", {"params": {"lr": 0.001}})
+            raise AssertionError("FAIL: 缺参数应被拒")
+        except _ue.HTTPError as e:
+            ok("缺参数被拒（validate_config 要求给全）", e.code == 400)
+        ct = api("/api/custom", {"params": {"optimizer": "adam", "lr": 0.001,
+                                            "batch_size": 32},
+                                 "note": "web-smoke-human"})
+        ok("空闲时提交即时派发执行（mode=executing）",
+           ct["queued"] is True and ct["mode"] == "executing"
+           and ct["cohort"], str(ct))
+        sth = wait_idle()
+        ok("人工试验子进程正常退出", sth["exit_code"] == 0, str(sth))
+        tsh = api("/api/trials")
+        hum = [t for t in tsh["trials"]
+               if t["attrs"].get("note") == "web-smoke-human"]
+        ok("人工试验落最新分区（custom 属性 + note 审计）",
+           len(hum) == 1 and hum[0]["attrs"].get("custom") is True
+           and hum[0]["state"] == "COMPLETE", str(hum))
+
+        # 4) 试验日志下钻：列表带 has_log；详情端点返回全量 stdout/stderr
+        ok("完结试验均有全量日志标记",
+           all(t["has_log"] for t in tsh["trials"] if t["state"] == "COMPLETE"),
+           str([(t["number"], t["state"], t["has_log"]) for t in tsh["trials"]]))
+        n_h = hum[0]["number"]
+        lg2 = api(f"/api/trials/{n_h}/log")
+        ok("日志端点返回全量输出（头行 + 协议行 + 尾段）",
+           lg2["trial"] == n_h and "=====" in lg2["text"]
+           and "##TANSUO##" in lg2["text"] and "exit_code=" in lg2["text"],
+           lg2["text"][:200])
+        ok("未知试验日志 404", _expect_404("/api/trials/9999/log"))
+
         print("\nWeb 冒烟全部通过")
     finally:
         if proc and proc.poll() is None:

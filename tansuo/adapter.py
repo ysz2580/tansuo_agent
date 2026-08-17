@@ -80,13 +80,31 @@ class SubprocessAdapter:
             env.pop(ENV_CONFIG_FILE, None)
         return env
 
-    def run(self, params: dict, on_line: Callable[[str], None]) -> RunResult:
-        """启动子进程跑一次试验；stdout 逐行实时回调 on_line。"""
+    def run(self, params: dict, on_line: Callable[[str], None],
+            log_path: str | Path | None = None) -> RunResult:
+        """启动子进程跑一次试验；stdout 逐行实时回调 on_line。
+
+        log_path 给出时，完整 stdout/stderr 同步落盘该文件（追加模式，重试会
+        续写多段）——内存里只保留尾部摘要，全量输出不再随进程结束丢失。
+        写日志失败不影响试验本身（降级为无落盘）。
+        """
         config_file = None
         if self.cfg.config_via == "file":
             fd, config_file = tempfile.mkstemp(prefix="tansuo_cfg_", suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(params, f, ensure_ascii=False)
+        log_f = None
+        if log_path:
+            try:
+                log_path = Path(log_path)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_f = open(log_path, "a", encoding="utf-8")
+                log_f.write(
+                    f"===== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"cmd={resolve_command(self.cfg)} "
+                    f"params={json.dumps(params, ensure_ascii=False)} =====\n")
+            except OSError:
+                log_f = None
         try:
             env = self._build_env(params, config_file)
             t0 = time.perf_counter()
@@ -110,14 +128,26 @@ class SubprocessAdapter:
                 stdout_tail.append(line.rstrip("\n"))
                 if len(stdout_tail) > 200:
                     stdout_tail.pop(0)
+                if log_f:
+                    log_f.write(line)
                 on_line(line)
             self._proc.wait()
             stderr = self._proc.stderr.read() if self._proc.stderr else ""
+            if log_f:
+                log_f.write("----- stderr -----\n")
+                log_f.write(stderr or "(空)")
+                log_f.write(f"\n----- exit_code={self._proc.returncode} "
+                            f"timed_out={timed_out['v']} -----\n")
             return RunResult(exit_code=self._proc.returncode or 0,
                              timed_out=timed_out["v"],
                              stderr_tail=(stderr or "")[-2000:],
                              stdout_tail=stdout_tail[-20:])
         finally:
+            if log_f:
+                try:
+                    log_f.close()
+                except OSError:
+                    pass
             self._proc = None
             if config_file:
                 try:

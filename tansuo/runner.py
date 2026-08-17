@@ -81,6 +81,16 @@ def parse_metric_line(line: str) -> dict | None:
     return payload
 
 
+def trial_log_path(settings: Settings, trial_number: int) -> Path:
+    """试验全量输出日志的约定位置：<data_dir>/trials/trial-NNNN.log。
+
+    data_dir 已被 apply_cohort 改写为分区目录时，日志天然按分区隔离。
+    subprocess 模式每个试验落一份完整 stdout/stderr（重试续写多段）；
+    python 函数模式无子进程输出，不产生该文件。
+    """
+    return Path(settings.data_dir) / "trials" / f"trial-{trial_number:04d}.log"
+
+
 # ------------------------------------------------------------------
 # 瞬时故障环境线索（STAR #004 那类"退出码非零、stderr 为空、单独复现正常"
 # 的疑难问题，根因多与安全软件/磁盘等环境因素有关）。采集轻量、永不阻塞：
@@ -229,6 +239,9 @@ class TrialRunner:
             # 其它 type 忽略（允许脚本扩展）
 
         if adapter.mode == "subprocess":
+            # 全量输出落盘（内存只留尾部摘要）：失败诊断与前端下钻共用同一文件
+            log_path = trial_log_path(self.settings, trial.number)
+
             def on_line(line: str) -> None:
                 payload = parse_metric_line(line)
                 if payload is not None:
@@ -237,7 +250,7 @@ class TrialRunner:
             result = None
             for attempt in range(1, attempts + 1):
                 try:
-                    result = adapter.run(cfg, on_line)
+                    result = adapter.run(cfg, on_line, log_path=log_path)
                 except _PruneSignal:
                     adapter.kill()
                     self.journal.append(TRIAL_PRUNED, trial=trial.number, epochs=len(curve))
@@ -261,7 +274,8 @@ class TrialRunner:
                 raise TrialFailedError(
                     f"训练超时（>{self.settings.adapter.timeout_s}s）",
                     hint="可减少 epochs/width 或调低 budget.data_fraction；"
-                         "也可在 settings.yaml 提高 adapter.timeout_s")
+                         "也可在 settings.yaml 提高 adapter.timeout_s",
+                    detail=f"完整日志：{log_path}")
             if result.exit_code != 0:
                 retried = attempt - 1   # 实际发生的重试次数（确定性失败可能为 0）
                 # stderr 为空 = 瞬时故障形态：采环境线索落 journal 供根因诊断
@@ -269,17 +283,18 @@ class TrialRunner:
                 raise TrialFailedError(
                     f"训练脚本退出码 {result.exit_code}"
                     + (f"（已自动重试 {retried} 次仍失败）" if retried else ""),
-                    hint="查看下方 stderr/stdout 尾部定位脚本错误（若都为空，多为环境瞬时问题，"
+                    hint="查看完整日志定位脚本错误（若 stderr/stdout 都为空，多为环境瞬时问题，"
                          "可在 settings.yaml 设置 adapter.retry_on_fail 自动重试）",
                     detail=(f"stderr: {result.stderr_tail or '(空)'} | "
-                            f"stdout 尾部: {result.stdout_tail[-3:] or '(空)'}"),
+                            f"stdout 尾部: {result.stdout_tail[-3:] or '(空)'} | "
+                            f"完整日志: {log_path}"),
                     env_clues=collect_env_clues() if transient_like else None)
             if final_value["v"] is None:
                 raise TrialFailedError(
                     "训练结束但未收到 final 协议行",
                     hint=("脚本结束时必须打印 "
                           "##TANSUO## {\"type\":\"final\",\"value\":<float>}"),
-                    detail=f"stdout 尾部：{result.stdout_tail[-3:]}")
+                    detail=f"stdout 尾部：{result.stdout_tail[-3:]} | 完整日志: {log_path}")
             return float(final_value["v"])
         else:  # python 函数模式
             def report(epoch: int, metrics: dict) -> bool:

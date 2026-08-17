@@ -113,12 +113,47 @@ export interface Trial {
   attrs: Record<string, unknown>
   duration_s: number | null
   fail_reason: string | null
+  has_log?: boolean           // 是否有全量 stdout/stderr 落盘（<分区>/trials/trial-NNNN.log）
 }
 
 export interface TrialsResp {
   trials: Trial[]
   primary: string
   direction: string
+}
+
+// 试验全量 stdout/stderr 日志（/api/trials/{n}/log；无落盘时后端 404）
+export interface TrialLogResp {
+  trial: number
+  path: string
+  text: string
+}
+
+// 人工试验插队（POST /api/custom）：运行中 → 排队等批边界消费；空闲 → 即时派发执行
+export interface CustomTrialResp {
+  queued: boolean
+  mode: "inbox" | "executing"
+  cohort: string
+  inbox: string
+  detail: string
+}
+
+// 预算预估（/api/estimate?trials=&slots=）：按实测耗时估算总算力
+export interface EstimateResp {
+  basis: "history" | "probe" | null   // history=分区历史试验均值；probe=setup 探针
+  sample?: number                     // 参与估算的样本数
+  per_trial_s?: number                // 单次试验平均耗时（秒）
+  trials: number
+  slots: number
+  est_hours?: number
+  unit?: string                       // "GPU·小时" | "机时"
+  recommended_max?: number            // est_hours × 1.2（建议的 budget.max_gpu_hours）
+  hint?: string                       // basis=null 时的说明
+}
+
+export interface EstimateAdoptResp {
+  write_back: { ok: boolean; changed: boolean; errors: string[] }
+  max_gpu_hours: number
 }
 
 export interface CurvePoint {
@@ -456,6 +491,8 @@ export const api = {
   trials: (cohort?: string | null) => http<TrialsResp>(`/trials${qs(cohort)}`),
   trialCurve: (n: number, cohort?: string | null) =>
     http<CurveResp>(`/trials/${n}/curve${qs(cohort)}`),
+  trialLog: (n: number, cohort?: string | null) =>
+    http<TrialLogResp>(`/trials/${n}/log${qs(cohort)}`),
   curves: (cohort?: string | null) => http<CurvesResp>(`/curves${qs(cohort)}`),
   space: (cohort?: string | null) => http<SpaceResp>(`/space${qs(cohort)}`),
   agentEvents: (cohort?: string | null) =>
@@ -474,9 +511,17 @@ export const api = {
   runStart: (body: { trials?: number; wake_every?: number; no_agent?: boolean; fresh?: boolean; new_cohort?: boolean; note?: string; workers?: number; max_duration_h?: number; gpus?: number[] }) =>
     http<RunStatus>("/run/start", { method: "POST", body: JSON.stringify(body) }),
   runStop: () => http<RunStatus & { marked_failed?: number[] }>("/run/stop", { method: "POST", body: "{}" }),
+  // 人工试验插队：运行中排队（mode=inbox）；空闲即时派发（mode=executing）
+  customTrial: (body: { params: Record<string, unknown>; note?: string }) =>
+    http<CustomTrialResp>("/custom", { method: "POST", body: JSON.stringify(body) }),
   // 本机 GPU 清单（选卡用；无 GPU → 空数组，前端隐藏选卡区）
   gpusList: (refresh = false) =>
     http<{ gpus: GpuInfo[] }>(`/gpus${refresh ? "?refresh=true" : ""}`),
+  // 预算预估：按实测耗时估算 N 次试验总算力；adopt 一键写入 budget.max_gpu_hours
+  estimate: (trials: number, slots: number) =>
+    http<EstimateResp>(`/estimate?trials=${trials}&slots=${slots}`),
+  estimateAdopt: (max_gpu_hours: number) =>
+    http<EstimateAdoptResp>("/estimate/adopt", { method: "POST", body: JSON.stringify({ max_gpu_hours }) }),
   // 毕业赛：POST 启动（复用运行槽，日志走 runLog）；GET 读结果
   graduateStart: () => http<RunStatus>("/graduate", { method: "POST", body: "{}" }),
   graduateResult: (cohort?: string | null) =>

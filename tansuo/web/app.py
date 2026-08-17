@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -234,6 +236,7 @@ def trials(cohort: str | None = Query(default=None)):
     settings, space, study, journal, coh = _safe_load(cohort)
     fail_reasons = {e.get("trial"): e.get("reason")
                     for e in journal.load_events() if e.get("kind") == "trial_fail"}
+    from ..runner import trial_log_path
     rows = []
     for t in study.get_trials(deepcopy=False):
         duration = None
@@ -247,10 +250,28 @@ def trials(cohort: str | None = Query(default=None)):
             "attrs": {k: v for k, v in t.user_attrs.items() if k != "curve"},
             "duration_s": duration,
             "fail_reason": fail_reasons.get(t.number),
+            "has_log": trial_log_path(settings, t.number).exists(),
         })
     return {"trials": rows,
             "primary": settings.metrics.primary.name,
             "direction": settings.metrics.primary.direction}
+
+
+@app.get("/api/trials/{number}/log")
+def trial_log(number: int, cohort: str | None = Query(default=None)):
+    """试验全量 stdout/stderr（<分区>/trials/trial-NNNN.log）。
+
+    python 函数模式 / 旧分区（日志落盘引入前）没有该文件 → 404。
+    """
+    settings, space, study, journal, coh = _safe_load(cohort)
+    from ..runner import trial_log_path
+    p = trial_log_path(settings, number)
+    if not p.exists():
+        raise HTTPException(status_code=404,
+                            detail=f"trial#{number} 没有全量日志"
+                                   "（python 模式无子进程输出，或早于日志落盘功能）")
+    return {"trial": number, "path": str(p),
+            "text": p.read_text(encoding="utf-8", errors="replace")}
 
 
 @app.get("/api/trials/{number}/curve")
@@ -352,6 +373,155 @@ def graduate_result(cohort: str | None = Query(default=None)):
     if result is not None:
         resp["updated"] = time_iso(graduation_path(settings).stat().st_mtime)
     return resp
+
+
+class CustomTrialBody(BaseModel):
+    params: dict = Field(..., description="想试的参数组合（按目标分区的空间快照校验）")
+    note: str | None = Field(default=None, description="备注（journal 审计：source=human）")
+
+
+def _append_inbox(settings, params: dict, note: str | None) -> Path:
+    """向分区 inbox.jsonl 追加一条人工试验（运行中的 orchestrator 批边界消费）。"""
+    inbox = Path(settings.data_dir) / "inbox.jsonl"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"params": params, "note": note or "human-web",
+             "queued_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    with open(inbox, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return inbox
+
+
+@app.post("/api/custom")
+def custom_trial(body: CustomTrialBody):
+    """人工试验插队：
+    - 本项目有搜索在跑 → 写入该运行分区的 inbox，orchestrator 下批开头消费；
+    - 空闲 → 写入最新分区 inbox 并派发 `cli.py custom` 即时执行（复用运行槽日志）。
+    参数先按目标分区的空间快照 validate_config 校验，非法配置当场拒绝。
+    """
+    if not body.params:
+        raise HTTPException(status_code=400, detail="params 不能为空")
+    project_id = _active_project_id()
+    settings_path, space_path, project_dir = _active_paths()
+    try:
+        settings = load_settings(settings_path)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    mgr = _run_mgr(project_id)
+    root = abs_data_dir(settings, project_dir)
+    try:
+        if mgr.running and mgr.last_cohort:
+            # 运行中：队列必须写进"正在跑的那个分区"（指纹可能已变，不能写最新分区）
+            cohort = load_cohort(root, mgr.last_cohort, settings=settings)
+            apply_cohort(settings, cohort)
+        else:
+            cohorts = list_cohorts(root, settings=settings)
+            if not cohorts:
+                raise HTTPException(status_code=400,
+                                    detail="还没有记录分区：请先运行一次搜索"
+                                           "（人工试验的记录依托分区存在）")
+            cohort = cohorts[-1]
+            apply_cohort(settings, cohort)
+    except CohortError as e:
+        raise HTTPException(status_code=404, detail=f"定位记录分区失败：{e}")
+    try:
+        space = _load_space_with_snapshots(Path(space_path), Path(settings.data_dir))
+        errors = space.validate_config(body.params)
+    except SpaceError as e:
+        raise HTTPException(status_code=500, detail=f"搜索空间加载失败：{e}")
+    if errors:
+        raise HTTPException(status_code=400,
+                            detail="参数组合未通过搜索空间校验：" + "；".join(errors))
+    try:
+        inbox = _append_inbox(settings, body.params, body.note)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"写入试验队列失败：{e}")
+    if mgr.running:
+        return {"queued": True, "mode": "inbox", "cohort": cohort.id,
+                "inbox": str(inbox),
+                "detail": "已排队：运行中的搜索会在下一批开头执行该配置"
+                          "（journal source=human）"}
+    busy = _busy_reason_for(project_id)
+    if busy:   # 本项目 setup 在跑：不能派发 run 槽，等空闲消费
+        return {"queued": True, "mode": "inbox", "cohort": cohort.id,
+                "inbox": str(inbox),
+                "detail": f"已排队（{busy}）：下次搜索启动时执行"}
+    try:
+        mgr.start(cohort.path, settings_path=settings_path, space_path=space_path,
+                  project_dir=project_dir, cohort=cohort.id, subcmd="custom")
+    except RuntimeError as e:
+        return {"queued": True, "mode": "inbox", "cohort": cohort.id,
+                "inbox": str(inbox),
+                "detail": f"已排队（即时执行派发失败：{e}）：下次搜索启动时执行"}
+    return {"queued": True, "mode": "executing", "cohort": cohort.id,
+            "inbox": str(inbox),
+            "detail": "空闲即时执行中：进度看运行日志（/api/run/log）"}
+
+
+def _probe_duration_s() -> float | None:
+    """setup 探针最近一次成功耗时（setup_journal.jsonl 的 TRIAL_END source=probe）。"""
+    settings_path, _, project_dir = _active_paths()
+    try:
+        settings = load_settings(settings_path)
+    except ConfigError:
+        return None
+    jp = abs_data_dir(settings, project_dir) / "setup_journal.jsonl"
+    if not jp.exists():
+        return None
+    probes = [float(e["duration_s"]) for e in Journal(jp).load_events()
+              if e.get("kind") == TRIAL_END and e.get("source") == "probe"
+              and isinstance(e.get("duration_s"), (int, float))]
+    return probes[-1] if probes else None
+
+
+@app.get("/api/estimate")
+def estimate(trials: int = Query(default=30, ge=1, le=100000),
+             slots: int = Query(default=1, ge=1, le=128)):
+    """预算预估：按实测耗时估算 N 次试验的总算力，启动前给用户量级参考。
+
+    口径优先级：① 当前分区最近 ≤20 次完结试验平均耗时（history，最准）；
+    ② setup 探针耗时（probe，新项目无任何试验时的唯一依据）。
+    recommended_max = 估算 × 1.2 余量，可一键采纳为 budget.max_gpu_hours。
+    """
+    settings, space, study, journal, coh = _safe_load(None)
+    ends = [e for e in journal.load_events()
+            if e.get("kind") == TRIAL_END and isinstance(e.get("duration_s"), (int, float))]
+    per: float | None = None
+    basis: str | None = None
+    sample = 0
+    recent = [float(e["duration_s"]) for e in ends[-20:]]
+    if recent:
+        per = sum(recent) / len(recent)
+        basis = "history"
+        sample = len(recent)
+    else:
+        p = _probe_duration_s()
+        if p is not None:
+            per = p
+            basis = "probe"
+            sample = 1
+    if per is None:
+        return {"basis": None, "trials": trials, "slots": slots,
+                "hint": "无实测数据（该分区尚无完结试验、setup 也未跑过探针），无法估算"}
+    est_hours = per * trials * slots / 3600.0
+    return {"basis": basis, "sample": sample, "per_trial_s": round(per, 2),
+            "trials": trials, "slots": slots,
+            "est_hours": round(est_hours, 4),
+            "unit": "GPU·小时" if slots > 1 else "机时",
+            "recommended_max": round(est_hours * 1.2, 3)}
+
+
+class AdoptBudgetBody(BaseModel):
+    max_gpu_hours: float = Field(..., gt=0, description="算力上限（GPU·小时/机时）")
+
+
+@app.post("/api/estimate/adopt")
+def estimate_adopt(body: AdoptBudgetBody):
+    """把建议的算力上限写进 settings.yaml 的 budget.max_gpu_hours（块/行内形态兼容）。"""
+    from ..config import write_back_budget
+    wb = write_back_budget(_active_paths()[0], max_gpu_hours=body.max_gpu_hours)
+    if not wb["changed"] and wb["errors"]:
+        raise HTTPException(status_code=500, detail="；".join(wb["errors"]))
+    return {"write_back": wb, "max_gpu_hours": body.max_gpu_hours}
 
 
 class ExportBody(BaseModel):

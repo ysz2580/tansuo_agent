@@ -69,6 +69,8 @@ python cli.py run                    # ④ 正式跑：30 次试验，agent 每 
 | `space show` | 查看搜索空间（含每个参数的语义说明）与补丁历史（默认最新分区，`--cohort ID` 看历史分区） |
 | `report` | 重新生成分析报告与 best.yaml（默认最新分区，`--cohort ID` 为历史分区生成） |
 | `graduate` | 毕业赛：最优配置全量数据 + 满轮数隔离复验（`--cohort ID` 指定分区，默认最新） |
+| `try` | 人工插队试验：投一组自定义参数（`--params JSON --note 备注 --cohort ID`）；空闲立即执行，运行中排队、下批开头自动消费（journal source=human 审计） |
+| `custom` | 消费分区队列里排队的人工试验（Web 端空闲时自动派发；此命令供手动触发） |
 | `api` | 大模型 API 自配置：盘点凭据→候选模型探测→写回 settings |
 | `check` | 两级探测端点（ping + tool-use），验证模型名是否可用 |
 | `setup --train 你的脚本` | 配置 agent：读训练脚本自动起草两份配置并跑探测试验自证 |
@@ -93,6 +95,21 @@ python cli.py run                    # ④ 正式跑：30 次试验，agent 每 
 - **失败重试**：`adapter.retry_on_fail`（0-3，默认 0）。非零退出码**且 stderr 为空**
   判定为瞬时故障自动重试（journal 记 `trial_retry` 事件）；超时/协议错误/stderr
   有内容是确定性失败，不重试。仅子进程模式生效。
+- **早停护栏**：确定性止损，不浪费算力。
+  - `budget.max_fail_streak`（默认 5，0=关闭）：**连续** N 次试验失败就提前优雅收尾
+    （`finished_reason=fail_streak`）——脚本/配置错了不必把预算烧完；任一成功或剪枝清零连败。
+  - `budget.auto_stop_plateau`（默认关闭）：连续 N 次完结试验**无提升**就自动停
+    （`finished_reason=plateau`），方向感知、与历史最优比，续跑时以既有最优为基准。
+- **试验级日志下钻**：子进程模式每个试验的完整 stdout/stderr 落盘
+  `<分区>/trials/trial-NNNN.log`（头部含命令与参数快照、尾部含 stderr 与退出码，
+  重试续写多段）。失败时错误信息直接给出日志路径；Web「试验」页点开任一试验可展开全量日志。
+- **人工试验插队**：不必等 agent——把你笃定的参数组直接投进来
+  （`python cli.py try --params '{"lr":0.01,...}' --note 备注`，或 Web「试验」页表单）。
+  校验与 agent 假设试验同一条链路；空闲时立即执行，搜索运行中则排队、在下一批开头
+  自动消费；journal 以 `source=human` 留痕可审计。
+- **预算预估建议**：启动前按分区历史试验平均耗时（无历史时用 setup 探针耗时）估算
+  N 次试验的总算力，给出含 20% 余量的建议值；Web「运行控制」可一键采纳为
+  `budget.max_gpu_hours`（块/行内形态兼容写回、保留注释）。
 - **ETA**：进度行与 Web 仪表盘按最近试验平均耗时 × 剩余预算 ÷ 并发数估算剩余时间
   （断点续跑时从 journal 预热样本）。
 - **webhook 通知**：调参一跑几小时，人不必守在屏幕前——会话结束（跑完 / Ctrl+C /

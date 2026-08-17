@@ -8,6 +8,9 @@
   init   生成离线配置模板兜底（Phase 6 提供）
   setup  配置 agent：自动起草 settings/搜索空间（Phase 6 提供）
   report 生成分析报告（Phase 4 提供）
+  graduate 最优配置毕业赛（全量数据复验 best）
+  try    人工插队试验：自定义参数组排队/立即执行（journal source=human）
+  custom 消费分区队列里排队的人工试验
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import optuna
@@ -366,6 +370,108 @@ def cmd_graduate(args) -> int:
     if result.get("status") == "ok":
         return 0
     return 1   # 复验失败/被剪枝：进程退出码如实反映，便于 Web 端提示
+
+
+def cmd_try(args) -> int:
+    """人工试验插队：把自己想试的参数组排进分区队列，并尝试立即执行。
+
+    与 agent 的 add_custom_trial 走同一条执行链路（space.validate_config 校验
+    + 计入预算），journal 审计 source=human。空闲时立即执行；有搜索在跑时
+    配置留在队列，运行中的 orchestrator 在下一批开头自动消费。
+    """
+    try:
+        settings = load_settings(args.settings)
+    except ConfigError as e:
+        print(f"配置错误：{e}", file=sys.stderr)
+        return 2
+    try:
+        params = json.loads(args.params)
+    except json.JSONDecodeError as e:
+        print(f"--params 不是合法 JSON：{e}", file=sys.stderr)
+        return 2
+    if not isinstance(params, dict) or not params:
+        print('--params 必须是非空 JSON 对象，如 \'{"lr": 0.01, "epochs": 8}\'',
+              file=sys.stderr)
+        return 2
+    try:
+        cohort = _pick_read_cohort(settings, getattr(args, "cohort", None))
+        if cohort is None:
+            print("还没有记录分区：请先运行 `python cli.py run`"
+                  "（人工试验的记录依托分区存在）。", file=sys.stderr)
+            return 1
+        apply_cohort(settings, cohort)
+        space = load_space_with_snapshots(Path(args.space), Path(settings.data_dir))
+    except (CohortError, SpaceError) as e:
+        print(f"配置错误：{e}", file=sys.stderr)
+        return 2
+    errors = space.validate_config(params)
+    if errors:
+        print("参数组合未通过搜索空间校验：", file=sys.stderr)
+        for er in errors:
+            print(f"  - {er}", file=sys.stderr)
+        return 2
+    # 排队：inbox.jsonl 追加一行（运行中的 orchestrator 批边界原子认领消费）
+    inbox = Path(settings.data_dir) / "inbox.jsonl"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"params": params, "note": args.note or "human-cli",
+             "queued_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    with open(inbox, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f"已排队 → 分区 {cohort.id}（{inbox}）")
+    # 尝试立即执行：与运行中搜索并发安全（Optuna 支持多进程同 study）；
+    # 队列认领/执行异常时条目会被 consume_inbox 原样放回，不会丢
+    orch = None
+    try:
+        settings, orch = _make_runtime(args, settings=settings)
+        result = orch.consume_inbox()
+    except Exception as e:   # noqa: BLE001 —— 存储被占用/分区状态异常等
+        print(f"立即执行不可用（{e}）：配置保留在队列，"
+              "运行中的搜索会在下一批开头自动执行")
+        return 0
+    finally:
+        from tansuo.study import dispose_study
+        if orch is not None:
+            try:
+                dispose_study(orch.study)
+            except Exception:   # noqa: BLE001
+                pass
+    if result["consumed"]:
+        print(f"已立即执行 {result['consumed']} 条人工试验"
+              "（journal TRIAL_END source=human 可审计）")
+    elif result["requeued"]:
+        print("试验数据库正忙或预算已用完：配置保留在队列，搜索运行时自动执行")
+    else:
+        print("没有可消费的排队条目（可能已被运行中的搜索并发取走）")
+    return 0
+
+
+def cmd_custom(args) -> int:
+    """消费分区 inbox 里排队的人工试验（Web 端空闲时派发的入口，等价 cli try 的
+    消费环节）。退出码：执行了 ≥1 条 → 0；无可消费条目 → 1。"""
+    try:
+        settings = load_settings(args.settings)
+        cohort = _pick_read_cohort(settings, getattr(args, "cohort", None))
+        if cohort is None:
+            print("还没有记录分区：请先运行 `python cli.py run`。", file=sys.stderr)
+            return 1
+        apply_cohort(settings, cohort)
+        settings, orch = _make_runtime(args, settings=settings)
+    except (ConfigError, SpaceError, CohortError) as e:
+        print(f"配置错误：{e}", file=sys.stderr)
+        return 2
+    try:
+        result = orch.consume_inbox()
+    finally:
+        from tansuo.study import dispose_study
+        dispose_study(orch.study)
+    if result["consumed"]:
+        print(f"已执行 {result['consumed']} 条人工试验（分区 {cohort.id}，"
+              "journal TRIAL_END source=human 可审计）")
+        if result["requeued"]:
+            print(f"另有 {result['requeued']} 条放回队列（预算已用完）")
+        return 0
+    print("没有可消费的人工试验排队条目。")
+    return 1
 
 
 def cmd_runs(args) -> int:
@@ -736,6 +842,23 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--cohort", default=None, metavar="ID",
                     help="复验指定分区的 best（默认最新分区）")
     pg.set_defaults(fn=cmd_graduate)
+
+    pt = sub.add_parser("try", parents=[common],
+                        help="人工插队试验：把自定义参数组排进分区队列；空闲时立即执行，"
+                             "运行中则在下一批开头自动消费（journal source=human 可审计）")
+    pt.add_argument("--params", required=True, metavar="JSON",
+                    help='完整参数组 JSON（所有活跃自由参数都要给），'
+                         '如 \'{"lr": 0.01, "batch_size": 64}\'')
+    pt.add_argument("--note", default=None, help="备注（写入 journal，便于日后辨认）")
+    pt.add_argument("--cohort", default=None, metavar="ID",
+                    help="排入指定分区的队列（默认最新分区）")
+    pt.set_defaults(fn=cmd_try, seed=None, warm_start=None, model=None)
+
+    pcu = sub.add_parser("custom", parents=[common],
+                         help="消费分区队列里排队的人工试验（空闲时手动触发）")
+    pcu.add_argument("--cohort", default=None, metavar="ID",
+                     help="消费指定分区的队列（默认最新分区）")
+    pcu.set_defaults(fn=cmd_custom, seed=None, warm_start=None, model=None)
 
     pc = sub.add_parser("check", parents=[common], help="两级探测 LLM 端点（ping + tool-use）")
     pc.add_argument("--model", default=None, help="覆盖 settings 中的模型名")

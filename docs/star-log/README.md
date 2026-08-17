@@ -31,4 +31,6 @@
 | 2026-08-16 | 023 | [补齐 #022 三项遗留并开通人工空间编辑入口：唤醒时确定性失败/收敛护栏强制注入、CLI space patch 可扩展 envelope、瞬时失败环境线索、Hyperband widen 真实验收](2026-08-16-023-wake-guardrails-space-patch-env-clues.md) | `确定性护栏` `wake-brief` `space-patch` `环境线索` `hyperband` `设计决策` | ✅ 已解决 |
 | 2026-08-17 | 024 | [GPU 算力记账被两处舍入抹零（TRIAL_END round(1)、FINISH round(3)抹掉快试验），及毕业赛隔离复验与配置回写防逃逸的设计取舍](2026-08-17-024-gpu-cost-rounding-graduation-export.md) | `算力记账` `舍入精度` `毕业赛` `配置回写` `gpu` `设计决策` | ✅ 已解决 |
 
+| 2026-08-17 | 025 | [四项 P0 用户侧功能的设计取舍与踩坑：早停护栏记账与续跑基准、人工试验队列原子认领/放回、试验全量日志落盘、预算预估三形态写回](2026-08-17-025-p0-guardrails-logs-inbox-estimate.md) | `早停护栏` `人工试验` `试验日志` `预算预估` `配置写回` `设计决策` | ✅ 已解决 |
+
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中

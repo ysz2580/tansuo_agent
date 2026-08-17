@@ -408,6 +408,12 @@ class SetupExecutor:
             return _json(self._probe_diagnosis(e, len(curve)))
         curve = trial.user_attrs.get("curve") or []
         duration = round(time.perf_counter() - t0, 1)
+        # 探针耗时按 TRIAL_END 事件落 setup_journal：预算预估（/api/estimate）
+        # 在新项目无任何正式试验时，用探针口径给出启动前的算力量级参考
+        from ...journal import TRIAL_END
+        self.journal.append(TRIAL_END, trial=trial.number, value=value,
+                            params=dict(trial.params), source="probe",
+                            duration_s=duration)
         result = {
             "status": "ok",
             "value": value,

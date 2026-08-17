@@ -3,6 +3,7 @@ import { toast } from "sonner"
 import {
   api,
   type AgentConfig,
+  type EstimateResp,
   type ExportPreviewResp,
   type GraduationResp,
   type GpuInfo,
@@ -56,6 +57,35 @@ function RunPanel() {
   const [busy, setBusy] = useState(false)
   const [gpuList, setGpuList] = useState<GpuInfo[] | null>(null)
   const [selGpus, setSelGpus] = useState<number[]>([])
+  const [est, setEst] = useState<EstimateResp | null>(null)
+  const [adopting, setAdopting] = useState(false)
+
+  // 预算预估：试验数/选卡变化后防抖 500ms 拉一次（口径=分区历史均值，无则 setup 探针）
+  useEffect(() => {
+    const t = parseInt(trials)
+    if (!Number.isFinite(t) || t <= 0) {
+      setEst(null)
+      return
+    }
+    const slots = selGpus.length > 0 ? selGpus.length : 1
+    const timer = setTimeout(() => {
+      api.estimate(t, slots).then(setEst).catch(() => setEst(null))
+    }, 500)
+    return () => clearTimeout(timer)
+  }, [trials, selGpus])
+
+  const adoptBudget = async () => {
+    if (!est?.recommended_max) return
+    setAdopting(true)
+    try {
+      await api.estimateAdopt(est.recommended_max)
+      toast.success(`已把算力上限 ${est.recommended_max} ${est.unit ?? ""} 写入 settings.yaml 的 budget.max_gpu_hours`)
+    } catch (e) {
+      toast.error(`写入失败：${e instanceof Error ? e.message : e}`)
+    } finally {
+      setAdopting(false)
+    }
+  }
 
   // 本机 GPU 清单：无 GPU（nvidia-smi 缺失/驱动异常）→ 空数组，选卡区整体隐藏
   useEffect(() => {
@@ -178,6 +208,27 @@ function RunPanel() {
             <Button variant="destructive" onClick={stop} disabled={!running || busy}>停止</Button>
           </div>
         </div>
+
+        {est && (
+          est.basis && est.est_hours !== undefined ? (
+            <div className="text-muted-foreground flex flex-wrap items-center gap-2 rounded-md border p-2.5 text-xs">
+              <span>
+                预算预估：≈ <span className="text-foreground font-medium">{est.est_hours}</span> {est.unit}
+                （{est.basis === "history"
+                  ? `基于最近 ${est.sample} 次完结试验均值 ${est.per_trial_s}s/次`
+                  : `基于 setup 探针耗时 ${est.per_trial_s}s/次`}
+                × {est.trials} 次 × {est.slots} 槽位，含 20% 余量建议值 {est.recommended_max}）
+              </span>
+              <Button size="sm" variant="outline" onClick={adoptBudget} disabled={adopting}>
+                {adopting ? "写入中…" : `采纳为算力上限（budget.max_gpu_hours）`}
+              </Button>
+            </div>
+          ) : (
+            <div className="text-muted-foreground rounded-md border p-2.5 text-xs">
+              预算预估：{est.hint ?? "无实测数据，无法估算"}
+            </div>
+          )
+        )}
 
         {(gpuList?.length ?? 0) > 0 && (
           <div className="space-y-1.5">

@@ -9,10 +9,13 @@ ask/tell（study.optimize(n_jobs=) 即此模式）；每个试验在 TrialRunner
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import optuna
 
@@ -65,6 +68,12 @@ class Orchestrator:
         # 算力成本：Σ(试验耗时 × slots)，秒。多线程试验下持锁累加。
         self._compute_seconds: float = 0.0
         self._compute_lock = threading.Lock()
+        # 早停护栏状态（每会话从 run() 内重新起算）：
+        # _fail_streak 连败（completed/pruned 重置）；_plateau_streak 连续无提升
+        # （仅 completed 计入，方向感知），阈值 0/None 表示关闭。
+        self._fail_streak = 0
+        self._plateau_streak = 0
+        self._best_so_far: float | None = None
 
     # ---------------- 预算 ----------------
     def finished_count(self) -> int:
@@ -92,6 +101,43 @@ class Orchestrator:
 
     def _time_exceeded(self) -> bool:
         return self.deadline is not None and time.monotonic() >= self.deadline
+
+    # ---------------- 早停护栏（失败熔断 + 收敛自动停） ----------------
+    def _outcome(self, result: str, value: float | None = None) -> None:
+        """每次试验完结后统一记账护栏状态。
+
+        连败：failed +1，completed/pruned 清零（剪枝说明流水线本身是通的）；
+        无提升：仅 completed 参与——与历史最优比（方向感知），未严格变好 +1，
+        变好则刷新基准并清零。阈值在 settings.budget（0/None=关闭）。
+        并行 worker 下多线程同时记账，整体持锁（批边界才读取判定）。
+        """
+        with self._compute_lock:
+            if result == "failed":
+                self._fail_streak += 1
+            else:
+                self._fail_streak = 0
+            if result == "completed" and value is not None:
+                limit = self.settings.budget.auto_stop_plateau or 0
+                if limit <= 0:
+                    return
+                b = self._best_so_far
+                if self.settings.metrics.primary.direction == "maximize":
+                    improved = b is None or value > b
+                else:
+                    improved = b is None or value < b
+                if improved:
+                    self._best_so_far = value
+                    self._plateau_streak = 0
+                else:
+                    self._plateau_streak += 1
+
+    def _fail_streak_hit(self) -> bool:
+        limit = self.settings.budget.max_fail_streak
+        return limit > 0 and self._fail_streak >= limit
+
+    def _plateau_hit(self) -> bool:
+        limit = self.settings.budget.auto_stop_plateau or 0
+        return limit > 0 and self._plateau_streak >= limit
 
     def eta_seconds(self) -> float | None:
         """按最近试验平均耗时 × 剩余预算 ÷ 并发数估算；无样本返回 None。"""
@@ -158,16 +204,19 @@ class Orchestrator:
                                 duration_s=round(dt, 2))
             self._progress(trial, "COMPLETE",
                            f"{self.settings.metrics.primary.name}={value:.4f}", dt)
+            self._outcome("completed", value)
             return "completed"
         except optuna.TrialPruned:
             self.study.tell(trial, state=optuna.trial.TrialState.PRUNED)
             self._progress(trial, "PRUNED ", "(中途剪枝)", time.perf_counter() - t0)
+            self._outcome("pruned")
             return "pruned"
         except TrialFailedError as e:
             self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
             self.journal.append(TRIAL_FAIL, trial=trial.number, source=source,
                                 **_fail_fields(e))
             self._progress(trial, "FAILED ", e.reason, time.perf_counter() - t0)
+            self._outcome("failed")
             return "failed"
         except Exception as e:   # noqa: BLE001 —— 意外异常（如 python 模式用户函数错误）不炸掉整个搜索
             self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
@@ -176,15 +225,16 @@ class Orchestrator:
                                 hint="检查训练脚本 / adapter 实现", source=source)
             self._progress(trial, "FAILED ", f"未预期异常 {type(e).__name__}",
                            time.perf_counter() - t0)
+            self._outcome("failed")
             return "failed"
 
     def run_batch(self, n: int, source: str = "search") -> dict:
-        """跑 n 次常规试验（n 受剩余预算钳制，时间预算到点停止派发）。返回统计。"""
+        """跑 n 次常规试验（n 受剩余预算钳制，时间预算到点/失败熔断停止派发）。返回统计。"""
         n = min(n, self.budget_left())
         stats = {"ran": 0, "completed": 0, "pruned": 0, "failed": 0}
         if self.workers <= 1:
             for _ in range(n):
-                if self._time_exceeded():
+                if self._time_exceeded() or self._fail_streak_hit():
                     break
                 trial = self.study.ask()
                 stats[self._run_one(trial, source)] += 1
@@ -194,7 +244,7 @@ class Orchestrator:
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures = []
             for _ in range(n):
-                if self._time_exceeded():
+                if self._time_exceeded() or self._fail_streak_hit():
                     break
                 futures.append(pool.submit(self._run_one, self.study.ask(), source))
             for f in futures:
@@ -202,38 +252,120 @@ class Orchestrator:
                 stats["ran"] += 1
         return stats
 
-    def run_custom(self, params: dict, note: str | None = None) -> dict:
-        """agent 的假设驱动试验。计入预算，返回结构化结果供工具回喂。"""
+    def run_custom(self, params: dict, note: str | None = None,
+                   source: str = "custom") -> dict:
+        """假设驱动试验（agent source="custom" / 人工插队 source="human"）。
+        计入预算，返回结构化结果供工具回喂。"""
         if self.budget_left() <= 0:
             return {"status": "rejected", "reason": "预算已用完，无法再增加试验"}
         trial = self.study.ask()
         t0 = time.perf_counter()
         try:
-            return self._run_custom_impl(trial, params, note, t0)
+            return self._run_custom_impl(trial, params, note, t0, source)
         finally:
             self._charge(time.perf_counter() - t0)
 
-    def _run_custom_impl(self, trial, params: dict, note: str | None, t0: float) -> dict:
+    def _run_custom_impl(self, trial, params: dict, note: str | None, t0: float,
+                         source: str) -> dict:
         try:
             value = self.runner.run_trial(trial, cfg_override=params, note=note)
             self.study.tell(trial, value)
             self.journal.append(TRIAL_END, trial=trial.number, value=value,
-                                params=dict(trial.params), source="custom",
+                                params=dict(trial.params), source=source,
                                 note=note, duration_s=round(time.perf_counter() - t0, 2))
             self._progress(trial, "COMPLETE",
                            f"{self.settings.metrics.primary.name}={value:.4f}",
                            time.perf_counter() - t0)
+            self._outcome("completed", value)
             return {"status": "complete", "trial": trial.number, "value": value}
         except optuna.TrialPruned:
             self.study.tell(trial, state=optuna.trial.TrialState.PRUNED)
             self._progress(trial, "PRUNED ", "(中途剪枝)", time.perf_counter() - t0)
+            self._outcome("pruned")
             return {"status": "pruned", "trial": trial.number}
         except TrialFailedError as e:
             self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
-            self.journal.append(TRIAL_FAIL, trial=trial.number, source="custom",
+            self.journal.append(TRIAL_FAIL, trial=trial.number, source=source,
                                 **_fail_fields(e))
             self._progress(trial, "FAILED ", e.reason, time.perf_counter() - t0)
+            self._outcome("failed")
             return {"status": "failed", "trial": trial.number, "reason": e.full()}
+
+    # ---------------- 人工试验插队（inbox 队列消费） ----------------
+    def inbox_path(self) -> Path:
+        """人工试验队列文件：在分区 data_dir 内，run() 批边界消费。"""
+        return Path(self.settings.data_dir) / "inbox.jsonl"
+
+    def consume_inbox(self) -> dict:
+        """消费人工排队的试验（journal 审计 source=human）。
+
+        用 os.replace 原子认领队列文件再逐条执行：消费期间新追加的条目落在
+        新建的 inbox.jsonl，下批再消费。执行不了的条目（预算耗尽 / 数据库被
+        运行中搜索占用）原样放回队列，绝不静默丢弃。
+        返回 {"consumed": 执行条数, "requeued": 放回条数}。
+        """
+        path = self.inbox_path()
+        if not path.exists():
+            return {"consumed": 0, "requeued": 0}
+        claimed = path.with_name("inbox.processing.jsonl")
+        try:
+            os.replace(path, claimed)
+        except OSError:
+            return {"consumed": 0, "requeued": 0}
+        try:
+            lines = [ln.strip() for ln in claimed.read_text(encoding="utf-8").splitlines()
+                     if ln.strip()]
+        except OSError:
+            return {"consumed": 0, "requeued": 0}
+        consumed = 0
+        remaining: list[str] = []
+        stop = False
+        for line in lines:
+            if stop:
+                remaining.append(line)
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                self.log(f"[人工试验] 跳过损坏的排队条目：{line[:120]}")
+                continue
+            params = entry.get("params") if isinstance(entry, dict) else None
+            if not isinstance(params, dict) or not params:
+                self.log("[人工试验] 跳过缺少 params 的排队条目")
+                continue
+            note = str(entry.get("note") or "human")
+            self.log(f"[人工试验] 执行人工排队配置：{json.dumps(params, ensure_ascii=False)}")
+            try:
+                res = self.run_custom(params, note=note, source="human")
+            except Exception as e:   # noqa: BLE001 —— 数据库被运行中搜索占用等
+                self.log(f"[人工试验] 执行异常，放回队列待下轮：{e}")
+                remaining.append(line)
+                stop = True
+                continue
+            if res.get("status") == "rejected":
+                self.log(f"[人工试验] 被拒（{res.get('reason')}），放回队列")
+                remaining.append(line)
+                stop = True
+                continue
+            consumed += 1
+            if res.get("status") == "complete":
+                self.log(f"[人工试验] trial#{res.get('trial')} 完成，"
+                         f"{self.settings.metrics.primary.name}={res.get('value')}")
+            elif res.get("status") == "failed":
+                self.log(f"[人工试验] trial#{res.get('trial')} 失败："
+                         f"{res.get('reason')}")
+        if remaining:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write("\n".join(remaining) + "\n")
+            except OSError as e:
+                self.log(f"[人工试验] 放回队列失败（{e}）：{len(remaining)} 条条目可能丢失")
+        try:
+            claimed.unlink()
+        except OSError:
+            pass
+        return {"consumed": consumed, "requeued": len(remaining)}
 
     def _progress(self, trial, status: str, what: str, dt: float) -> None:
         done = self.finished_count()
@@ -272,6 +404,14 @@ class Orchestrator:
             self.deadline = time.monotonic() + hours * 3600
         self._seed_durations()
         self._seed_compute()
+        # 护栏状态每会话重新起算：连败从零计；无提升基准用 study 现有最优
+        # （续跑时老最优不算本会话的新提升，首个未超越它的完结试验即开始累计）
+        self._fail_streak = 0
+        self._plateau_streak = 0
+        try:
+            self._best_so_far = float(self.study.best_value)
+        except ValueError:
+            self._best_so_far = None
         already = self.finished_count()
         if already:
             self.log(f"断点续跑：study 中已有 {already} 次完结试验，本会话预算剩余 "
@@ -288,12 +428,22 @@ class Orchestrator:
                      f"（成本按 {self.slots} 槽折算）")
         if self.workers > 1:
             self.log(f"并行试验：{self.workers} 个 worker（唤醒发生在批边界）")
+        guardrails = []
+        if self.settings.budget.max_fail_streak:
+            guardrails.append(f"连续失败 ≥{self.settings.budget.max_fail_streak} 次早停")
+        if self.settings.budget.auto_stop_plateau:
+            guardrails.append(f"连续 {self.settings.budget.auto_stop_plateau} 次完结试验无提升自动停")
+        if guardrails:
+            self.log("早停护栏：" + "；".join(guardrails)
+                     + "（budget.max_fail_streak / budget.auto_stop_plateau）")
         self.journal.append(SESSION_START, total=self.total, wake_every=wake_every,
                             resume=already > 0, space_version=self.space.version,
                             study_trials=already, workers=self.workers,
                             max_duration_h=hours, cohort=cohort,
                             cohort_fp=cohort_fp, fp_match=fp_match,
-                            gpus=self.gpus or None)
+                            gpus=self.gpus or None,
+                            max_fail_streak=self.settings.budget.max_fail_streak,
+                            auto_stop_plateau=self.settings.budget.auto_stop_plateau)
         self.space.snapshot(self.settings.data_dir)
 
         if self.budget_left() <= 0:
@@ -305,6 +455,7 @@ class Orchestrator:
 
         try:
             while self.budget_left() > 0 and not self.finished_reason:
+                self.consume_inbox()   # 人工插队试验：批边界消费（source=human 审计）
                 if self._time_exceeded():
                     self.finished_reason = "time_budget_exhausted"
                     break
@@ -314,6 +465,18 @@ class Orchestrator:
                 batch = min(wake_every, self.budget_left())
                 self.run_batch(batch)
                 if self.finished_reason or self.budget_left() <= 0:
+                    break
+                if self._fail_streak_hit():
+                    self.log(f"[护栏] 连续 {self._fail_streak} 次试验失败"
+                             f"（熔断阈值 {self.settings.budget.max_fail_streak}）："
+                             "提前收尾，请检查训练脚本或配置是否有误"
+                             "（budget.max_fail_streak=0 可关闭）")
+                    self.finished_reason = "fail_streak"
+                    break
+                if self._plateau_hit():
+                    self.log(f"[护栏] 连续 {self._plateau_streak} 次完结试验无提升"
+                             f"（阈值 {self.settings.budget.auto_stop_plateau}）：收敛自动停，节省剩余预算")
+                    self.finished_reason = "plateau"
                     break
                 if self._time_exceeded():
                     self.finished_reason = "time_budget_exhausted"

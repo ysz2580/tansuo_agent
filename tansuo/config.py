@@ -86,6 +86,8 @@ class BudgetCfg:
     max_duration_h: float | None = None   # 会话时间预算（小时）；到点优雅收尾
     warm_start: int = 3          # 新分区热启动：入队同目标旧分区 top-k 配置为种子试验（0=关）
     max_gpu_hours: float | None = None    # 算力预算（GPU·小时，无 GPU 时为机时）；到点优雅收尾
+    max_fail_streak: int = 5     # 早停护栏：连续 N 次试验失败 → 提前优雅收尾（0=关闭）
+    auto_stop_plateau: int | None = None  # 收敛自动停：连续 N 次完结试验无提升 → 提前收尾（None/0=关闭）
 
 
 @dataclass
@@ -232,6 +234,7 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
     b = raw.get("budget") or {}
     max_duration_h = b.get("max_duration_h")
     max_gpu_hours = b.get("max_gpu_hours")
+    auto_stop_plateau = b.get("auto_stop_plateau")
     budget = BudgetCfg(
         total_trials=int(b.get("total_trials", 30)),
         wake_every=int(b.get("wake_every", 5)),
@@ -241,6 +244,8 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         max_duration_h=float(max_duration_h) if max_duration_h is not None else None,
         warm_start=int(b.get("warm_start", 3)),
         max_gpu_hours=float(max_gpu_hours) if max_gpu_hours is not None else None,
+        max_fail_streak=int(b.get("max_fail_streak", 5)),
+        auto_stop_plateau=int(auto_stop_plateau) if auto_stop_plateau else None,
     )
     _require(budget.total_trials >= 1, "budget.total_trials 必须 ≥ 1")
     _require(1 <= budget.wake_every <= budget.total_trials,
@@ -256,6 +261,11 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
     _require(budget.max_gpu_hours is None or budget.max_gpu_hours > 0,
              f"budget.max_gpu_hours 必须是正数（GPU·小时，无 GPU 时为机时），"
              f"实际 {budget.max_gpu_hours}")
+    _require(budget.max_fail_streak >= 0,
+             f"budget.max_fail_streak 必须 ≥ 0（0=关闭失败熔断），实际 {budget.max_fail_streak}")
+    _require(budget.auto_stop_plateau is None or budget.auto_stop_plateau >= 2,
+             f"budget.auto_stop_plateau 必须 ≥ 2（0/不设置=关闭收敛自动停；"
+             f"1 次无提升即停没有意义），实际 {budget.auto_stop_plateau}")
 
     # ---- pruner ----
     p = raw.get("pruner") or {}
@@ -377,3 +387,76 @@ def load_settings(path: str | Path = "configs/settings.yaml") -> Settings:
         source_path=str(path),
         raw=raw,
     )
+
+
+def _trailing_comment(rest: str) -> str:
+    """行尾注释原样提取（YAML：空白 + # 起注释）；无注释返回空串。"""
+    m = re.search(r"\s+#.*$", rest)
+    return m.group(0) if m else ""
+
+
+def write_back_budget(settings_path: str | Path, max_gpu_hours: float) -> dict:
+    """把 budget.max_gpu_hours 写回 settings.yaml（保留注释；块/行内两种形态兼容）。
+
+    已有键 → 原位覆盖（保行尾注释）；没有键 → 插入（块形态插在 budget 块首行、
+    沿用子键缩进；行内形态 budget: {...} 插在收尾花括号前）。
+    返回 {"ok", "changed", "errors"}，与 write_back_notify/write_back_agent 同构。
+    """
+    path = Path(settings_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "changed": [], "errors": [f"无法读取 {path}：{e}"]}
+    value = f"{max_gpu_hours:g}"
+
+    # ① 已存在 max_gpu_hours 键（带缩进的行）→ 原位覆盖，保留行尾注释
+    m = re.search(r"^(?P<sp>[ \t]+)max_gpu_hours:(?P<rest>.*)$", text, re.M)
+    if m:
+        comment = _trailing_comment(m.group("rest"))
+        text = (text[:m.start()]
+                + f"{m.group('sp')}max_gpu_hours: {value}{comment}"
+                + text[m.end():])
+    else:
+        # ② 行内形态：budget: { ... }（setup 生成/测试常用）→ 花括号内追加
+        m = re.search(r"^(?P<lead>budget:[ \t]*\{)(?P<body>[^}\n]*)(?P<tail>\})",
+                      text, re.M)
+        if m:
+            body = m.group("body")
+            sep = ", " if body.strip() else ""
+            text = (text[:m.start()] + m.group("lead")
+                    + f"{body}{sep}max_gpu_hours: {value}" + m.group("tail")
+                    + text[m.end():])
+        else:
+            # ③ 块形态：budget: 独占一行，子键缩进更深的行跟随 → 插入为首个子键
+            m = re.search(r"^budget:[ \t]*(?:#.*)?\n(?P<indent>[ \t]+)[^\s#]",
+                          text, re.M)
+            if not m:
+                return {"ok": False, "changed": [],
+                        "errors": ["settings.yaml 未找到 budget 块"
+                                   "（既无 budget: {...} 也无独立 budget: 行），"
+                                   "请手动添加 budget.max_gpu_hours"]}
+            insert_at = m.start() + len(m.group(0)) - len(m.group("indent")) - 1
+            text = (text[:insert_at]
+                    + f"{m.group('indent')}max_gpu_hours: {value}\n"
+                    + text[insert_at:])
+    try:
+        # 写入前校验新文本可被 load_settings 接受（临时文件走完整校验链）
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False,
+                                         encoding="utf-8") as f:
+            f.write(text)
+            tmp = f.name
+        try:
+            load_settings(tmp)
+        finally:
+            os.remove(tmp)
+    except ConfigError as e:
+        return {"ok": False, "changed": [],
+                "errors": [f"写入将破坏 settings 校验，已拒绝：{e}"]}
+    except OSError as e:
+        return {"ok": False, "changed": [], "errors": [f"临时校验失败：{e}"]}
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "changed": [], "errors": [f"写入 {path} 失败：{e}"]}
+    return {"ok": True, "changed": ["max_gpu_hours"], "errors": []}
