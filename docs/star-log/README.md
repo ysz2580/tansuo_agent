@@ -33,4 +33,6 @@
 
 | 2026-08-17 | 025 | [四项 P0 用户侧功能的设计取舍与踩坑：早停护栏记账与续跑基准、人工试验队列原子认领/放回、试验全量日志落盘、预算预估三形态写回](2026-08-17-025-p0-guardrails-logs-inbox-estimate.md) | `早停护栏` `人工试验` `试验日志` `预算预估` `配置写回` `设计决策` | ✅ 已解决 |
 
+| 2026-08-17 | 026 | [前端并发轮询撞 sqlite 建表竞态：`table studies already exists`，且真实异常是 SQLAlchemy 包装类型，旧捕获全部漏网变 ASGI 500](2026-08-17-026-sqlite-create-table-race-sqlalchemy-exception.md) | `sqlite` `optuna` `并发` `建表竞态` `sqlalchemy` `异常捕获` `web后端` | ✅ 已解决 |
+
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中

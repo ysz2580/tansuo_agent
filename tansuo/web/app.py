@@ -32,7 +32,7 @@ from ..compare import CompareError, compare_cohorts
 from ..config import ConfigError, load_settings
 from ..journal import TRIAL_END, Journal
 from ..space import SearchSpace, SpaceError
-from ..study import create_or_load_study, dispose_study
+from ..study import DB_BUSY_ERRORS, create_or_load_study, dispose_study
 from .project_store import ProjectStore
 from .run_manager import RunManager
 from .setup_manager import SetupManager
@@ -168,7 +168,7 @@ def _safe_load(cohort_id: str | None = None):
         raise HTTPException(status_code=404, detail=str(e))
     except (ConfigError, SpaceError) as e:
         raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
-    except sqlite3.OperationalError as e:
+    except DB_BUSY_ERRORS as e:   # sqlite3.OperationalError 或 SQLAlchemy 包装的同型异常
         raise HTTPException(status_code=503,
                             detail=f"数据库正被运行中的任务写入，稍后再试（{e}）")
 
@@ -649,6 +649,9 @@ def runs_compare(cohorts: str | None = Query(
         raise HTTPException(status_code=400, detail=str(e))
     except CohortError as e:       # 分区不存在 / 无分区可比
         raise HTTPException(status_code=404, detail=str(e))
+    except DB_BUSY_ERRORS as e:    # 分区 db 正被运行中的搜索写入
+        raise HTTPException(status_code=503,
+                            detail=f"数据库正被运行中的任务写入，稍后再试（{e}）")
 
 
 # ------------------------------------------------------------------
@@ -704,7 +707,7 @@ def _orphan_cleanup_for(cohort, project_dir: Path,
             apply_cohort(s, cohort)
         journal = Journal(Path(s.data_dir) / "journal.jsonl")
         return _mark_orphaned_running_as_failed(s, journal, project_dir)
-    except (ConfigError, CohortError, sqlite3.Error):
+    except (ConfigError, CohortError, sqlite3.Error, *DB_BUSY_ERRORS):
         return []
 
 
@@ -758,7 +761,7 @@ def run_start(body: RunStartBody):
                 finished = len(study_t.get_trials(
                     deepcopy=False,
                     states=(TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL)))
-            except sqlite3.OperationalError as e:
+            except DB_BUSY_ERRORS as e:   # SQLAlchemy 包装的 sqlite OperationalError 同样降级
                 raise HTTPException(status_code=503,
                                     detail=f"数据库正被占用，稍后再试（{e}）")
             finally:

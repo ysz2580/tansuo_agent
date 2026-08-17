@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +13,16 @@ import optuna
 logger = logging.getLogger("tansuo")
 
 STUDY_NAME = "tansuo"
+
+# sqlite「忙/建表竞态」异常类型元组：
+# optuna RDB 路径经 SQLAlchemy 包装，实际抛出的是 sqlalchemy.exc.OperationalError
+# （内含 sqlite3.OperationalError），只捕 sqlite3.OperationalError 会漏（STAR #026）。
+try:
+    from sqlalchemy import exc as _sa_exc
+    DB_BUSY_ERRORS: tuple[type, ...] = (sqlite3.OperationalError,
+                                        _sa_exc.OperationalError)
+except ImportError:                                    # pragma: no cover
+    DB_BUSY_ERRORS = (sqlite3.OperationalError,)       # sqlalchemy 随 optuna RDB 必装
 
 
 class DynamicTPESampler(optuna.samplers.TPESampler):
@@ -45,6 +58,44 @@ class DynamicTPESampler(optuna.samplers.TPESampler):
         return {k: np.asarray(v) for k, v in values.items()}
 
 
+_SCHEMA_LOCKS_GUARD = threading.Lock()
+_SCHEMA_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _is_schema_race_error(e: BaseException) -> bool:
+    """建表竞态特征：另一线程/进程已抢先把同名表建好（CREATE TABLE 撞车）。"""
+    return isinstance(e, DB_BUSY_ERRORS) and "already exists" in str(e)
+
+
+def _make_rdb_storage(db_path: Path) -> optuna.storages.RDBStorage:
+    """建 RDBStorage，带「进程内按路径串行 + 跨进程建表竞态重试」。
+
+    RDBStorage.__init__ 无条件执行 create_all（checkfirst）：两个线程/进程对同一个
+    新 db 同时 inspect 都判定"表不存在"→ 双双 CREATE TABLE → 后到者报
+    `table studies already exists`（STAR #026）。触发场景：Web 前端并发轮询多个
+    只读端点（sync 端点跑在线程池）、Web 后端与 cli 子进程同时打开新分区 db。
+    进程内竞态用按路径锁串行化；跨进程竞态靠重试容忍——赢家提交后，下一轮
+    checkfirst 能看到表，重试必然成功。
+    """
+    key = str(db_path.resolve())
+    with _SCHEMA_LOCKS_GUARD:
+        lock = _SCHEMA_LOCKS.setdefault(key, threading.Lock())
+    attempts = 3
+    for i in range(attempts):
+        try:
+            with lock:
+                return optuna.storages.RDBStorage(
+                    "sqlite:///" + db_path.resolve().as_posix())
+        except Exception as e:   # noqa: BLE001 — 类型随 SQLAlchemy 包装而变
+            if _is_schema_race_error(e) and i < attempts - 1:
+                logger.warning("sqlite 建表竞态（%s），第 %d 次重试：%s",
+                               db_path.name, i + 1, str(e).splitlines()[0])
+                time.sleep(0.05 * (i + 1))
+                continue
+            raise
+    raise AssertionError("unreachable")   # 循环内要么 return 要么 raise
+
+
 def make_storage(url: str) -> optuna.storages.BaseStorage:
     """storage 工厂：sqlite:/// 优先；journal:// 为降级方案（纯 Python、零额外依赖）。
 
@@ -54,7 +105,7 @@ def make_storage(url: str) -> optuna.storages.BaseStorage:
         rel = url[len("sqlite:///"):]
         db_path = Path(rel)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        return optuna.storages.RDBStorage("sqlite:///" + db_path.resolve().as_posix())
+        return _make_rdb_storage(db_path)
     if url.startswith("journal://"):
         rel = url[len("journal://"):]
         path = Path(rel)
