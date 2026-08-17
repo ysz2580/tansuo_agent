@@ -501,6 +501,61 @@ with tempfile.TemporaryDirectory() as td:
         ok("setup 事件端点可查（probe 失败未写 journal → 空列表）",
            isinstance(ev["events"], list) and ev["events"] == [], str(ev))
 
+        print("== 15b. 训练脚本补登记：候选扫描 + 占位命令拦截 + 回填 ==")
+        projd = tmp / "projD"
+        projd.mkdir()
+        (projd / "train_model.py").write_text(
+            "import argparse\n\n"
+            'if __name__ == "__main__":\n'
+            "    ap = argparse.ArgumentParser()\n"
+            "    for epoch in range(2):\n"
+            "        loss = 0.1\n", encoding="utf-8")
+        (projd / "utils.py").write_text("def helper():\n    return 1\n",
+                                        encoding="utf-8")
+        crd = api("/api/projects", {"name": "projD", "dir": str(projd)})
+        ok("projD 创建时未选训练脚本 → scaffolded", crd["scaffolded"] is True)
+        ok("projD train_script 为空", crd["train_script"] == "")
+        api(f"/api/projects/{crd['id']}/activate", method="POST")
+        # 占位启动命令（path/to/your_train.py）应在启动前拦截，而不是跑一轮全败
+        try:
+            api("/api/run/start", {"trials": 1, "no_agent": True})
+            raise AssertionError("FAIL: 占位启动命令应被拦截")
+        except _ue.HTTPError as e:
+            detail = json.loads(e.read().decode("utf-8"))["detail"]
+            ok("未配置的占位命令启动前拦截（400 + 指引）",
+               e.code == 400 and "不存在" in detail and "配置" in detail,
+               detail)
+        # 候选扫描：train_model.py 排第一且依据非空；纯工具文件不入列
+        cds = api(f"/api/projects/{crd['id']}/train-candidates")["candidates"]
+        ok("候选扫描把 train_model.py 排第一",
+           bool(cds) and cds[0]["rel"] == "train_model.py", str(cds))
+        ok("候选带评分依据（reasons 非空）", bool(cds[0]["reasons"]))
+        ok("无关 utils.py 不入候选列（score 0）",
+           all(c["rel"] != "utils.py" for c in cds), str(cds))
+        # 补登记 → 脚手架占位命令同步回填
+        sts = api(f"/api/projects/{crd['id']}/train-script",
+                  {"train_script": str(projd / "train_model.py")})
+        ok("补登记返回 settings_patched=true", sts["settings_patched"] is True,
+           str(sts))
+        txt = (projd / ".tansuo" / "settings.yaml").read_text(encoding="utf-8")
+        ok("占位命令已回填真实脚本路径",
+           "train_model.py" in txt and "path/to/your_train.py" not in txt)
+        ok("注册表条目的 train_script 已更新",
+           any(p["id"] == crd["id"] and p["train_script"]
+               for p in api("/api/projects")["projects"]))
+        try:
+            api(f"/api/projects/{crd['id']}/train-script",
+                {"train_script": str(projd / "nope.py")})
+            raise AssertionError("FAIL: 不存在的脚本应被拒")
+        except _ue.HTTPError as e:
+            ok("不存在的脚本被拒（400）", e.code == 400)
+        try:
+            api(f"/api/projects/{crd['id']}/train-script",
+                {"train_script": str(tmp / "train.py")})   # 项目目录之外
+            raise AssertionError("FAIL: 项目目录外的脚本应被拒")
+        except _ue.HTTPError as e:
+            ok("项目目录外的脚本被拒（400）", e.code == 400)
+
         print("== 16. GPU 清单与选卡记账 ==")
         g = api("/api/gpus")
         ok("/api/gpus 返回列表结构（无 GPU 时为空列表）",

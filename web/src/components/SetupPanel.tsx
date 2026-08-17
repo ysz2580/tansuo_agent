@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { toast } from "sonner"
 import { Loader2Icon, PlayIcon, SquareIcon } from "lucide-react"
 import { api, type SetupLogResp, type SetupStatus } from "@/lib/api"
@@ -8,6 +8,7 @@ import { usePolling } from "@/lib/usePolling"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { TrainScriptPicker } from "@/components/TrainScriptPicker"
 
 /** 配置 agent（setup）面板：新建项目后手动触发——LLM 阅读训练脚本，
  *  起草 settings.yaml + search_space.yaml（含探针验证），进度实时流到
@@ -15,13 +16,17 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
  *
  *  与搜索硬互斥：任一在跑时另一边返回 409（toast 显示后端原因）。 */
 export default function SetupPanel() {
-  const { project } = useProject()
+  const { project, refresh } = useProject()
   const [acting, setActing] = useState(false)
+  const [picking, setPicking] = useState(false)
   const { data: status } = usePolling<SetupStatus>(api.setupStatus, 3000)
   const running = status?.running ?? false
   // 运行中高频拉日志/事件；空闲低频兜底（展示上一轮残留状态与历史会话事件）
   const { data: log } = usePolling<SetupLogResp>(api.setupLog, running ? 2000 : 15000)
   const { data: ev } = usePolling(api.setupEvents, running ? 4000 : 15000)
+
+  // 切换项目时重置选择器展开态（避免别的项目的残留状态）
+  useEffect(() => { setPicking(false) }, [project?.id])
 
   const start = async () => {
     if (!project) return
@@ -80,7 +85,7 @@ export default function SetupPanel() {
               ) : (
                 <Button size="sm" onClick={start}
                         disabled={acting || !project || noScript}
-                        title={noScript ? "该项目未登记训练脚本：新建项目时请选择主训练脚本" : undefined}>
+                        title={noScript ? "该项目未登记训练脚本：先在下方扫描结果里选择并登记" : undefined}>
                   <PlayIcon className="size-3.5" /> 开始配置
                 </Button>
               )}
@@ -100,8 +105,18 @@ export default function SetupPanel() {
                 训练脚本：
                 {project.train_script
                   ? <span className="font-mono text-xs">{project.train_script}</span>
-                  : "未登记（新建项目时选择，或改用 CLI `python cli.py init` 离线模板）"}
+                  : "未登记——在下方扫描结果里选择，或展开目录浏览手工挑"}
+                {project.train_script && (
+                  <Button variant="ghost" size="sm" className="ml-2 h-6 px-2 text-xs"
+                          onClick={() => setPicking((v) => !v)}>
+                    {picking ? "收起" : "更换"}
+                  </Button>
+                )}
               </p>
+              {(noScript || picking) && project && (
+                <TrainScriptPicker projectId={project.id}
+                                   onDone={() => { refresh(); setPicking(false) }} />
+              )}
               <p className="text-xs">
                 注意：与搜索运行互斥；配置会覆写项目的
                 .tansuo/settings.yaml 与 search_space.yaml。

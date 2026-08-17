@@ -73,6 +73,27 @@ def test_store():
         st.remove(entry["id"])
         ok("remove 后注册表回到 2", len(st.list_projects()) == 2)
 
+        print("== update：补登记 train_script + 白名单外字段忽略 ==")
+        train = tmp / "projB" / "train.py"
+        train.parent.mkdir(parents=True, exist_ok=True)
+        train.write_text("# train")
+        entry = st.register("updproj", tmp / "projB",
+                            tmp / "projB" / "settings.yaml",
+                            tmp / "projB" / "space.yaml", train_script="")
+        upd = st.update(entry["id"], train_script=str(train), bogus="x")
+        ok("补登记 train_script 写入且解析为绝对路径",
+           upd["train_script"] == str(train.resolve()), str(upd))
+        ok("白名单外字段被忽略", "bogus" not in upd)
+        try:
+            st.update("nonexistent", train_script="a.py")
+            raise AssertionError("FAIL: 未知项目 update 应 KeyError")
+        except KeyError:
+            ok("未知项目 update 抛 KeyError", True)
+        ok("update 后注册表条目同步可读",
+           next(p for p in st.list_projects()
+                if p["id"] == entry["id"])["train_script"] == str(train.resolve()))
+        st.remove(entry["id"])
+
         print("== 并发：20 线程同时 register + activate 不损坏 ==")
         errors = []
 

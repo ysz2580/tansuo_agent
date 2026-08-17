@@ -35,4 +35,6 @@
 
 | 2026-08-17 | 026 | [前端并发轮询撞 sqlite 建表竞态：`table studies already exists`，且真实异常是 SQLAlchemy 包装类型，旧捕获全部漏网变 ASGI 500](2026-08-17-026-sqlite-create-table-race-sqlalchemy-exception.md) | `sqlite` `optuna` `并发` `建表竞态` `sqlalchemy` `异常捕获` `web后端` | ✅ 已解决 |
 
+| 2026-08-17 | 027 | [demo2 从零接入首跑全败（退出码 2）：脚手架模板占位命令直通运行层无人拦截，且训练脚本忘选后无补登记入口](2026-08-17-027-train-script-missing-placeholder-run.md) | `项目管理` `脚手架` `快速失败` `训练脚本` `web后端` `前端` `用户体验` | ✅ 已解决 |
+
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中

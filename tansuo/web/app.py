@@ -711,6 +711,30 @@ def _orphan_cleanup_for(cohort, project_dir: Path,
         return []
 
 
+def _adapter_command_problem(settings, project_dir: Path) -> str | None:
+    """启动前检查：subprocess 启动命令指向的脚本不存在时返回错误文案。
+
+    scaffold 模板占位符（path/to/your_train.py）与写错的路径应在这里快速失败
+    （400 + 指引），而不是让整轮搜索在试验子进程里以退出码 2 全败、用户无头绪。
+    mode=python 或 command 里没有 .py 元素（如 python -m pkg）不盲目拦截。
+    """
+    a = settings.adapter
+    if a.mode != "subprocess":
+        return None
+    script = next((c for c in a.command if c.lower().endswith(".py")), None)
+    if script is None:
+        return None
+    p = Path(script)
+    if not p.is_absolute():
+        p = Path(project_dir) / p
+    if p.is_file():
+        return None
+    return (f"adapter.command 指向的训练脚本不存在：{script}"
+            f"（解析为 {p}）。项目可能尚未配置——请先在「Agent」页登记训练脚本"
+            "并运行「配置 agent」，或手工修正 .tansuo/settings.yaml 的"
+            " adapter.command。")
+
+
 @app.post("/api/run/start")
 def run_start(body: RunStartBody):
     # 顺序：先解析目标分区 → 清理目标分区（及上次运行分区）的孤儿试验 →
@@ -726,6 +750,9 @@ def run_start(body: RunStartBody):
         settings0 = load_settings(settings_path)
     except ConfigError as e:
         raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    problem = _adapter_command_problem(settings0, project_dir)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
     root = abs_data_dir(settings0, project_dir)
     try:
         target, info = resolve_for_run(settings0,
@@ -1334,6 +1361,147 @@ def project_delete(project_id: str):
                             detail="该项目配置 agent 正在运行，请先停止再移除")
     PROJECTS.remove(project_id)   # 仅移除注册，不删文件（数据安全优先）
     return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# 训练脚本：候选扫描（启发式评分）+ 补登记（含脚手架占位命令回填）
+# ------------------------------------------------------------------
+
+_TRAIN_CANDIDATE_SKIP_DIRS = {".tansuo", ".git", ".venv", "venv", "env",
+                              "node_modules", "__pycache__", ".idea", ".vscode"}
+
+
+def _score_train_file(f: Path) -> tuple[int, list[str]]:
+    """启发式估计一个 .py 文件像不像「主训练脚本」。返回 (分数, 依据)。
+
+    纯本地规则、不调 LLM：文件名提示 + 内容特征（已实现 tansuo 协议 /
+    命令行收超参 / 主入口 / 训练循环关键词）。分数 0 = 不像。
+    """
+    score = 0
+    reasons: list[str] = []
+    name = f.name.lower()
+    for hint, pts in (("train", 3), ("main", 2), ("fit", 2), ("run", 1)):
+        if hint in name:
+            score += pts
+            reasons.append(f"文件名含 {hint}")
+            break
+    try:
+        text = f.read_text(encoding="utf-8", errors="ignore")[:200_000]
+    except OSError:
+        return score, reasons
+    if "TANSUO_TRIAL_CONFIG" in text:
+        score += 4
+        reasons.append("已实现 tansuo 试验协议")
+    if "add_argument" in text or "argparse" in text:
+        score += 2
+        reasons.append("命令行接收超参")
+    if '__name__ == "__main__"' in text or "__name__ == '__main__'" in text:
+        score += 2
+        reasons.append("有主入口")
+    low = text.lower()
+    if "epoch" in low:
+        score += 1
+        reasons.append("含 epoch 循环")
+    if any(k in low for k in ("loss", "backward", "optimizer", "accuracy")):
+        score += 1
+        reasons.append("含训练循环特征")
+    return score, reasons
+
+
+def _train_candidates(dir_path: Path, max_depth: int = 2,
+                      limit: int = 30) -> list[dict]:
+    """扫描项目目录，按「像训练脚本」的程度降序返回候选（score>0 才入列）。
+
+    跳过隐藏目录与 venv/node_modules 等依赖目录；文件深度 ≤ max_depth。
+    """
+    cands: list[dict] = []
+
+    def walk(d: Path, depth: int) -> None:
+        try:
+            entries = sorted(d.iterdir(), key=lambda x: x.name.lower())
+        except OSError:
+            return
+        for f in entries:
+            if f.name.startswith(".") or f.name.startswith("$"):
+                continue
+            if f.is_dir():
+                if depth < max_depth and f.name not in _TRAIN_CANDIDATE_SKIP_DIRS:
+                    walk(f, depth + 1)
+                continue
+            if not (f.is_file() and f.suffix == ".py"):
+                continue
+            score, reasons = _score_train_file(f)
+            if score > 0:
+                cands.append({"path": str(f),
+                              "rel": f.relative_to(dir_path).as_posix(),
+                              "name": f.name, "score": score,
+                              "reasons": reasons})
+
+    walk(dir_path, 0)
+    cands.sort(key=lambda c: (-c["score"], c["rel"]))
+    return cands[:limit]
+
+
+class TrainScriptBody(BaseModel):
+    train_script: str = Field(
+        description="训练脚本路径（须为项目目录内存在的 .py 文件）")
+
+
+@app.get("/api/projects/{project_id}/train-candidates")
+def project_train_candidates(project_id: str):
+    """扫描项目代码，列出「像训练脚本」的候选（启发式评分降序，不调 LLM）。"""
+    entry = next((p for p in PROJECTS.list_projects()
+                  if p["id"] == project_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    return {"candidates": _train_candidates(Path(entry["dir"]))}
+
+
+@app.post("/api/projects/{project_id}/train-script")
+def project_set_train_script(project_id: str, body: TrainScriptBody):
+    """补登记 / 更换训练脚本（新建项目时忘选 → 在这里补）。
+
+    settings.yaml 仍是脚手架模板占位命令时同步回填真实脚本路径；
+    已被 setup agent 或人工改过的配置不动。
+    """
+    busy = _busy_reason_for(project_id)
+    if busy:
+        raise HTTPException(status_code=409, detail=busy)
+    entry = next((p for p in PROJECTS.list_projects()
+                  if p["id"] == project_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    project_dir = Path(entry["dir"])
+    resolved = Path(body.train_script).resolve()
+    if not resolved.is_file():
+        raise HTTPException(status_code=400,
+                            detail=f"训练脚本不存在：{body.train_script}")
+    if resolved.suffix != ".py":
+        raise HTTPException(status_code=400, detail="训练脚本须为 .py 文件")
+    try:
+        rel = resolved.relative_to(project_dir)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"训练脚本须位于项目目录内（{project_dir}）：{resolved}")
+    patched = False
+    settings_path = Path(entry["settings_path"])
+    if settings_path.is_file():
+        original = settings_path.read_text(encoding="utf-8")
+        if "path/to/your_train.py" in original:
+            candidate = original.replace("path/to/your_train.py",
+                                         rel.as_posix())
+            settings_path.write_text(candidate, encoding="utf-8")
+            try:
+                load_settings(settings_path)   # 回填后校验，坏配置立即回滚
+            except ConfigError as e:
+                settings_path.write_text(original, encoding="utf-8")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"回填脚本路径后 settings.yaml 无效，已回滚：{e}")
+            patched = True
+    updated = PROJECTS.update(project_id, train_script=str(resolved))
+    return {**updated, "settings_patched": patched}
 
 
 # ------------------------------------------------------------------

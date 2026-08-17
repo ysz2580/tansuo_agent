@@ -10,6 +10,10 @@ __pycache__/
 # MNIST 数据缓存（examples/train_mnist.py 会下载到 ./mnist_data）
 mnist_data/
 
+# demo2 是"从零接入"示例仓库，其 .tansuo/ 工作目录是 setup agent 的生成物，
+# 不入库（保持克隆后的 demo2 处于零配置起点）
+demo2/.tansuo/
+
 # 前端
 web/node_modules/
 web/*.tsbuildinfo

@@ -106,6 +106,29 @@ class ProjectStore:
             self._write_doc(doc)
             return dict(target)
 
+    _UPDATABLE = {"name", "dir", "settings_path", "space_path", "train_script"}
+
+    def update(self, project_id: str, **fields) -> dict:
+        """更新注册条目字段（如补登记训练脚本），返回更新后的条目。
+
+        只允许 _UPDATABLE 白名单字段；id/created_at 等身份字段不可改。
+        """
+        with self._lock:
+            doc = self._read_doc()
+            target = next((p for p in doc["projects"]
+                           if p.get("id") == project_id), None)
+            if target is None:
+                raise KeyError(f"项目不存在：{project_id}")
+            for k, v in fields.items():
+                if k not in self._UPDATABLE:
+                    continue
+                if k == "train_script":
+                    v = str(Path(v).resolve()) if v else ""
+                target[k] = v
+            target["last_used"] = _now()
+            self._write_doc(doc)
+            return dict(target)
+
     def remove(self, project_id: str) -> None:
         with self._lock:
             doc = self._read_doc()

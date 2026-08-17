@@ -443,6 +443,16 @@ export interface ProjectCreateResp extends ProjectInfo {
   scaffolded: boolean         // true=新生成 .tansuo/ 模板；false=打开既有项目
 }
 
+// 训练脚本候选：后端扫项目目录启发式评分（文件名提示 + CLI 收参 + 主入口 +
+// 训练循环特征 + 已实现 tansuo 协议），score 降序；新建项目时忘选可事后补登记
+export interface TrainCandidate {
+  path: string                // 绝对路径（登记时原样回传）
+  rel: string                 // 相对项目目录（展示用）
+  name: string
+  score: number
+  reasons: string[]
+}
+
 export interface BrowseDirEntry {
   name: string
   path: string
@@ -563,6 +573,14 @@ export const api = {
     http<BrowseResp>(`/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
   browseFiles: (path: string, ext = ".py") =>
     http<FilesResp>(`/fs/files?path=${encodeURIComponent(path)}&ext=${encodeURIComponent(ext)}`),
+  // 训练脚本：候选扫描（启发式评分）+ 补登记（新建项目时忘选可事后补救）
+  trainCandidates: (projectId: string) =>
+    http<{ candidates: TrainCandidate[] }>(
+      `/projects/${encodeURIComponent(projectId)}/train-candidates`),
+  setTrainScript: (projectId: string, trainScript: string) =>
+    http<ProjectInfo & { settings_patched: boolean }>(
+      `/projects/${encodeURIComponent(projectId)}/train-script`,
+      { method: "POST", body: JSON.stringify({ train_script: trainScript }) }),
   // setup agent（配置会话）：对指定项目跑配置 agent，与搜索硬互斥
   setupStart: (projectId: string) =>
     http<SetupStatus>(`/projects/${encodeURIComponent(projectId)}/setup`,
