@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { BookOpenIcon } from "lucide-react"
+import { BookOpenIcon, BotIcon, Loader2Icon } from "lucide-react"
 import { Toaster } from "@/components/ui/sonner"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -11,7 +11,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { api, type ProjectsResp, type RunInfo, type RunStatus, type RunsResp } from "@/lib/api"
+import { api, type ProjectsResp, type RunInfo, type RunStatus, type RunsResp, type SetupStatus } from "@/lib/api"
 import { CohortContext } from "@/lib/cohort"
 import { ProjectContext } from "@/lib/project"
 import { usePolling } from "@/lib/usePolling"
@@ -25,12 +25,35 @@ import PromptsPage from "@/pages/PromptsPage"
 import ComparePage from "@/pages/ComparePage"
 import SettingsPage from "@/pages/SettingsPage"
 
-function RunIndicator() {
-  const { data } = usePolling<RunStatus>(api.runStatus, 3000)
-  if (!data) return null
-  return data.running ? (
-    <Badge className="bg-emerald-600/15 text-emerald-700 dark:text-emerald-400">搜索运行中</Badge>
-  ) : null
+/** 头部 agent 状态胶囊：以 agent 为主轴的状态展示。
+ *  优先级：setup 进行中 > 搜索运行中（区分是否 --no-agent 纯 Optuna）> agent 待命。
+ *  轮次等细节在默认 Agent 页内可见，胶囊只做状态指示，不额外轮询事件流。 */
+function AgentIndicator() {
+  const { data: setup } = usePolling<SetupStatus>(api.setupStatus, 3000)
+  const { data: run } = usePolling<RunStatus>(api.runStatus, 3000)
+  if (setup?.running) {
+    return (
+      <Badge className="bg-emerald-600/15 text-emerald-700 dark:text-emerald-400">
+        <Loader2Icon className="size-3 animate-spin" /> 配置 agent 进行中
+      </Badge>
+    )
+  }
+  if (run?.running) {
+    return run.args.includes("--no-agent") ? (
+      <Badge className="bg-emerald-600/15 text-emerald-700 dark:text-emerald-400">
+        搜索运行中（纯 Optuna）
+      </Badge>
+    ) : (
+      <Badge className="bg-emerald-600/15 text-emerald-700 dark:text-emerald-400">
+        <BotIcon className="size-3" /> 搜索运行中 · agent 监督
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="outline" className="text-muted-foreground">
+      <BotIcon className="size-3" /> agent 待命
+    </Badge>
+  )
 }
 
 const COMPARABLE_META: Record<RunInfo["comparable"], { label: string; cls: string }> = {
@@ -124,25 +147,25 @@ export default function App() {
               <ProjectSelector resp={projResp} onRefresh={refreshProjects}
                                onSwitched={onProjectSwitched} />
               <CohortSelector key={`cs-${epoch}`} value={cohort} onChange={setCohort} />
-              <RunIndicator />
+              <AgentIndicator />
             </div>
           </header>
 
-          <Tabs defaultValue="dashboard">
+          <Tabs defaultValue="agent">
             <TabsList>
+              <TabsTrigger value="agent">Agent</TabsTrigger>
               <TabsTrigger value="dashboard">仪表盘</TabsTrigger>
               <TabsTrigger value="trials">试验</TabsTrigger>
               <TabsTrigger value="space">搜索空间</TabsTrigger>
-              <TabsTrigger value="agent">Agent</TabsTrigger>
               <TabsTrigger value="prompts">提示词</TabsTrigger>
               <TabsTrigger value="compare">对比</TabsTrigger>
               <TabsTrigger value="settings">运行与设置</TabsTrigger>
             </TabsList>
             {/* key 随项目纪元/分区变化整体重挂载各页：轮询立即按新项目与新分区重新拉数 */}
+            <TabsContent value="agent" className="mt-4"><AgentPage key={pageKey} /></TabsContent>
             <TabsContent value="dashboard" className="mt-4"><DashboardPage key={pageKey} /></TabsContent>
             <TabsContent value="trials" className="mt-4"><TrialsPage key={pageKey} /></TabsContent>
             <TabsContent value="space" className="mt-4"><SpacePage key={pageKey} /></TabsContent>
-            <TabsContent value="agent" className="mt-4"><AgentPage key={pageKey} /></TabsContent>
             {/* 提示词与对比跟随项目（prompts.yaml 在 settings 同目录、对比组按激活项目解析），
                 随项目纪元重挂载；但不跟分区 key（提示词无分区语义、对比页自管分区选择） */}
             <TabsContent value="prompts" className="mt-4"><PromptsPage key={`p-${epoch}`} /></TabsContent>

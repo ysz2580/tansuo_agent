@@ -2,9 +2,10 @@ import { useEffect, useState } from "react"
 import { toast } from "sonner"
 import { Loader2Icon, PlayIcon, SquareIcon } from "lucide-react"
 import { api, type SetupLogResp, type SetupStatus } from "@/lib/api"
-import { eventBody, KIND_META } from "@/lib/agentEvents"
+import { groupByRounds } from "@/lib/agentEvents"
 import { useProject } from "@/lib/project"
 import { usePolling } from "@/lib/usePolling"
+import { AgentTimeline } from "@/components/AgentTimeline"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -142,34 +143,20 @@ export default function SetupPanel() {
       )}
 
       {ev && ev.events.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">
-              会话事件（{ev.events.length} 条）
-              {ev.tokens.total_tokens > 0 && (
-                <span className="text-muted-foreground ml-3 text-xs font-normal">
-                  累计 tokens：{ev.tokens.total_tokens.toLocaleString()}
-                </span>
-              )}
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ol className="space-y-2">
-              {ev.events.map((e, i) => {
-                const meta = KIND_META[e.kind] ?? { label: e.kind, cls: "" }
-                return (
-                  <li key={i} className="flex items-start gap-2 border-b pb-2 text-sm last:border-0">
-                    <Badge variant="outline" className={`${meta.cls} shrink-0`}>{meta.label}</Badge>
-                    <span className="text-muted-foreground shrink-0 font-mono text-xs leading-5">
-                      {e.ts}
-                    </span>
-                    <span className="break-all leading-5">{eventBody(e)}</span>
-                  </li>
-                )
-              })}
-            </ol>
-          </CardContent>
-        </Card>
+        <div className="space-y-2">
+          <div className="text-muted-foreground flex flex-wrap items-center gap-3 text-sm">
+            配置会话时间线（{ev.events.length} 条事件）
+            {ev.tokens.total_tokens > 0 && (
+              <span>累计 tokens：{ev.tokens.total_tokens.toLocaleString()}</span>
+            )}
+          </div>
+          <AgentTimeline segments={groupByRounds(ev.events)} />
+        </div>
+      )}
+      {!running && (!ev || ev.events.length === 0) && (
+        <div className="text-muted-foreground rounded-md border border-dashed py-8 text-center text-sm">
+          本项目尚无已完成的配置会话：点上方「开始配置」，agent 将阅读训练脚本并起草配置。
+        </div>
       )}
     </div>
   )
