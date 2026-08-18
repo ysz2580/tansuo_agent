@@ -5,6 +5,7 @@ import { useCohort } from "@/lib/cohort"
 import { groupByRounds } from "@/lib/agentEvents"
 import { usePolling } from "@/lib/usePolling"
 import { AgentTimeline } from "@/components/AgentTimeline"
+import { GuidanceComposer } from "@/components/GuidanceComposer"
 import { HistoryDialog } from "@/components/HistoryDialog"
 import { SetupDialog } from "@/components/SetupDialog"
 import { Button } from "@/components/ui/button"
@@ -20,6 +21,7 @@ export default function AgentPage() {
   const [historyOpen, setHistoryOpen] = useState(false)
   const { data, error } = usePolling(() => api.agentEvents(cohort), 8000)
   const { data: setupStatus } = usePolling<SetupStatus>(api.setupStatus, 3000)
+  const { data: runStatus } = usePolling(api.runStatus, 5000)
 
   if (error) return <div className="text-red-600 py-8 text-center">加载失败：{error}</div>
   if (!data) return <div className="text-muted-foreground py-12 text-center">加载中…</div>
@@ -62,6 +64,8 @@ export default function AgentPage() {
           </CardContent>
         </Card>
       )}
+
+      <GuidanceComposer running={runStatus?.running ?? false} />
 
       {latest ? (
         <div className="space-y-2">

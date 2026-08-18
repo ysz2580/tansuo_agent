@@ -103,7 +103,18 @@ function SeenBlock({ seg }: { seg: AgentSegment }) {
           ))}
         </div>
       )}
-      {parts.length === 0 && !ctx.signals?.length && (
+      {ctx.guidance && ctx.guidance.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {ctx.guidance.map((g, i) => (
+            <Badge key={i} variant="outline"
+                   className="border-cyan-500/40 bg-cyan-600/15 text-xs font-normal text-cyan-700 dark:text-cyan-400"
+                   title="人→agent 指令：本轮唤醒注入的原文">
+              👤 {g}
+            </Badge>
+          ))}
+        </div>
+      )}
+      {parts.length === 0 && !ctx.signals?.length && !ctx.guidance?.length && (
         <div className="text-muted-foreground">（本轮无额外上下文）</div>
       )}
     </div>

@@ -7,8 +7,11 @@
 三条提示词与其可用占位符：
 - tuning_system：{{experiment_name}} {{metrics_block}} {{space_describe}} {{total_trials}}
 - tuning_wake_brief：{{round_no}} {{max_wake_rounds}} {{finished_count}}
-                     {{total}} {{budget_left}} {{space_version}} {{wake_signals}}
-                     （wake_signals：确定性护栏的唤醒信号，无信号时为空串）
+                     {{total}} {{budget_left}} {{space_version}} {{last_note}}
+                     {{wake_signals}} {{guidance}}
+                     （last_note：上一轮唤醒的结论，首轮为占位文案——跨轮记忆；
+                      wake_signals：确定性护栏的唤醒信号，无信号时为空串；
+                      guidance：人→agent 指令，运行中由前端写入、下一轮唤醒注入，无则空串）
 - setup_system：{{train_script_path}} {{train_script_src}} {{existing_settings}}
 """
 from __future__ import annotations
@@ -22,7 +25,8 @@ PROMPT_NAMES = ("tuning_system", "tuning_wake_brief", "setup_system")
 PROMPT_VARS: dict[str, list[str]] = {
     "tuning_system": ["experiment_name", "metrics_block", "space_describe", "total_trials"],
     "tuning_wake_brief": ["round_no", "max_wake_rounds", "finished_count",
-                          "total", "budget_left", "space_version", "wake_signals"],
+                          "total", "budget_left", "space_version", "last_note",
+                          "wake_signals", "guidance"],
     "setup_system": ["train_script_path", "train_script_src", "existing_settings"],
 }
 
@@ -88,8 +92,11 @@ DEFAULT_PROMPTS: dict[str, str] = {
     "tuning_wake_brief": ("第 {{round_no}} 轮唤醒（最多 {{max_wake_rounds}} 轮）。"
                           "已完成 {{finished_count}}/{{total}} 次试验，"
                           "剩余预算 {{budget_left}} 次，当前空间版本 v{{space_version}}。"
-                          "请先调用 get_study_summary 分析，再决定本轮动作。"
-                          "{{wake_signals}}"),
+                          "上一轮你的结论：{{last_note}}。"
+                          "请先调用 get_study_summary 分析，再决定本轮动作；"
+                          "本轮决策应与上一轮结论保持连贯（避免反复横跳），"
+                          "除非新证据推翻它。"
+                          "{{wake_signals}}{{guidance}}"),
 
     "setup_system": """你是 tansuo_agent 的**配置生成 agent**。任务：阅读用户的训练脚本，推断超参数搜索空间与指标评估方式，写出两份配置文件，并用探测试验自证可用。
 
@@ -182,10 +189,12 @@ def build_context_tuning_system(settings, space) -> dict:
     }
 
 
-def build_context_tuning_wake(round_no: int, settings, orchestrator) -> dict:
+def build_context_tuning_wake(round_no: int, settings, orchestrator,
+                              last_note: str = "", guidance: str = "") -> dict:
     # 确定性护栏信号（失败警报/收敛提示）：无信号时为空串，渲染结果与旧版一致
     signals = build_wake_signals(orchestrator)
     wake_signals = "".join(f"\n⚠ {s}" for s in signals)
+    guidance_text = guidance.strip()
     return {
         "round_no": round_no,
         "max_wake_rounds": settings.agent.max_wake_rounds,
@@ -193,6 +202,10 @@ def build_context_tuning_wake(round_no: int, settings, orchestrator) -> dict:
         "total": orchestrator.total,
         "budget_left": orchestrator.budget_left(),
         "space_version": orchestrator.space.version,
+        # 跨轮记忆：空（首轮/resume 前无记录）时给占位，避免模板悬空冒号
+        "last_note": last_note or "（首轮，尚无上一轮结论）",
+        # 人→agent 指令：无则空串；有则带前缀注入（兜底追加分支也直接用此文本）
+        "guidance": f"\n👤 用户指令：\n{guidance_text}" if guidance_text else "",
         "wake_signals": wake_signals,
     }
 

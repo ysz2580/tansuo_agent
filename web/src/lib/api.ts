@@ -524,6 +524,9 @@ export const api = {
   // 人工试验插队：运行中排队（mode=inbox）；空闲即时派发（mode=executing）
   customTrial: (body: { params: Record<string, unknown>; note?: string }) =>
     http<CustomTrialResp>("/custom", { method: "POST", body: JSON.stringify(body) }),
+  // 人→agent 指令：仅运行中接收，下一轮唤醒注入（空闲 400）
+  guidance: (body: { text: string }) =>
+    http<{ ok: boolean; detail: string }>("/agent/guidance", { method: "POST", body: JSON.stringify(body) }),
   // 本机 GPU 清单（选卡用；无 GPU → 空数组，前端隐藏选卡区）
   gpusList: (refresh = false) =>
     http<{ gpus: GpuInfo[] }>(`/gpus${refresh ? "?refresh=true" : ""}`),

@@ -2,8 +2,8 @@
 
 独立脚本直跑：python tests/test_prompts.py
 
-说明：重构后的默认模板渲染输出已与重构前逐字比对一致（git 旧版函数对拍通过）；
-本套件聚焦渲染引擎、存储、回滚与 Skill 接线的行为。
+说明：默认 wake brief 自 STAR 030 起含 {{last_note}}（跨轮记忆）与
+{{guidance}}（人→agent 指令）；本套件聚焦渲染引擎、存储、回滚与 Skill 接线的行为。
 """
 from __future__ import annotations
 
@@ -90,9 +90,23 @@ def test_default_content():
        and "总预算 30 次试验" in sysp)
     ok("system 无残留占位符", "{{" not in sysp)
     brief = tuning_wake_brief(2, s, _Orch(sp))
-    ok("唤醒简报注入轮次/完成/剩余/版本",
-       brief == "第 2 轮唤醒（最多 6 轮）。已完成 7/30 次试验，"
-                "剩余预算 23 次，当前空间版本 v2。请先调用 get_study_summary 分析，再决定本轮动作。")
+    ok("唤醒简报注入轮次/完成/剩余/版本/上一轮结论占位",
+       brief == "第 2 轮唤醒（最多 6 轮）。"
+                "已完成 7/30 次试验，"
+                "剩余预算 23 次，当前空间版本 v2。"
+                "上一轮你的结论：（首轮，尚无上一轮结论）。"
+                "请先调用 get_study_summary 分析，再决定本轮动作；"
+                "本轮决策应与上一轮结论保持连贯（避免反复横跳），"
+                "除非新证据推翻它。")
+    ok("简报无残留占位符", "{{" not in brief)
+    ctx2 = build_context_tuning_wake(2, s, _Orch(sp),
+                                     last_note="lr=0.05 收敛偏慢",
+                                     guidance="优先探更小的 lr")
+    ok("last_note 原样注入、guidance 带 👤 前缀",
+       ctx2["last_note"] == "lr=0.05 收敛偏慢"
+       and ctx2["guidance"] == "\n👤 用户指令：\n优先探更小的 lr")
+    ok("无 guidance 时为空串（简报不出现悬空段落）",
+       build_context_tuning_wake(2, s, _Orch(sp))["guidance"] == "")
     setupp = setup_system_prompt("train.py", "print('hi')")
     ok("setup 注入脚本路径与源码", "train.py" in setupp and "print('hi')" in setupp)
     ok("上下文构建键与 PROMPT_VARS 一致",

@@ -1,5 +1,5 @@
 """Web 后端冒烟：起真实 uvicorn，验证 /api/runs、?cohort=、run_start 分区换算、
-项目管理、setup 互斥、GPU 清单/选卡记账、毕业赛、配置回写。
+项目管理、setup 互斥、GPU 清单/选卡记账、毕业赛、配置回写、人→agent 指令通道。
 
 独立脚本直跑：python tests/e2e_web_smoke.py（约 3-5 分钟，占用端口 8123）。
 """
@@ -728,6 +728,45 @@ with tempfile.TemporaryDirectory() as td:
         ok("教程含关键章节（新建项目/配置 agent/启动搜索/三点契约）",
            all(k in doc["markdown"] for k in
                ("新建项目", "配置 agent", "启动一次搜索", "三点契约")))
+
+        print("== 21. 人→agent 指令通道（guidance）==")
+        # 空闲拒收：指令的生命周期依附运行中的会话（无唤醒则无人消费）
+        try:
+            api("/api/agent/guidance", {"text": "优先探更小的 lr"})
+            raise AssertionError("FAIL: 空闲时 guidance 应被拒")
+        except _ue.HTTPError as e:
+            ok("空闲时 guidance 被拒（400 + 说明运行时接收）",
+               e.code == 400 and "未运行" in e.read().decode("utf-8", "replace"))
+        try:
+            api("/api/agent/guidance", {"text": "   "})
+            raise AssertionError("FAIL: 空白指令应被拒")
+        except _ue.HTTPError as e:
+            ok("空白指令被拒（400）", e.code == 400)
+        try:
+            api("/api/agent/guidance", {"text": "x" * 2001})
+            raise AssertionError("FAIL: 超长指令应被拒")
+        except _ue.HTTPError as e:
+            ok("超长指令被拒（400，上限 2000）", e.code == 400)
+        # 运行中：排队到正在跑的分区 data_dir 的 guidance.jsonl
+        api("/api/run/start", {"trials": 3, "no_agent": True})
+        t0 = time.time()
+        while time.time() - t0 < 10 and not api("/api/run/status")["running"]:
+            time.sleep(0.1)
+        ok("projC 搜索已启动（guidance 前置）", api("/api/run/status")["running"])
+        gd = api("/api/agent/guidance", {"text": "优先探更小的 lr"})
+        ok("运行中指令排队成功（返回分区 id）",
+           gd["ok"] is True and bool(gd["cohort"]), str(gd))
+        ok("写入分区 = 正在运行的分区（不是最新分区）",
+           gd["cohort"] == api("/api/run/status")["last_cohort"], str(gd))
+        files = list(projc.glob(".tansuo/**/guidance.jsonl"))
+        ok("guidance.jsonl 落盘运行分区目录", bool(files), str(files))
+        entry = json.loads(files[0].read_text(encoding="utf-8")
+                           .strip().splitlines()[-1])
+        ok("排队条目含指令原文与 queued_at",
+           entry["text"] == "优先探更小的 lr" and bool(entry["queued_at"]),
+           str(entry))
+        api("/api/run/stop", method="POST")
+        wait_idle()
 
         print("\nWeb 冒烟全部通过")
     finally:

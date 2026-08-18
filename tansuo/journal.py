@@ -21,6 +21,10 @@ AGENT_WAKEUP = "agent_wakeup"
 AGENT_TOOL_CALL = "agent_tool_call"
 AGENT_PERMISSION = "agent_permission"
 AGENT_ERROR = "agent_error"
+# 人→agent 指令（运行中写入 guidance.jsonl，下一轮唤醒消费并审计）。
+# 注意：本 kind 事件不带 phase 字段——agent_token_summary 只认 phase=end，
+# 带了会让 rounds 虚增。
+AGENT_GUIDANCE = "agent_guidance"
 FINISH = "finish"
 
 

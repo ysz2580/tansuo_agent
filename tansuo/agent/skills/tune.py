@@ -261,16 +261,21 @@ ToolExecutor = TuneExecutor
 
 
 class TuneSkill(Skill):
-    """调参技能：每轮唤醒一次短对话（靠 brief+summary 传状态，不累积长上下文）。"""
+    """调参技能：每轮唤醒一次短对话（靠 brief+summary 传状态，不累积长上下文）。
+    跨轮记忆（上一轮结论 {{last_note}}）与人→agent 指令（{{guidance}}）随 brief 注入。"""
 
     name = "tune"
     mode = "tune"
     description = "超参数搜索监督者：分析试验结果、调节搜索空间、提出假设实验、判断收敛"
 
-    def __init__(self, settings, orchestrator, round_no: int):
+    def __init__(self, settings, orchestrator, round_no: int,
+                 last_note: str = "", guidance: str = ""):
         self.settings = settings
         self.orch = orchestrator
         self.round_no = round_no
+        # 跨轮记忆（上一轮结论）与人→agent 指令：由 AgentSupervisor 注入 brief
+        self.last_note = last_note
+        self.guidance = guidance
         self._executor = TuneExecutor(orchestrator)
         self._prompts = load_overrides(settings)   # prompts.yaml 覆盖（无文件→{}→出厂默认）
 
@@ -286,13 +291,18 @@ class TuneSkill(Skill):
                              self._prompts)
 
     def opening_message(self) -> str:
-        ctx = build_context_tuning_wake(self.round_no, self.settings, self.orch)
+        ctx = build_context_tuning_wake(self.round_no, self.settings, self.orch,
+                                        last_note=self.last_note, guidance=self.guidance)
         text = render_prompt("tuning_wake_brief", ctx, self._prompts)
         # 护栏兜底：用户覆盖的模板若未带 {{wake_signals}}，确定性信号会被静默
         # 丢掉——护栏不允许被模板编辑绕过，缺了就强制追加到末尾。
         signals = ctx.get("wake_signals") or ""
         if signals and signals not in text:
             text += signals
+        # 人工指令同等兜底：用户输入不允许被模板编辑静默丢弃（范式同上）
+        guidance = ctx.get("guidance") or ""
+        if guidance and guidance not in text:
+            text += guidance
         return text
 
     def limits(self) -> SkillLimits:

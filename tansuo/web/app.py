@@ -457,6 +457,50 @@ def custom_trial(body: CustomTrialBody):
             "detail": "空闲即时执行中：进度看运行日志（/api/run/log）"}
 
 
+class GuidanceBody(BaseModel):
+    text: str = Field(..., description="给监督 agent 的指令（下一轮唤醒注入）")
+
+
+@app.post("/api/agent/guidance")
+def agent_guidance(body: GuidanceBody):
+    """人→agent 指令通道：仅搜索运行中接收，追加到运行分区的 guidance.jsonl，
+    下一轮 agent 唤醒时原子消费并注入 wake brief（journal 留 AGENT_GUIDANCE 审计）。
+    空闲时拒收——指令的生命周期依附运行中的会话，无唤醒则无人消费。"""
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="指令不能为空")
+    if len(text) > 2000:
+        raise HTTPException(status_code=400, detail="指令过长（上限 2000 字符）")
+    project_id = _active_project_id()
+    settings_path, _, project_dir = _active_paths()
+    try:
+        settings = load_settings(settings_path)
+    except ConfigError as e:
+        raise HTTPException(status_code=500, detail=f"配置加载失败：{e}")
+    mgr = _run_mgr(project_id)
+    if not (mgr.running and mgr.last_cohort):
+        raise HTTPException(status_code=400,
+                            detail="搜索未运行，指令在搜索运行时接收、下一轮唤醒注入")
+    root = abs_data_dir(settings, project_dir)
+    try:
+        # 队列必须写进"正在跑的那个分区"（同 /api/custom 的运行中分支）
+        cohort = load_cohort(root, mgr.last_cohort, settings=settings)
+        apply_cohort(settings, cohort)
+    except CohortError as e:
+        raise HTTPException(status_code=404, detail=f"定位运行分区失败：{e}")
+    path = Path(settings.data_dir) / "guidance.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"text": text,
+                                "queued_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                               ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"写入指令队列失败：{e}")
+    return {"ok": True, "cohort": cohort.id, "queued_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "detail": "已排队：下一轮 agent 唤醒时注入（journal 留审计）"}
+
+
 def _probe_duration_s() -> float | None:
     """setup 探针最近一次成功耗时（setup_journal.jsonl 的 TRIAL_END source=probe）。"""
     settings_path, _, project_dir = _active_paths()
@@ -1094,6 +1138,9 @@ def _preview_context(which: str) -> dict:
         return {"round_no": 1, "max_wake_rounds": settings.agent.max_wake_rounds,
                 "finished_count": 0, "total": total, "budget_left": total,
                 "space_version": space.version,
+                # 跨轮记忆样例：首轮/无记录时为占位文案；人→agent 指令无则空串
+                "last_note": "（示例）上轮 lr=0.05 收敛偏慢，建议下探。",
+                "guidance": "\n👤 用户指令：\n优先尝试更低 lr。",
                 # 护栏信号预览样例：运行时由代码按试验状态生成，无信号时为空串
                 "wake_signals": "\n⚠ （示例信号）系统警报：连续 3 次试验全部超时。"
                                 "实际运行时此项由代码自动填充，无信号时为空。"}

@@ -12,6 +12,8 @@
 - 兜底：python 模式用户函数抛异常 → 该试验 FAIL 但搜索不崩
 - 唤醒信号：连续同类失败触发系统警报（含疑似耗时维度）、收敛信号
   （最近 window 次未刷新最优），强制注入 wake brief；无信号时渲染不变
+- 跨轮记忆与人→agent 指令：last_note wake 后更新、新实例从 journal 恢复；
+  guidance.jsonl 唤醒时原子消费、写 AGENT_GUIDANCE 审计（不带 phase）、注入 brief
 - Hyperband：配置校验、工厂、真实搜索冒烟；中途 widen 后 max_resource=auto 自适应
 - 配置校验：workers / retry_on_fail / max_duration_h 越界拒绝
 """
@@ -391,6 +393,81 @@ def test_agent_token_usage(tmp: Path) -> None:
        and summ2["total_tokens"] == 450, str(summ2))
 
 
+def test_supervisor_memory(tmp: Path) -> None:
+    print("== 跨轮记忆 + 人→agent 指令消费 ==")
+    import json as _json
+    from types import SimpleNamespace
+
+    from tansuo.agent.loop import AgentSupervisor, make_gate
+    from tansuo.journal import AGENT_GUIDANCE
+
+    def make_resp(text, in_t=10, out_t=5):
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=in_t, output_tokens=out_t))
+
+    class FakeClient:
+        def __init__(self, resps):
+            self.resps = list(resps)
+            self.calls: list[dict] = []
+            outer = self
+
+            class _Messages:
+                def create(self, **kw):
+                    outer.calls.append(kw)
+                    return outer.resps.pop(0)
+
+            self.messages = _Messages()
+
+    child = 'import json\nprint(\'##TANSUO## {"type": "final", "value": 0.7}\')\n'
+    s = make_settings(tmp, child, "memory")
+    orch = make_orch(s)
+    gate = make_gate(s, orch.journal, log=lambda *_: None)
+
+    # 1) 跨轮记忆：wake 后立即更新；新实例从 journal 恢复（resume 场景）
+    sup = AgentSupervisor(s, orch,
+                          client=FakeClient([make_resp("第一轮结论：lr 偏大需下探")]),
+                          gate=gate, log=lambda *_: None)
+    ok("首次唤醒前无历史 → last_note 为空", sup.last_note == "")
+    sup.wake(orch)
+    ok("wake 后 last_note 立即更新为本轮结论",
+       sup.last_note == "第一轮结论：lr 偏大需下探")
+    sup_new = AgentSupervisor(s, orch, client=FakeClient([]), gate=gate,
+                              log=lambda *_: None)
+    ok("新实例从 journal 恢复上一轮结论（跨进程 resume 不失忆）",
+       sup_new.last_note == "第一轮结论：lr 偏大需下探")
+
+    # 2) guidance：排队 → 唤醒时原子消费 + 写审计（不带 phase）→ 文件删除
+    gpath = Path(s.data_dir) / "guidance.jsonl"
+    gpath.parent.mkdir(parents=True, exist_ok=True)
+    with open(gpath, "a", encoding="utf-8") as f:
+        f.write(_json.dumps({"text": "优先探更小的 lr", "queued_at": "t"},
+                            ensure_ascii=False) + "\n")
+        f.write(_json.dumps({"text": "本轮别动搜索空间", "queued_at": "t"},
+                            ensure_ascii=False) + "\n")
+    client2 = FakeClient([make_resp("第二轮结论：照办了")])
+    sup2 = AgentSupervisor(s, orch, client=client2, gate=gate, log=lambda *_: None)
+    sup2.wake(orch)
+    gevents = [e for e in orch.journal.load_events()
+               if e.get("kind") == AGENT_GUIDANCE]
+    ok("guidance 审计事件记录 round 与原文列表",
+       len(gevents) == 1
+       and gevents[0]["texts"] == ["优先探更小的 lr", "本轮别动搜索空间"]
+       and gevents[0]["round"] == 1, str(gevents))
+    ok("guidance 审计事件不带 phase（不污染 token_summary 的 rounds）",
+       "phase" not in gevents[0], str(gevents[0]))
+    ok("guidance.jsonl 消费后删除", not gpath.exists())
+    brief2 = client2.calls[0]["messages"][0]["content"]
+    ok("guidance 注入 wake brief（👤 前缀）",
+       "👤 用户指令：" in brief2 and "优先探更小的 lr" in brief2, brief2[:300])
+    ok("上一轮结论随 brief 注入（跨轮记忆生效）",
+       "第一轮结论：lr 偏大需下探" in brief2, brief2[:300])
+    summ = orch.journal.agent_token_summary()
+    ok("guidance 事件不虚增 rounds（只认 wakeup.end）",
+       summ["rounds"] == 2, str(summ))
+
+
 def test_hyperband_pruner(tmp: Path) -> None:
     print("== Hyperband 剪枝器 ==")
     base = ("metrics:\n  primary: {name: val_acc, direction: maximize}\n"
@@ -527,6 +604,10 @@ def test_wake_signals(tmp: Path) -> None:
     msg = TuneSkill(s, orch, 1).opening_message()
     ok("覆盖模板缺 {{wake_signals}} 时护栏兜底追加",
        msg.startswith("自定义简报") and "⚠ 系统警报" in msg, msg)
+    msg_g = TuneSkill(s, orch, 1, guidance="优先探更小的 lr").opening_message()
+    ok("覆盖模板缺 {{guidance}} 时人工指令兜底追加（与护栏同级）",
+       msg_g.startswith("自定义简报") and "👤 用户指令" in msg_g
+       and "优先探更小的 lr" in msg_g, msg_g)
     save_override(s, "tuning_wake_brief", "", "还原出厂")
     # 混入一条协议错误 → 类别混杂不触发（避免把偶发问题当系统性问题打扰）
     orch.journal.append(TRIAL_FAIL, trial=99, reason="协议行 JSON 解析失败")
@@ -575,14 +656,15 @@ def test_wake_signals(tmp: Path) -> None:
                                       params={"lr": 0.05}, distributions=dists3))
     ok("仍在明显改进 → 不发收敛信号", plateau_note(study4, s2, window=4) == "")
 
-    # 4) 无信号场景：build_wake_signals 为空，简报渲染与旧版逐字一致
+    # 4) 无信号场景：build_wake_signals 为空，简报以跨轮连贯性指引收尾
     s5 = make_settings(tmp, CHILD_SLOW, "wakesig_none", total=1)
     orch5 = make_orch(s5)
     orch5.run_batch(1)
     ok("无信号 → build_wake_signals 为空", build_wake_signals(orch5) == [])
     brief5 = tuning_wake_brief(1, s5, orch5)
-    ok("无信号时简报不含 ⚠ 且正文不变",
-       "⚠" not in brief5 and brief5.endswith("再决定本轮动作。"), brief5)
+    ok("无信号时简报不含 ⚠/👤 且含首轮结论占位",
+       "⚠" not in brief5 and "👤" not in brief5
+       and "上一轮你的结论：（首轮，尚无上一轮结论）" in brief5, brief5)
 
 
 def test_env_clues(tmp: Path) -> None:
@@ -681,6 +763,7 @@ if __name__ == "__main__":
         test_time_budget_and_eta(tmp)
         test_exception_guard(tmp)
         test_agent_token_usage(tmp)
+        test_supervisor_memory(tmp)
         test_hyperband_pruner(tmp)
         test_failure_awareness(tmp)
         test_wake_signals(tmp)

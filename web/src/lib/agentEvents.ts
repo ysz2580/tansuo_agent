@@ -15,6 +15,7 @@ export interface AgentSegment {
     budgetLeft?: number
     spaceVersion?: number
     signals?: string[]        // 确定性护栏信号（失败警报/收敛提示）
+    guidance?: string[]       // 人→agent 指令（本轮唤醒注入的原文，journal 审计）
     trainScript?: string      // setup：被配置阅读的训练脚本
   }
   judgment?: string           // 判断什么：wakeup.end.note（tune）或 finish.summary（setup）
@@ -74,6 +75,10 @@ function groupTune(events: AgentEvent[]): AgentSegment[] {
         seg.context.budgetLeft = num(e.budget_left)
         seg.context.spaceVersion = num(e.space_version)
       }
+    } else if (e.kind === "agent_guidance") {
+      // 写在 wakeup-start 之后、end 之前，此时 cur 已开段（防御兜底同 signals）
+      const seg = ensure(num(e.round) ?? 0, e.ts)
+      seg.context.guidance = Array.isArray(e.texts) ? (e.texts as unknown[]).map(String) : []
     } else if (ACTION_KINDS.has(e.kind)) {
       ensure(num(e.round) ?? 0, e.ts).toolCalls.push(e)
     }
@@ -106,6 +111,9 @@ function groupSetup(events: AgentEvent[]): AgentSegment[] {
       const seg = ensure()
       seg.endTs = e.ts
       if (typeof e.summary === "string" && e.summary && !seg.judgment) seg.judgment = e.summary
+    } else if (e.kind === "agent_guidance") {
+      // setup 会话不产生 guidance，分支仅为防御一致（避免未来未知事件静默丢弃）
+      ensure().context.guidance = Array.isArray(e.texts) ? (e.texts as unknown[]).map(String) : []
     } else if (ACTION_KINDS.has(e.kind)) {
       ensure().toolCalls.push(e)
     }
@@ -118,6 +126,7 @@ export const KIND_META: Record<string, { label: string; cls: string }> = {
   agent_wakeup: { label: "唤醒", cls: "bg-blue-600/15 text-blue-700 dark:text-blue-400" },
   agent_tool_call: { label: "工具调用", cls: "bg-violet-600/15 text-violet-700 dark:text-violet-400" },
   agent_permission: { label: "权限", cls: "bg-amber-600/15 text-amber-700 dark:text-amber-400" },
+  agent_guidance: { label: "人工指令", cls: "bg-cyan-600/15 text-cyan-700 dark:text-cyan-400" },
   agent_error: { label: "异常", cls: "bg-red-600/15 text-red-700 dark:text-red-400" },
   finish: { label: "结束", cls: "bg-gray-600/15 text-gray-600 dark:text-gray-400" },
 }
@@ -150,6 +159,8 @@ export function eventBody(e: AgentEvent): string {
     }
     case "agent_permission":
       return `${e.tool}：策略 ${e.policy} → ${e.outcome}`
+    case "agent_guidance":
+      return "人工指令：" + (Array.isArray(e.texts) ? (e.texts as string[]).join("；") : "")
     case "agent_error":
       return String(e.error ?? "")
     case "finish":

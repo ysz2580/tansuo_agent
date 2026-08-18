@@ -41,4 +41,6 @@
 
 | 2026-08-18 | 029 | [Agent 主页「全量时间线往下滑」不符监控操作习惯：主屏只留最新一轮，setup 与长日志收进子页面 Dialog](2026-08-18-029-agent-page-latest-only-subdialogs.md) | `前端` `信息架构` `用户体验` `agent` `监控界面` | ✅ 已解决 |
 
+| 2026-08-18 | 030 | [监督 agent 跨轮失忆且人→agent 无喊话通道：wake brief 注入 last_note 跨轮记忆 + guidance.jsonl 指令通道原子消费](2026-08-18-030-agent-memory-guidance-channel.md) | `agent` `跨轮记忆` `guidance` `wake-brief` `journal` `设计决策` `前端` | ✅ 已解决 |
+
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中

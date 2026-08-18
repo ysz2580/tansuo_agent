@@ -14,8 +14,13 @@
 """
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 from ..analysis import build_wake_signals
-from ..journal import AGENT_ERROR, AGENT_TOOL_CALL, AGENT_WAKEUP, FINISH, SESSION_START
+from ..journal import (AGENT_ERROR, AGENT_GUIDANCE, AGENT_TOOL_CALL, AGENT_WAKEUP,
+                       FINISH, SESSION_START)
 from .client import AgentEndpointError, call_with_retry, make_client
 from .hooks import HookChain, PermissionGate
 from .skill import Skill
@@ -147,6 +152,58 @@ class AgentSupervisor:
         # 会话级 token 累计（每轮唤醒后从 AgentLoop 汇总，写进 AGENT_WAKEUP 审计）
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        # 跨轮记忆：上一轮结论。从 journal 恢复（resume 跨进程时新实例也能
+        # 拿到上一进程的最后一轮 note，避免「每轮失忆」）。
+        self.last_note = self._load_last_note()
+
+    def _load_last_note(self) -> str:
+        """取 journal 里最后一条 agent_wakeup(phase=end) 的 note；无记录 → 空串。
+        （写法照搬 Journal.agent_token_summary 的 phase=end 过滤。）"""
+        ends = [e for e in self.journal.agent_events()
+                if e.get("kind") == AGENT_WAKEUP and e.get("phase") == "end"]
+        return str(ends[-1].get("note") or "") if ends else ""
+
+    def guidance_path(self) -> Path:
+        return Path(self.settings.data_dir) / "guidance.jsonl"
+
+    def _consume_guidance(self) -> str:
+        """人→agent 指令通道：原子认领（os.replace，照搬 consume_inbox 范式）后
+        读取全部条目。成功消费靠 AGENT_GUIDANCE 审计事件留痕（不带 phase 字段，
+        避免污染 agent_token_summary 的 rounds 计数）；guidance 是纯文本，无
+        「被拒/失败放回」语义——全部消费、不 requeue。返回拼接后的原文（无则空串）。"""
+        path = self.guidance_path()
+        if not path.exists():
+            return ""
+        claimed = path.with_name("guidance.processing.jsonl")
+        try:
+            os.replace(path, claimed)
+        except OSError:
+            return ""
+        try:
+            lines = [ln.strip() for ln in claimed.read_text(encoding="utf-8").splitlines()
+                     if ln.strip()]
+        except OSError:
+            lines = []
+        texts: list[str] = []
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                self.log(f"[agent] 跳过损坏的排队指令条目：{line[:120]}")
+                continue
+            text = str(entry.get("text") or "").strip() if isinstance(entry, dict) else ""
+            if text:
+                texts.append(text)
+        try:
+            claimed.unlink()
+        except OSError:
+            pass
+        if texts:
+            self.journal.append(AGENT_GUIDANCE, round=self.wake_count, texts=texts)
+            for t in texts:
+                self.log(f"[agent] 收到人工指令：{t}")
+            return "\n".join(texts)
+        return ""
 
     def wake(self, orchestrator=None) -> None:
         from .skills.tune import TuneSkill
@@ -165,8 +222,11 @@ class AgentSupervisor:
                                 signals=signals)
             for s in signals:
                 self.log(f"[护栏] {s}")
+        # 人→agent 指令：批边界累积的 guidance.jsonl 在本轮唤醒消费并注入 brief
+        guidance = self._consume_guidance()
         self.log(f"\n[agent] 第 {self.wake_count} 轮唤醒：分析试验结果……")
-        skill = TuneSkill(self.settings, self.orch, self.wake_count)
+        skill = TuneSkill(self.settings, self.orch, self.wake_count,
+                          last_note=self.last_note, guidance=guidance)
         loop = AgentLoop(self.settings, self.client, self.journal, self.gate,
                          mode="tune", log=self.log)
         try:
@@ -184,6 +244,8 @@ class AgentSupervisor:
                             output_tokens=loop.round_output_tokens,
                             total_input_tokens=self.total_input_tokens,
                             total_output_tokens=self.total_output_tokens)
+        # 更新跨轮记忆：本轮结论供下一轮 brief 的 {{last_note}} 使用
+        self.last_note = (last_text or "")[:300]
 
 
 # ==================================================================
