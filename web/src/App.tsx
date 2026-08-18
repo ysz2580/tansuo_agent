@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react"
+import { BookOpenIcon } from "lucide-react"
 import { Toaster } from "@/components/ui/sonner"
+import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -14,6 +16,7 @@ import { CohortContext } from "@/lib/cohort"
 import { ProjectContext } from "@/lib/project"
 import { usePolling } from "@/lib/usePolling"
 import { ProjectSelector } from "@/components/ProjectSelector"
+import { TutorialDialog } from "@/components/TutorialDialog"
 import DashboardPage from "@/pages/DashboardPage"
 import TrialsPage from "@/pages/TrialsPage"
 import SpacePage from "@/pages/SpacePage"
@@ -81,6 +84,7 @@ function CohortSelector({ value, onChange }: { value: string | null; onChange: (
 
 export default function App() {
   const [cohort, setCohort] = useState<string | null>(null)
+  const [tutorialOpen, setTutorialOpen] = useState(false)
   // 项目切换纪元：+1 → 分区重置为「跟随最新」且各页整体重挂载（按新项目重拉数）。
   // 仅 setCohort(null) 不够——cohort 本就是 null 时 key 不变，页面不会重挂载。
   const [epoch, setEpoch] = useState(0)
@@ -113,6 +117,10 @@ export default function App() {
               Optuna TPE 贝叶斯搜索 + LLM 监督 agent
             </span>
             <div className="ml-auto flex flex-wrap items-center gap-3">
+              <Button variant="outline" size="sm" onClick={() => setTutorialOpen(true)}
+                      title="从安装启动到跑完第一轮调参的完整教程">
+                <BookOpenIcon className="size-3.5" /> 使用教程
+              </Button>
               <ProjectSelector resp={projResp} onRefresh={refreshProjects}
                                onSwitched={onProjectSwitched} />
               <CohortSelector key={`cs-${epoch}`} value={cohort} onChange={setCohort} />
@@ -143,6 +151,7 @@ export default function App() {
           </Tabs>
 
           <Toaster richColors position="top-center" />
+          <TutorialDialog open={tutorialOpen} onOpenChange={setTutorialOpen} />
         </div>
       </CohortContext.Provider>
     </ProjectContext.Provider>

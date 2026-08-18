@@ -720,6 +720,15 @@ with tempfile.TemporaryDirectory() as td:
            lg2["text"][:200])
         ok("未知试验日志 404", _expect_404("/api/trials/9999/log"))
 
+        print("== 20. 从零教程文档端点 ==")
+        doc = api("/api/docs/tutorial")
+        ok("教程端点返回 markdown 原文",
+           isinstance(doc["markdown"], str) and doc["markdown"].startswith("# "),
+           doc["markdown"][:60])
+        ok("教程含关键章节（新建项目/配置 agent/启动搜索/三点契约）",
+           all(k in doc["markdown"] for k in
+               ("新建项目", "配置 agent", "启动一次搜索", "三点契约")))
+
         print("\nWeb 冒烟全部通过")
     finally:
         if proc and proc.poll() is None:

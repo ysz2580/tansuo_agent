@@ -589,4 +589,6 @@ export const api = {
   setupStatus: () => http<SetupStatus>("/setup/status"),
   setupLog: (tail = 300) => http<SetupLogResp>(`/setup/log?tail=${tail}`),
   setupEvents: () => http<SetupEventsResp>("/setup/events"),
+  // 从零教程：markdown 原文（前端渲染；源文件 docs/tutorial-getting-started.md）
+  tutorialDoc: () => http<{ markdown: string }>("/docs/tutorial"),
 }

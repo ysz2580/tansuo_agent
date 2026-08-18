@@ -1592,6 +1592,20 @@ def setup_events():
 
 
 # ------------------------------------------------------------------
+# 文档：从零教程（markdown 源，前端渲染；单一事实来源直接读仓库文件）
+# ------------------------------------------------------------------
+
+@app.get("/api/docs/tutorial")
+def docs_tutorial():
+    """从零开始使用教程的 markdown 原文（docs/tutorial-getting-started.md）。"""
+    p = PROJECT_ROOT / "docs" / "tutorial-getting-started.md"
+    if not p.is_file():
+        raise HTTPException(status_code=404,
+                            detail="教程文件不存在：docs/tutorial-getting-started.md")
+    return {"markdown": p.read_text(encoding="utf-8")}
+
+
+# ------------------------------------------------------------------
 # 静态前端（生产构建产物存在时托管，单端口部署）
 # ------------------------------------------------------------------
 
