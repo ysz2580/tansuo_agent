@@ -43,4 +43,6 @@
 
 | 2026-08-18 | 030 | [监督 agent 跨轮失忆且人→agent 无喊话通道：wake brief 注入 last_note 跨轮记忆 + guidance.jsonl 指令通道原子消费](2026-08-18-030-agent-memory-guidance-channel.md) | `agent` `跨轮记忆` `guidance` `wake-brief` `journal` `设计决策` `前端` | ✅ 已解决 |
 
+| 2026-08-19 | 031 | [dev.bat 启动不做端口占用检测，旧后端进程占着 8000 导致 WinError 10048 启动失败](2026-08-19-031-dev-bat-port-precheck.md) | `windows` `bat` `端口占用` `一键启动` | ✅ 已解决 |
+
 状态图例：✅ 已解决 · 🔶 绕过 · 🔴 未解决 · 🔄 处理中
